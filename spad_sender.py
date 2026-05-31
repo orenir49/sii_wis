@@ -294,6 +294,8 @@ def run_command_server(cmd_port: int = DEFAULT_CMD_PORT,
         except OSError:
             break
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        conn.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 30_000, 5_000))  # 30 s idle, probe every 5 s
         status_fn({'event': 'ctrl_connected', 'addr': addr[0]})
         _handle_controller(conn, status_fn)
         status_fn({'event': 'ctrl_disconnected'})

@@ -137,6 +137,8 @@ class NodePanel:
             ctrl.connect((sender_ip, cmd_port))
             ctrl.settimeout(None)   # back to blocking after connect
             ctrl.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            ctrl.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            ctrl.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 30_000, 5_000))  # 30 s idle, probe every 5 s
             self._ctrl_sock = ctrl
         except OSError as exc:
             self._data_server.close()
@@ -373,14 +375,14 @@ class ReceiverGUI:
 
         self.node1 = NodePanel(nodes_frame, self.root,
                                node_id=1,
-                               default_sender_ip='10.7.147.6',
+                               default_sender_ip='10.7.130.175',
                                default_cmd_port=50010,
                                default_data_port=50007,
                                log_fn=self._enqueue_log,
                                get_hooks_fn=lambda: self._correlate_win.hooks_node1)
         self.node2 = NodePanel(nodes_frame, self.root,
                                node_id=2,
-                               default_sender_ip='10.7.153.237',
+                               default_sender_ip='10.7.151.192',
                                default_cmd_port=50010,
                                default_data_port=50008,
                                log_fn=self._enqueue_log,
