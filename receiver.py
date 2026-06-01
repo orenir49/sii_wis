@@ -18,14 +18,16 @@ import queue
 import socket
 import sys
 import threading
+import time
 import tkinter as tk
-from tkinter import ttk, scrolledtext
+from tkinter import ttk, scrolledtext, simpledialog
 
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from receiver_backend import start_server, check_connection, run_session_loop
 from correlate import CorrelateWindow
+import ssh_launcher
 
 HEALTH_CHECK_MS = 2_000
 
@@ -82,21 +84,30 @@ class NodePanel:
         self._data_port_entry = ttk.Entry(frame, textvariable=self.data_port_var, width=7)
         self._data_port_entry.grid(row=0, column=5, sticky='w', padx=(0, 8))
 
-        # Row 1 — output folder
-        ttk.Label(frame, text='Output folder:').grid(row=1, column=0, sticky='w', padx=8, pady=4)
-        self.outdir_var = tk.StringVar(value=f'./spad_data/node{self.node_id}')
-        self._outdir_entry = ttk.Entry(frame, textvariable=self.outdir_var, width=36)
-        self._outdir_entry.grid(row=1, column=1, columnspan=5, sticky='w', padx=(0, 8))
+        # Row 1 — SSH user + mask file
+        ttk.Label(frame, text='SSH user:').grid(row=1, column=0, sticky='w', padx=8, pady=4)
+        self.ssh_user_var = tk.StringVar(value='user')
+        self._ssh_user_entry = ttk.Entry(frame, textvariable=self.ssh_user_var, width=14)
+        self._ssh_user_entry.grid(row=1, column=1, sticky='w')
 
-        # Row 2 — status + connect button
+        ttk.Label(frame, text='Mask file:').grid(row=1, column=2, sticky='w', padx=(12, 4))
+        self.mask_var = tk.StringVar(value='')
+        self._mask_entry = ttk.Entry(frame, textvariable=self.mask_var, width=22)
+        self._mask_entry.grid(row=1, column=3, columnspan=3, sticky='w', padx=(0, 8))
+
+        # Row 2 — status + launch / connect buttons
         self.ctrl_status_var = tk.StringVar(value='● Disconnected')
         self._ctrl_lbl = tk.Label(frame, textvariable=self.ctrl_status_var,
                                    fg='#cc3333', font=('TkDefaultFont', 9, 'bold'), anchor='w')
-        self._ctrl_lbl.grid(row=2, column=0, columnspan=3, sticky='w', padx=8, pady=(2, 2))
+        self._ctrl_lbl.grid(row=2, column=0, columnspan=2, sticky='w', padx=8, pady=(2, 2))
 
-        self._connect_btn = ttk.Button(frame, text='Connect', width=11,
+        self._launch_btn = ttk.Button(frame, text='Launch', width=9,
+                                      command=self._on_launch)
+        self._launch_btn.grid(row=2, column=2, columnspan=2, sticky='e', padx=(0, 4), pady=4)
+
+        self._connect_btn = ttk.Button(frame, text='Connect', width=9,
                                        command=self._toggle)
-        self._connect_btn.grid(row=2, column=3, columnspan=3, sticky='e', padx=8, pady=4)
+        self._connect_btn.grid(row=2, column=4, columnspan=2, sticky='e', padx=(0, 8), pady=4)
 
         # Row 3 — data status
         self.data_status_var = tk.StringVar(value='  Data: ● Idle')
@@ -185,7 +196,7 @@ class NodePanel:
             return
         recv_host  = self._ctrl_sock.getsockname()[0]
         recv_port  = int(self.data_port_var.get())
-        output_dir = self.outdir_var.get().strip()
+        output_dir = f'./spad_data/node{self.node_id}'
         self._send_ctrl({
             'cmd':        'start',
             'recv_host':  recv_host,
@@ -302,6 +313,50 @@ class NodePanel:
         return last
 
     # ------------------------------------------------------------------
+    # Remote launch via SSH
+    # ------------------------------------------------------------------
+
+    def _on_launch(self) -> None:
+        """Ask for SSH password (main thread) then start the launch thread."""
+        if self._state != 'idle':
+            self.log_fn(f'Node {self.node_id}: already connected or launching.\n')
+            return
+        host     = self.ip_var.get().strip()
+        username = self.ssh_user_var.get().strip()
+        mask     = self.mask_var.get().strip()
+        password = simpledialog.askstring(
+            'SSH Password',
+            f'Password for {username}@{host}:',
+            show='*',
+            parent=self.root)
+        if password is None:
+            return
+        threading.Thread(
+            target=self._ssh_launch,
+            args=(host, username, password, mask),
+            daemon=True).start()
+
+    def _ssh_launch(self, host: str, username: str,
+                    password: str, mask: str) -> None:
+        """Background thread: run full node launch sequence then auto-connect."""
+        self._gui(lambda: self._set_ctrl_status('launching'))
+        self.log_fn(f'Node {self.node_id}: launching remote node …\n')
+
+        def _log(msg: str) -> None:
+            self.log_fn(f'[N{self.node_id}] {msg}' if msg.endswith('\n')
+                        else f'[N{self.node_id}] {msg}\n')
+
+        try:
+            ssh_launcher.launch_node(
+                host=host, username=username, password=password,
+                mask_filename=mask, log_fn=_log)
+            time.sleep(3)           # give sender.py command server time to start
+            self._gui(self._connect)
+        except Exception as exc:
+            self.log_fn(f'Node {self.node_id}: launch failed — {exc}\n')
+            self._gui(lambda: self._set_ctrl_status('idle'))
+
+    # ------------------------------------------------------------------
     # Health check  (main thread)
     # ------------------------------------------------------------------
 
@@ -318,17 +373,26 @@ class NodePanel:
     def _set_ctrl_status(self, state: str) -> None:
         self._state = state
         entries = [self._ip_entry, self._cmd_port_entry,
-                   self._data_port_entry, self._outdir_entry]
+                   self._data_port_entry, self._ssh_user_entry, self._mask_entry]
         if state == 'idle':
             self.ctrl_status_var.set('● Disconnected')
             self._ctrl_lbl.config(fg='#cc3333')
-            self._connect_btn.config(text='Connect')
+            self._launch_btn.config(state='normal')
+            self._connect_btn.config(text='Connect', state='normal')
             for e in entries:
                 e.config(state='normal')
-        else:
+        elif state == 'launching':
+            self.ctrl_status_var.set('● Launching …')
+            self._ctrl_lbl.config(fg='#cc9900')
+            self._launch_btn.config(state='disabled')
+            self._connect_btn.config(state='disabled')
+            for e in entries:
+                e.config(state='disabled')
+        else:  # 'ready' or 'streaming'
             self.ctrl_status_var.set('● Connected')
             self._ctrl_lbl.config(fg='#33aa33')
-            self._connect_btn.config(text='Disconnect')
+            self._launch_btn.config(state='disabled')
+            self._connect_btn.config(text='Disconnect', state='normal')
             for e in entries:
                 e.config(state='disabled')
 

@@ -127,7 +127,7 @@ class CorrelateWindow(tk.Toplevel):
 
         ttk.Label(cfg, text='Output file:').grid(
             row=3, column=0, padx=6, pady=4, sticky='w')
-        self.outfile_var = tk.StringVar(value='g2_histogram.txt')
+        self.outfile_var = tk.StringVar(value='.\\spad_data\\g2_histogram.txt')
         ttk.Entry(cfg, textvariable=self.outfile_var, width=32).grid(
             row=3, column=1, columnspan=3, sticky='w')
 
