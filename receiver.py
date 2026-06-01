@@ -24,7 +24,7 @@ from tkinter import ttk, scrolledtext
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from spad_receiver import start_server, check_connection, run_session_loop
+from receiver_backend import start_server, check_connection, run_session_loop
 from correlate import CorrelateWindow
 
 HEALTH_CHECK_MS = 2_000
@@ -375,14 +375,14 @@ class ReceiverGUI:
 
         self.node1 = NodePanel(nodes_frame, self.root,
                                node_id=1,
-                               default_sender_ip='10.7.130.175',
+                               default_sender_ip='192.168.1.11',
                                default_cmd_port=50010,
                                default_data_port=50007,
                                log_fn=self._enqueue_log,
                                get_hooks_fn=lambda: self._correlate_win.hooks_node1)
         self.node2 = NodePanel(nodes_frame, self.root,
                                node_id=2,
-                               default_sender_ip='10.7.151.192',
+                               default_sender_ip='192.168.1.12',
                                default_cmd_port=50010,
                                default_data_port=50008,
                                log_fn=self._enqueue_log,
