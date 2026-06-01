@@ -173,7 +173,7 @@ def run(sock: socket.socket,
                 spad_sock.send(b'T,c,1\n')
                 log_fn(spad_sock.recv(8192).decode('utf8'))
 
-            spad_sock.send(f'SB,{duration}\n'.encode('utf8'))
+            spad_sock.send(f'SB,{int(duration * 1000)}\n'.encode('utf8'))
 
             reset_m = 0
             reset_s = 0
