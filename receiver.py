@@ -58,6 +58,7 @@ class NodePanel:
         self._dwell_q: queue.Queue = queue.Queue()
         self._ssh_creds: tuple | None = None       # (host, user, password) set after Launch
         self._shutdown_thread: threading.Thread | None = None
+        self._dwell_freq: float | None = None      # dwell clock Hz from last Launch R command
 
         self._build_ui(parent, default_sender_ip, default_cmd_port, default_data_port, default_ssh_user)
 
@@ -352,7 +353,7 @@ class NodePanel:
                         else f'[N{self.node_id}] {msg}\n')
 
         try:
-            ssh_launcher.launch_node(
+            self._dwell_freq = ssh_launcher.launch_node(
                 host=host, username=username, password=password,
                 mask_filename=mask, log_fn=_log)
             time.sleep(3)           # give sender.py command server time to start
@@ -548,6 +549,16 @@ class ReceiverGUI:
             return
 
         test = self.test_var.get()
+
+        # Check dwell clock frequency for any launched node
+        for node in (self.node1, self.node2):
+            if node.is_ready() and node._dwell_freq is not None and node._dwell_freq == 0:
+                messagebox.showwarning(
+                    'Dwell Clock Not Running',
+                    f'Node {node.node_id}: dwell clock frequency is 0 Hz.\n'
+                    f'Please start the dwell clock on the detector before acquiring.')
+                return
+
         sent = 0
         for node in (self.node1, self.node2):
             if node.is_ready():
@@ -605,9 +616,9 @@ class ReceiverGUI:
                   justify='center',
                   font=('TkDefaultFont', 11)).pack(padx=30, pady=(20, 8))
 
-        err_var = tk.StringVar(value='Waiting for dwell signal …')
+        err_var = tk.StringVar(value='')
         ttk.Label(popup, textvariable=err_var,
-                  foreground='#cc9900', wraplength=300).pack(padx=20, pady=(0, 4))
+                  foreground='#cc3333', wraplength=300).pack(padx=20, pady=(0, 4))
 
         btn_frame = ttk.Frame(popup)
         btn_frame.pack(pady=(4, 20))
@@ -616,24 +627,14 @@ class ReceiverGUI:
             if self._apply_dwell_offset(err_var) is None:
                 popup.destroy()
 
-        ok_btn = ttk.Button(btn_frame, text='OK', width=10,
-                            command=on_ok, state='disabled')
-        ok_btn.grid(row=0, column=0, padx=6)
+        ttk.Button(btn_frame, text='OK', width=10,
+                   command=on_ok).grid(row=0, column=0, padx=6)
         ttk.Button(btn_frame, text='Skip (offset = 0)', width=16,
                    command=lambda: [
                        self._correlate_win.start_with_offset(0),
                        self._enqueue_log('Dwell skipped — offset set to 0.\n'),
                        popup.destroy(),
                    ]).grid(row=0, column=1, padx=6)
-
-        def _poll_dwell():
-            if not self.node1._dwell_q.empty() and not self.node2._dwell_q.empty():
-                ok_btn.config(state='normal')
-                err_var.set('Dwell received — click OK to apply.')
-            else:
-                popup.after(200, _poll_dwell)
-
-        popup.after(200, _poll_dwell)
 
         popup.transient(self.root)
         popup.update_idletasks()

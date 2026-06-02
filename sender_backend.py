@@ -231,6 +231,7 @@ def run(sock: socket.socket,
                     reset_arr = np.where(is_mast, cum_reset_m, cum_reset_s)
                     time_ps   = (reset_arr * COUNTS_PER_RESET + coarse) * PS_PER_COUNT + fine
 
+                    dwell_seen = False
                     for chip_flag, loc_map, n_phys, chip_name in (
                         (True,  master_loc, 150, 'master'),
                         (False, slave_loc,  170, 'slave'),
@@ -248,8 +249,10 @@ def run(sock: socket.socket,
                             mask = chip_mask & (pixel_nr == sp_id)
                             if mask.any():
                                 bufs[(chip_name, name)].append(time_ps[mask])
+                                if name == 'dwell':
+                                    dwell_seen = True
 
-                    if events_since_flush >= FLUSH_EVERY:
+                    if dwell_seen or events_since_flush >= FLUSH_EVERY:
                         flush()
                         events_since_flush = 0
 

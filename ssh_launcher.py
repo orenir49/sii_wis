@@ -178,10 +178,11 @@ def shutdown_lspad(host: str, username: str, password: str) -> None:
 
 def launch_node(host: str, username: str, password: str,
                 mask_filename: str, log_fn,
-                lspad_port: int = SPAD_PORT) -> None:
+                lspad_port: int = SPAD_PORT) -> float:
     """
     Full launch sequence for one sender node.
     log_fn receives plain text lines (already newline-terminated).
+    Returns the dwell clock frequency (Hz) from the R command.
     Raises RuntimeError on fatal errors.
     """
     client = ssh_connect(host, username, password)
@@ -218,12 +219,14 @@ def launch_node(host: str, username: str, password: str,
             log_fn('No mask file specified — skipping mask command.\n')
 
         # 5. Read detector status (R) before calibration
+        dwell_freq = 0.0
         r_resp = send_lspad_cmd(client, lspad_port, 'R')
         try:
             fields = r_resp.split(',')
             if len(fields) >= 10:   # humidity-sensor format (10 fields)
+                dwell_freq = float(fields[9])
                 log_fn(f'Laser: {float(fields[6]):.0e} Hz   '
-                       f'Dwell: {float(fields[9]):.0e} Hz\n')
+                       f'Dwell: {dwell_freq:.0e} Hz\n')
         except (ValueError, IndexError):
             pass
 
@@ -253,6 +256,8 @@ def launch_node(host: str, username: str, password: str,
         sender  = sii_dir + r'\sender.py'
         start_detached(client, pythonw, sender, sii_dir)
         log_fn('sender.py launched.\n')
+
+        return dwell_freq
 
     finally:
         client.close()
