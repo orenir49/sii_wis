@@ -189,11 +189,7 @@ class NodePanel:
         self._gui(lambda: self._set_ctrl_status('idle'))
         self._gui(lambda: self._set_data_status('idle'))
         self.log_fn(f'Node {self.node_id}: disconnected.\n')
-        if self._ssh_creds:
-            creds, self._ssh_creds = self._ssh_creds, None
-            self._shutdown_thread = threading.Thread(
-                target=self._shutdown_remote, args=creds, daemon=False)
-            self._shutdown_thread.start()
+        self._trigger_remote_shutdown()
 
     # ------------------------------------------------------------------
     # Send commands to sender
@@ -349,6 +345,7 @@ class NodePanel:
         """Background thread: run full node launch sequence then auto-connect."""
         self._gui(lambda: self._set_ctrl_status('launching'))
         self.log_fn(f'Node {self.node_id}: launching remote node …\n')
+        self._ssh_creds = (host, username, password)   # store early so shutdown works on any error
 
         def _log(msg: str) -> None:
             self.log_fn(f'[N{self.node_id}] {msg}' if msg.endswith('\n')
@@ -358,7 +355,6 @@ class NodePanel:
             ssh_launcher.launch_node(
                 host=host, username=username, password=password,
                 mask_filename=mask, log_fn=_log)
-            self._ssh_creds = (host, username, password)
             time.sleep(3)           # give sender.py command server time to start
             self._gui(self._connect)
         except ssh_launcher.UncommittedChangesError as exc:
@@ -367,10 +363,20 @@ class NodePanel:
                 'Uncommitted Changes',
                 f'Node {self.node_id} has uncommitted changes on the sender — '
                 f'git pull skipped.\n\n{changes}'))
+            self._trigger_remote_shutdown()
             self._gui(lambda: self._set_ctrl_status('idle'))
         except Exception as exc:
             self.log_fn(f'Node {self.node_id}: launch failed — {exc}\n')
+            self._trigger_remote_shutdown()
             self._gui(lambda: self._set_ctrl_status('idle'))
+
+    def _trigger_remote_shutdown(self) -> None:
+        """If SSH creds are available, start a non-daemon thread to kill lSPAD."""
+        if self._ssh_creds:
+            creds, self._ssh_creds = self._ssh_creds, None
+            self._shutdown_thread = threading.Thread(
+                target=self._shutdown_remote, args=creds, daemon=False)
+            self._shutdown_thread.start()
 
     def _shutdown_remote(self, host: str, username: str, password: str) -> None:
         """Background thread: SSH in and kill lSPAD on the sender machine."""

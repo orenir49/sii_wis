@@ -132,6 +132,7 @@ def send_lspad_cmd(client: paramiko.SSHClient, port: int,
     chan = transport.open_channel(
         'direct-tcpip', ('127.0.0.1', port), ('127.0.0.1', 0))
     try:
+        _recv_lspad(chan, timeout=1.0)   # drain "lSPAD command server" welcome banner
         chan.sendall((cmd + '\n').encode())
         return _recv_lspad(chan, read_timeout)
     finally:
@@ -151,8 +152,10 @@ def git_update(client: paramiko.SSHClient, repo_dir: str, log_fn) -> None:
     run_ps(client, f"git -C '{repo_dir}' fetch")
 
     status_out, _ = run_ps(client, f"git -C '{repo_dir}' status --porcelain")
-    if status_out:
-        raise UncommittedChangesError(status_out)
+    tracked_changes = '\n'.join(
+        l for l in status_out.splitlines() if not l.startswith('??'))
+    if tracked_changes:
+        raise UncommittedChangesError(tracked_changes)
 
     pull_out, _ = run_ps(client, f"git -C '{repo_dir}' pull")
     log_fn(f'git pull: {pull_out}\n')
@@ -200,12 +203,16 @@ def launch_node(host: str, username: str, password: str,
         # 3. Wait for lSPAD to accept connections
         if not wait_for_port(client, lspad_port, timeout=40):
             raise RuntimeError(
-                f'lSPAD did not open port {lspad_port} within 20 s')
+                f'lSPAD did not open port {lspad_port} within 40 s')
+        log_fn('lSPAD TCP port ready.\n')
 
-        # 4. Apply pixel mask
-        mask_path = lspad_dir + '\\' + mask_filename
-        mask_resp = send_lspad_cmd(client, lspad_port, f'M,{mask_path}')
-        log_fn(f'Mask response: {mask_resp}\n')
+        # 4. Apply pixel mask (skip if no filename provided)
+        if mask_filename.strip():
+            mask_path = lspad_dir + '\\' + mask_filename
+            mask_resp = send_lspad_cmd(client, lspad_port, f'M,{mask_path}')
+            log_fn(f'Mask response: {mask_resp}\n')
+        else:
+            log_fn('No mask file specified — skipping mask command.\n')
 
         # 5. Check TDC calibration; run if needed
         calib_state = send_lspad_cmd(client, lspad_port, 'T,v,1')
