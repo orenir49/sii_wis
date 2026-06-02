@@ -209,19 +209,26 @@ def launch_node(host: str, username: str, password: str,
         # 4. Apply pixel mask (skip if no filename provided)
         if mask_filename.strip():
             mask_path = lspad_dir + '\\' + mask_filename
+            log_fn(f'Applying mask: {mask_path}\n')
             mask_resp = send_lspad_cmd(client, lspad_port, f'M,{mask_path}')
-            log_fn(f'Mask response: {mask_resp}\n')
+            log_fn(f'Mask: {mask_resp}\n')
         else:
             log_fn('No mask file specified — skipping mask command.\n')
 
-        # 5. Check TDC calibration; run if needed
+        # 5. Read detector status (R) before calibration
+        r_resp = send_lspad_cmd(client, lspad_port, 'R')
+        log_fn(f'Detector status (R): {r_resp}\n')
+
+        # 6. Check TDC calibration; run if needed
         calib_state = send_lspad_cmd(client, lspad_port, 'T,v,1')
-        log_fn(f'TDC state: {calib_state}\n')
+        log_fn(f'TDC calibration state: {calib_state}\n')
         if 'invalid' in calib_state.lower():
-            log_fn('Calibrating TDC (T,c,1) — this may take a moment …\n')
+            log_fn('Running TDC calibration (T,c,1) — this may take a moment …\n')
             calib_resp = send_lspad_cmd(
                 client, lspad_port, 'T,c,1', read_timeout=120.0)
             log_fn(f'Calibration result: {calib_resp}\n')
+        else:
+            log_fn('TDC already calibrated — skipping.\n')
 
         # 6. Locate sii_wis directory
         sii_dir = find_sii_wis(client, username)
