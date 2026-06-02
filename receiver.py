@@ -550,17 +550,6 @@ class ReceiverGUI:
 
         test = self.test_var.get()
 
-        # Live check: query lSPAD dwell clock frequency via SSH for each launched node
-        for node in (self.node1, self.node2):
-            if node.is_ready() and node._ssh_creds:
-                host, username, password = node._ssh_creds
-                freq = ssh_launcher.get_dwell_freq(host, username, password)
-                if freq == 0:
-                    messagebox.showwarning(
-                        'Dwell Clock Not Running',
-                        f'Node {node.node_id}: dwell clock frequency is 0 Hz.\n'
-                        f'Please start the dwell clock on the detector before acquiring.')
-                    return
 
         sent = 0
         for node in (self.node1, self.node2):
