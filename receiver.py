@@ -42,7 +42,8 @@ class NodePanel:
                  default_sender_ip: str,
                  default_cmd_port: int,
                  default_data_port: int,
-                 log_fn,
+                 default_ssh_user: str = 'user',
+                 log_fn=None,
                  get_hooks_fn=None) -> None:
         self.root          = root
         self.node_id       = node_id
@@ -55,15 +56,17 @@ class NodePanel:
         self._ctrl_lock    = threading.Lock()
         self._state        = 'idle'   # 'idle' | 'ready' | 'streaming'
         self._dwell_q: queue.Queue = queue.Queue()
+        self._ssh_creds: tuple | None = None       # (host, user, password) set after Launch
+        self._shutdown_thread: threading.Thread | None = None
 
-        self._build_ui(parent, default_sender_ip, default_cmd_port, default_data_port)
+        self._build_ui(parent, default_sender_ip, default_cmd_port, default_data_port, default_ssh_user)
 
 
     # ------------------------------------------------------------------
     # UI
     # ------------------------------------------------------------------
 
-    def _build_ui(self, parent, sender_ip, cmd_port, data_port) -> None:
+    def _build_ui(self, parent, sender_ip, cmd_port, data_port, ssh_user='user') -> None:
         frame = ttk.LabelFrame(parent, text=f'Node {self.node_id}')
         frame.grid(row=self.node_id - 1, column=0, sticky='ew', padx=10, pady=(6, 2))
         parent.columnconfigure(0, weight=1)
@@ -86,7 +89,7 @@ class NodePanel:
 
         # Row 1 — SSH user + mask file
         ttk.Label(frame, text='SSH user:').grid(row=1, column=0, sticky='w', padx=8, pady=4)
-        self.ssh_user_var = tk.StringVar(value='user')
+        self.ssh_user_var = tk.StringVar(value=ssh_user)
         self._ssh_user_entry = ttk.Entry(frame, textvariable=self.ssh_user_var, width=14)
         self._ssh_user_entry.grid(row=1, column=1, sticky='w')
 
@@ -186,6 +189,11 @@ class NodePanel:
         self._gui(lambda: self._set_ctrl_status('idle'))
         self._gui(lambda: self._set_data_status('idle'))
         self.log_fn(f'Node {self.node_id}: disconnected.\n')
+        if self._ssh_creds:
+            creds, self._ssh_creds = self._ssh_creds, None
+            self._shutdown_thread = threading.Thread(
+                target=self._shutdown_remote, args=creds, daemon=False)
+            self._shutdown_thread.start()
 
     # ------------------------------------------------------------------
     # Send commands to sender
@@ -350,6 +358,7 @@ class NodePanel:
             ssh_launcher.launch_node(
                 host=host, username=username, password=password,
                 mask_filename=mask, log_fn=_log)
+            self._ssh_creds = (host, username, password)
             time.sleep(3)           # give sender.py command server time to start
             self._gui(self._connect)
         except ssh_launcher.UncommittedChangesError as exc:
@@ -362,6 +371,15 @@ class NodePanel:
         except Exception as exc:
             self.log_fn(f'Node {self.node_id}: launch failed — {exc}\n')
             self._gui(lambda: self._set_ctrl_status('idle'))
+
+    def _shutdown_remote(self, host: str, username: str, password: str) -> None:
+        """Background thread: SSH in and kill lSPAD on the sender machine."""
+        self.log_fn(f'Node {self.node_id}: shutting down lSPAD on {host} …\n')
+        try:
+            ssh_launcher.shutdown_lspad(host, username, password)
+            self.log_fn(f'Node {self.node_id}: lSPAD shut down.\n')
+        except Exception as exc:
+            self.log_fn(f'Node {self.node_id}: lSPAD shutdown failed — {exc}\n')
 
     # ------------------------------------------------------------------
     # Health check  (main thread)
@@ -435,6 +453,7 @@ class ReceiverGUI:
         self._build_ui()
         self._poll_log()
         self._schedule_health_check()
+        self.root.protocol('WM_DELETE_WINDOW', self._on_close)
 
     # ------------------------------------------------------------------
     # UI
@@ -449,6 +468,7 @@ class ReceiverGUI:
                                default_sender_ip='192.168.1.11',
                                default_cmd_port=50010,
                                default_data_port=50007,
+                               default_ssh_user='labcomp1',
                                log_fn=self._enqueue_log,
                                get_hooks_fn=lambda: self._correlate_win.hooks_node1)
         self.node2 = NodePanel(nodes_frame, self.root,
@@ -456,6 +476,7 @@ class ReceiverGUI:
                                default_sender_ip='192.168.1.12',
                                default_cmd_port=50010,
                                default_data_port=50008,
+                               default_ssh_user='oreni',
                                log_fn=self._enqueue_log,
                                get_hooks_fn=lambda: self._correlate_win.hooks_node2)
 
@@ -635,6 +656,20 @@ class ReceiverGUI:
         self.node1.health_check()
         self.node2.health_check()
         self._schedule_health_check()
+
+    # ------------------------------------------------------------------
+    # Window close
+    # ------------------------------------------------------------------
+
+    def _on_close(self) -> None:
+        """Disconnect all nodes (triggers lSPAD shutdown), wait, then exit."""
+        for node in (self.node1, self.node2):
+            if node._state != 'idle':
+                node._disconnect()
+        for node in (self.node1, self.node2):
+            if node._shutdown_thread and node._shutdown_thread.is_alive():
+                node._shutdown_thread.join(timeout=8)
+        self.root.destroy()
 
     # ------------------------------------------------------------------
     # Log

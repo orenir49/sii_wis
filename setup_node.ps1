@@ -10,7 +10,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $REPO_URL  = 'https://github.com/orenir49/sii_wis.git'
-$REPO_DIR  = Join-Path $env:USERPROFILE 'code\sii_wis'
+$REPO_DIR  = Join-Path $env:USERPROFILE 'Documents\code\sii_wis'
 $SUBNET    = '192.168.1.*'
 $TASK_NAME = 'Force192PrivateNetwork'
 

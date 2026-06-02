@@ -64,14 +64,10 @@ def find_lspad_dir(client: paramiko.SSHClient) -> str | None:
     return out or None
 
 
-def find_sii_wis(client: paramiko.SSHClient) -> str | None:
-    """Return the full path of the sii_wis project directory, or None."""
-    script = (
-        r"Get-ChildItem 'C:\Users' -Directory | ForEach-Object { "
-        r"$p = Join-Path $_.FullName 'code\sii_wis'; "
-        r"if (Test-Path $p) { $p } } | Select-Object -First 1"
-    )
-    out, _ = run_ps(client, script)
+def find_sii_wis(client: paramiko.SSHClient, username: str) -> str | None:
+    """Return the full path of the sii_wis project directory for the given user, or None."""
+    path = rf'C:\Users\{username}\Documents\code\sii_wis'
+    out, _ = run_ps(client, f"if (Test-Path '{path}') {{ '{path}' }}")
     return out or None
 
 
@@ -166,6 +162,17 @@ def git_update(client: paramiko.SSHClient, repo_dir: str, log_fn) -> None:
 # Full node launch sequence
 # ---------------------------------------------------------------------------
 
+def shutdown_lspad(host: str, username: str, password: str) -> None:
+    """SSH into host and kill any running lSPAD process. Best-effort."""
+    client = ssh_connect(host, username, password)
+    try:
+        run_ps(client,
+               "Get-Process -Name 'lSPAD*' -ErrorAction SilentlyContinue | "
+               "Stop-Process -Force")
+    finally:
+        client.close()
+
+
 def launch_node(host: str, username: str, password: str,
                 mask_filename: str, log_fn,
                 lspad_port: int = SPAD_PORT) -> None:
@@ -210,7 +217,7 @@ def launch_node(host: str, username: str, password: str,
             log_fn(f'Calibration result: {calib_resp}\n')
 
         # 6. Locate sii_wis directory
-        sii_dir = find_sii_wis(client)
+        sii_dir = find_sii_wis(client, username)
         if not sii_dir:
             raise RuntimeError(
                 r'sii_wis directory not found under C:\Users\*\code\\')
