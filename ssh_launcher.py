@@ -165,6 +165,23 @@ def git_update(client: paramiko.SSHClient, repo_dir: str, log_fn) -> None:
 # Full node launch sequence
 # ---------------------------------------------------------------------------
 
+def get_dwell_freq(host: str, username: str, password: str,
+                   lspad_port: int = SPAD_PORT) -> float:
+    """SSH in, send R command, return dwell clock frequency (Hz). Best-effort: returns 0.0 on any error."""
+    try:
+        client = ssh_connect(host, username, password)
+        try:
+            r_resp = send_lspad_cmd(client, lspad_port, 'R')
+            fields = r_resp.split(',')
+            if len(fields) >= 10:
+                return float(fields[9])
+        finally:
+            client.close()
+    except Exception:
+        pass
+    return 0.0
+
+
 def shutdown_lspad(host: str, username: str, password: str) -> None:
     """SSH into host and kill any running lSPAD process. Best-effort."""
     client = ssh_connect(host, username, password)
