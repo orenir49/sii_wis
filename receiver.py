@@ -20,7 +20,7 @@ import sys
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk, scrolledtext, simpledialog
+from tkinter import ttk, scrolledtext, simpledialog, messagebox
 
 import numpy as np
 
@@ -352,6 +352,13 @@ class NodePanel:
                 mask_filename=mask, log_fn=_log)
             time.sleep(3)           # give sender.py command server time to start
             self._gui(self._connect)
+        except ssh_launcher.UncommittedChangesError as exc:
+            changes = str(exc)
+            self._gui(lambda: messagebox.showwarning(
+                'Uncommitted Changes',
+                f'Node {self.node_id} has uncommitted changes on the sender — '
+                f'git pull skipped.\n\n{changes}'))
+            self._gui(lambda: self._set_ctrl_status('idle'))
         except Exception as exc:
             self.log_fn(f'Node {self.node_id}: launch failed — {exc}\n')
             self._gui(lambda: self._set_ctrl_status('idle'))

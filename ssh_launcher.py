@@ -18,6 +18,11 @@ import time
 
 import paramiko
 
+
+class UncommittedChangesError(RuntimeError):
+    """Raised when the remote repo has uncommitted changes; payload is git status output."""
+
+
 LSPAD_SEARCH_ROOT = r'C:\Program Files (x86)\SPADlambda'
 LSPAD_EXE         = 'lSPAD.exe'
 SPAD_PORT         = 9999
@@ -133,6 +138,26 @@ def send_lspad_cmd(client: paramiko.SSHClient, port: int,
 
 
 # ---------------------------------------------------------------------------
+# Git update
+# ---------------------------------------------------------------------------
+
+def git_update(client: paramiko.SSHClient, repo_dir: str, log_fn) -> None:
+    """
+    Fetch latest refs then pull if the working tree is clean.
+    Raises UncommittedChangesError (with git status output) if dirty.
+    """
+    log_fn('Checking repo for uncommitted changes …\n')
+    run_ps(client, f"git -C '{repo_dir}' fetch")
+
+    status_out, _ = run_ps(client, f"git -C '{repo_dir}' status --porcelain")
+    if status_out:
+        raise UncommittedChangesError(status_out)
+
+    pull_out, _ = run_ps(client, f"git -C '{repo_dir}' pull")
+    log_fn(f'git pull: {pull_out}\n')
+
+
+# ---------------------------------------------------------------------------
 # Full node launch sequence
 # ---------------------------------------------------------------------------
 
@@ -186,7 +211,10 @@ def launch_node(host: str, username: str, password: str,
                 r'sii_wis directory not found under C:\Users\*\code\\')
         log_fn(f'sii_wis found: {sii_dir}\n')
 
-        # 7. Start sender.py using venv pythonw.exe (window visible on remote desktop)
+        # 7. Fetch + pull repo (aborts if uncommitted changes present)
+        git_update(client, sii_dir, log_fn)
+
+        # 8. Start sender.py using venv pythonw.exe (window visible on remote desktop)
         pythonw = sii_dir + r'\.venv\Scripts\pythonw.exe'
         sender  = sii_dir + r'\sender.py'
         start_detached(client, pythonw, sender, sii_dir)
