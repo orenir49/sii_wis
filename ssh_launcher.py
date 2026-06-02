@@ -77,13 +77,18 @@ def find_sii_wis(client: paramiko.SSHClient) -> str | None:
 
 def start_detached(client: paramiko.SSHClient,
                    exe: str, args: str, workdir: str) -> None:
-    """Launch a detached GUI process on the remote desktop via Start-Process."""
+    """
+    Launch a detached process on the remote host via WMI Win32_Process.Create.
+    The spawned process is owned by the WMI service — fully independent of the
+    SSH session and survives after this connection closes.
+    """
     script = (
-        f"Start-Process -FilePath '{exe}' "
-        f"-ArgumentList '{args}' "
-        f"-WorkingDirectory '{workdir}'"
+        f"$r = ([wmiclass]'Win32_Process').Create('{exe} {args}', '{workdir}'); "
+        f"if ($r.ReturnValue -ne 0) {{ throw 'Win32_Process.Create failed: return value ' + $r.ReturnValue }}"
     )
-    run_ps(client, script)
+    _, err = run_ps(client, script)
+    if err:
+        raise RuntimeError(f'start_detached: {err}')
 
 
 def wait_for_port(client: paramiko.SSHClient,
@@ -186,7 +191,7 @@ def launch_node(host: str, username: str, password: str,
         log_fn('lSPAD.exe started — waiting for TCP port …\n')
 
         # 3. Wait for lSPAD to accept connections
-        if not wait_for_port(client, lspad_port, timeout=20):
+        if not wait_for_port(client, lspad_port, timeout=40):
             raise RuntimeError(
                 f'lSPAD did not open port {lspad_port} within 20 s')
 
