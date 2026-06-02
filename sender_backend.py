@@ -28,7 +28,7 @@ DURATION_S  = 1
 TARGET_HOST = '10.7.136.94'
 TARGET_PORT = 50007
 
-FLUSH_EVERY   = 500_000
+FLUSH_EVERY   = 1_000
 QUEUE_MAXSIZE = 200
 
 # ---------------------------------------------------------------------------

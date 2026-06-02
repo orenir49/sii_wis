@@ -220,6 +220,13 @@ def launch_node(host: str, username: str, password: str,
         # 5. Read detector status (R) before calibration
         r_resp = send_lspad_cmd(client, lspad_port, 'R')
         log_fn(f'Detector status (R): {r_resp}\n')
+        try:
+            fields = r_resp.split(',')
+            if len(fields) >= 10:   # humidity-sensor format (10 fields)
+                log_fn(f'  Laser: {float(fields[6]):.1f} Hz   '
+                       f'Dwell: {float(fields[9]):.1f} Hz\n')
+        except (ValueError, IndexError):
+            pass
 
         # 6. Check TDC calibration; run if needed
         calib_state = send_lspad_cmd(client, lspad_port, 'T,v,1')

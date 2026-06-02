@@ -605,9 +605,9 @@ class ReceiverGUI:
                   justify='center',
                   font=('TkDefaultFont', 11)).pack(padx=30, pady=(20, 8))
 
-        err_var = tk.StringVar(value='')
+        err_var = tk.StringVar(value='Waiting for dwell signal …')
         ttk.Label(popup, textvariable=err_var,
-                  foreground='#cc3333', wraplength=300).pack(padx=20, pady=(0, 4))
+                  foreground='#cc9900', wraplength=300).pack(padx=20, pady=(0, 4))
 
         btn_frame = ttk.Frame(popup)
         btn_frame.pack(pady=(4, 20))
@@ -616,14 +616,24 @@ class ReceiverGUI:
             if self._apply_dwell_offset(err_var) is None:
                 popup.destroy()
 
-        ttk.Button(btn_frame, text='OK', width=10,
-                   command=on_ok).grid(row=0, column=0, padx=6)
+        ok_btn = ttk.Button(btn_frame, text='OK', width=10,
+                            command=on_ok, state='disabled')
+        ok_btn.grid(row=0, column=0, padx=6)
         ttk.Button(btn_frame, text='Skip (offset = 0)', width=16,
                    command=lambda: [
                        self._correlate_win.start_with_offset(0),
                        self._enqueue_log('Dwell skipped — offset set to 0.\n'),
                        popup.destroy(),
                    ]).grid(row=0, column=1, padx=6)
+
+        def _poll_dwell():
+            if not self.node1._dwell_q.empty() and not self.node2._dwell_q.empty():
+                ok_btn.config(state='normal')
+                err_var.set('Dwell received — click OK to apply.')
+            else:
+                popup.after(200, _poll_dwell)
+
+        popup.after(200, _poll_dwell)
 
         popup.transient(self.root)
         popup.update_idletasks()

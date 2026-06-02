@@ -125,10 +125,10 @@ class CorrelateWindow(tk.Toplevel):
         ttk.Entry(cfg, textvariable=self.interval_var, width=8).grid(
             row=2, column=3, sticky='w')
 
-        ttk.Label(cfg, text='Output file:').grid(
+        ttk.Label(cfg, text='Suffix:').grid(
             row=3, column=0, padx=6, pady=4, sticky='w')
-        self.outfile_var = tk.StringVar(value='.\\spad_data\\g2_histogram.txt')
-        ttk.Entry(cfg, textvariable=self.outfile_var, width=32).grid(
+        self.suffix_var = tk.StringVar(value='g2')
+        ttk.Entry(cfg, textvariable=self.suffix_var, width=32).grid(
             row=3, column=1, columnspan=3, sticky='w')
 
         btn_row = ttk.Frame(cfg)
@@ -377,9 +377,13 @@ class CorrelateWindow(tk.Toplevel):
         self._write_histogram(centers, hist)
 
     def _write_histogram(self, centers: np.ndarray, hist: np.ndarray) -> None:
-        path = self.outfile_var.get().strip()
-        if not path:
+        try:
+            px1, px2, _, _, _ = self._get_params()
+        except Exception:
             return
+        suffix = self.suffix_var.get().strip()
+        name   = f'{px1}_{px2}_{suffix}' if suffix else f'{px1}_{px2}'
+        path   = f'.\\spad_data\\{name}.txt'
         try:
             with open(path, 'w') as f:
                 f.write('tau_ps\tcounts\n')
