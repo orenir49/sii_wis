@@ -200,17 +200,19 @@ def launch_node(host: str, username: str, password: str,
         start_detached(client, lspad_exe, 'GUI', lspad_dir)
         log_fn('lSPAD.exe started — waiting for TCP port …\n')
 
-        # 3. Wait for lSPAD to accept connections
+        # 3. Wait for lSPAD to accept connections, then let it finish initialising
         if not wait_for_port(client, lspad_port, timeout=40):
             raise RuntimeError(
                 f'lSPAD did not open port {lspad_port} within 40 s')
         log_fn('lSPAD TCP port ready.\n')
+        time.sleep(2)   # let lSPAD finish GUI/hardware init before sending commands
 
         # 4. Apply pixel mask (skip if no filename provided)
         if mask_filename.strip():
             mask_path = lspad_dir + '\\' + mask_filename
             log_fn(f'Applying mask: {mask_path}\n')
-            mask_resp = send_lspad_cmd(client, lspad_port, f'M,{mask_path}')
+            mask_resp = send_lspad_cmd(client, lspad_port, f'M,{mask_path}',
+                                       read_timeout=30.0)
             log_fn(f'Mask: {mask_resp}\n')
         else:
             log_fn('No mask file specified — skipping mask command.\n')
