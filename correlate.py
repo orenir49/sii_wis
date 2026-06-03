@@ -71,6 +71,10 @@ class CorrelateWindow(tk.Toplevel):
         self._has_new_data  = False
         self._result_q: queue.Queue = queue.Queue()
 
+        # Accumulated histogram (incremental — staging buffers are cleared each pass)
+        self._hist: np.ndarray | None = None
+        self._bins: np.ndarray | None = None
+
         self._build_ui()
 
         # Pre-warm numba in background; update status when done
@@ -232,6 +236,8 @@ class CorrelateWindow(tk.Toplevel):
     def _reset(self) -> None:
         self._t1           = np.empty(0, dtype=np.int64)
         self._t2           = np.empty(0, dtype=np.int64)
+        self._hist         = None
+        self._bins         = None
         self._offset       = None
         self._accumulating = False
         for q in (self._q1, self._q2):
@@ -292,6 +298,8 @@ class CorrelateWindow(tk.Toplevel):
                     break
         self._t1           = np.empty(0, dtype=np.int64)
         self._t2           = np.empty(0, dtype=np.int64)
+        self._hist         = None
+        self._bins         = None
         self._offset       = offset
         self._accumulating = True
         self.status_var.set(f'Accumulating — offset {offset:+,} ps')
@@ -336,8 +344,9 @@ class CorrelateWindow(tk.Toplevel):
     def _launch_correlation(self) -> None:
         self._correlating  = True
         self._has_new_data = False
-        t1 = self._t1.copy()
-        t2 = self._t2.copy()
+        t1, t2   = self._t1, self._t2           # grab references (no copy)
+        self._t1 = np.empty(0, dtype=np.int64)  # clear staging buffers immediately
+        self._t2 = np.empty(0, dtype=np.int64)  # _poll_data fills fresh arrays from here
         threading.Thread(
             target=self._correlate_bg,
             args=(t1, t2),
@@ -366,8 +375,13 @@ class CorrelateWindow(tk.Toplevel):
         try:
             result = self._result_q.get_nowait()
             if result[0] == 'ok':
-                _, hist, bins, n1, n2 = result
-                warn   = self._update_plot(hist, bins)
+                _, partial_hist, bins, n1, n2 = result
+                if self._hist is None or len(partial_hist) != len(self._hist):
+                    self._hist = partial_hist          # first pass or parameter change
+                    self._bins = bins
+                else:
+                    self._hist = self._hist + partial_hist
+                warn   = self._update_plot(self._hist, self._bins)
                 busy   = '  (correlating …)' if self._correlating else ''
                 off_s  = f'  offset {self._offset:+,} ps' if self._offset is not None else ''
                 status = f'Accumulating{off_s} — {n1:,} px1, {n2:,} px2 events{busy}'
@@ -393,7 +407,6 @@ class CorrelateWindow(tk.Toplevel):
     def _update_plot(self, hist: np.ndarray, bins: np.ndarray) -> str:
         """Draw histogram; returns a warning string for the status bar (empty if none)."""
         centers   = (bins[:-1] + bins[1:]) / 2
-        width     = (bins[1] - bins[0]) * 0.9
         plot_data = hist.astype(float)
         ylabel    = 'Counts'
         title     = 'g² — live'
@@ -419,7 +432,7 @@ class CorrelateWindow(tk.Toplevel):
                 warn = f'[norm error: {exc}]'
 
         self.ax.clear()
-        self.ax.bar(centers, plot_data, width=width, color='steelblue', edgecolor='none')
+        self.ax.stairs(plot_data, bins, fill=True, color='steelblue', linewidth=0)
         self.ax.set_xlabel('τ (ps)')
         self.ax.set_ylabel(ylabel)
         self.ax.set_title(title)
