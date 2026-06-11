@@ -12,6 +12,7 @@ Workflow:
   3. Each connected sender runs its acquisition and streams data here.
 """
 
+import csv
 import json
 import os
 import queue
@@ -457,6 +458,7 @@ class ReceiverGUI:
         self._run_id = 0
 
         self._correlate_win = CorrelateWindow(root)
+        self._monitor_abort: threading.Event | None = None
         self._build_ui()
         self._poll_log()
         self._schedule_health_check()
@@ -495,7 +497,7 @@ class ReceiverGUI:
         self.test_var = tk.BooleanVar(value=False)
         ttk.Radiobutton(acq, text='Real', variable=self.test_var,
                         value=False).grid(row=0, column=1, sticky='w')
-        ttk.Radiobutton(acq, text='Test', variable=self.test_var,
+        ttk.Radiobutton(acq, text='Monitor', variable=self.test_var,
                         value=True).grid(row=0, column=2, sticky='w', padx=(0, 16))
 
         ttk.Label(acq, text='Duration (s):').grid(row=0, column=3, sticky='w', padx=(12, 4))
@@ -548,21 +550,21 @@ class ReceiverGUI:
             self._enqueue_log('Error: duration must be a positive number.\n')
             return
 
-        test = self.test_var.get()
-
+        if self.test_var.get():
+            self._start_monitor(duration)
+            return
 
         sent = 0
         for node in (self.node1, self.node2):
             if node.is_ready():
-                node.send_start(duration, test)
+                node.send_start(duration, False)
                 sent += 1
 
         if sent == 0:
             self._enqueue_log('No nodes connected — nothing started.\n')
             return
 
-        self._enqueue_log(f'START sent to {sent} node(s) '
-                          f'({"test" if test else "real"}, {duration} s).\n')
+        self._enqueue_log(f'START sent to {sent} node(s) (real, {duration} s).\n')
         self._run_id += 1
         self._set_progress(0)
         step_ms = max(1, int(duration / 10 * 1000))
@@ -572,12 +574,131 @@ class ReceiverGUI:
             self._show_dwell_popup()
 
     def _abort_all(self) -> None:
+        if self._monitor_abort is not None:
+            self._monitor_abort.set()
         for node in (self.node1, self.node2):
             if node.is_ready():
                 node.send_abort()
         self._run_id += 1
         self._set_progress(0)
         self._enqueue_log('ABORT sent to all connected nodes.\n')
+
+    # ------------------------------------------------------------------
+    # Monitor mode  (environmental polling via SSH R command)
+    # ------------------------------------------------------------------
+
+    def _start_monitor(self, duration: float) -> None:
+        if self._monitor_abort is not None and not self._monitor_abort.is_set():
+            self._enqueue_log('Monitor already running — click ABORT to stop it first.\n')
+            return
+
+        # Collect SSH credentials for each node; ask for password if not cached.
+        node_creds: list[tuple[int, tuple]] = []
+        for node in (self.node1, self.node2):
+            creds = node._ssh_creds
+            if creds is None:
+                host = node.ip_var.get().strip()
+                user = node.ssh_user_var.get().strip()
+                if not host:
+                    continue
+                pw = simpledialog.askstring(
+                    'SSH Password',
+                    f'Password for {user}@{host} (Node {node.node_id}):',
+                    show='*', parent=self.root)
+                if pw:
+                    creds = (host, user, pw)
+                else:
+                    self._enqueue_log(f'Node {node.node_id}: skipped (no password).\n')
+                    continue
+            node_creds.append((node.node_id, creds))
+
+        if not node_creds:
+            self._enqueue_log('No nodes available for monitoring.\n')
+            return
+
+        self._monitor_abort = threading.Event()
+        self._enqueue_log(
+            f'Monitor started: {duration:.0f} s, {len(node_creds)} node(s), '
+            f'R poll every 10 s.\n')
+
+        for node_id, creds in node_creds:
+            threading.Thread(
+                target=self._run_monitor_node,
+                args=(node_id, creds, duration),
+                daemon=True).start()
+
+        self._run_id += 1
+        self._set_progress(0)
+        step_ms = max(1, int(duration / 10 * 1000))
+        self._schedule_progress(step_ms, 1, self._run_id)
+
+    def _run_monitor_node(self, node_id: int, creds: tuple, duration: float) -> None:
+        host, username, password = creds
+        rows: list[dict] = []
+
+        def log(msg: str) -> None:
+            self._enqueue_log(
+                f'[N{node_id}] {msg}' if msg.endswith('\n') else f'[N{node_id}] {msg}\n')
+
+        try:
+            ssh_launcher.ensure_lspad_running(host, username, password, log)
+        except Exception as exc:
+            log(f'Cannot start lSPAD: {exc}')
+            return
+
+        log('Environmental monitoring started.')
+        start_time = time.time()
+
+        while not self._monitor_abort.is_set():
+            elapsed = time.time() - start_time
+            if elapsed >= duration:
+                break
+
+            ts = time.strftime('%Y-%m-%dT%H:%M:%S')
+            reading = ssh_launcher.query_r(host, username, password)
+            if reading is not None:
+                reading['timestamp'] = ts
+                reading['elapsed_s'] = round(elapsed, 1)
+                rows.append(reading)
+                log(
+                    f't={elapsed:.0f}s  '
+                    f'FPGA={reading["fpga_master_temp_c"]:.1f}°C  '
+                    f'PCB={reading["pcb_temp_c"]:.1f}°C  '
+                    f'H={reading["humidity_pct"]:.1f}%  '
+                    f'Dwell={reading["dwell_freq_hz"]:.3e} Hz')
+            else:
+                log(f't={elapsed:.0f}s  R command failed.')
+
+            self._monitor_abort.wait(10.0)
+
+        log('Monitoring done.')
+        self._save_monitor_csv(node_id, rows)
+
+    def _save_monitor_csv(self, node_id: int, rows: list[dict]) -> None:
+        if not rows:
+            self._enqueue_log(f'Node {node_id}: no monitor data collected.\n')
+            return
+
+        os.makedirs('spad_data', exist_ok=True)
+        ts = time.strftime('%Y%m%d_%H%M%S')
+        path = os.path.join('spad_data', f'monitor_node{node_id}_{ts}.csv')
+
+        cols = [
+            'timestamp', 'elapsed_s',
+            'fpga_master_temp_c', 'fpga_slave_temp_c',
+            'pcb_temp_c', 'pcb_temp2_c', 'chip_pcb_temp_c',
+            'humidity_pct',
+            'laser_freq_hz', 'frame_freq_hz', 'line_freq_hz', 'dwell_freq_hz',
+        ]
+        try:
+            with open(path, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=cols)
+                writer.writeheader()
+                writer.writerows(rows)
+            self._enqueue_log(
+                f'Node {node_id}: {len(rows)} readings saved → {path}\n')
+        except Exception as exc:
+            self._enqueue_log(f'Node {node_id}: failed to save CSV — {exc}\n')
 
     def _set_progress(self, pct: int) -> None:
         self._progress_var.set(pct)

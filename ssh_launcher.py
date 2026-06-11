@@ -165,6 +165,65 @@ def git_update(client: paramiko.SSHClient, repo_dir: str, log_fn) -> None:
 # Full node launch sequence
 # ---------------------------------------------------------------------------
 
+def ensure_lspad_running(host: str, username: str, password: str, log_fn,
+                         lspad_port: int = SPAD_PORT) -> None:
+    """Start lSPAD.exe on the remote host if it is not already running."""
+    client = ssh_connect(host, username, password)
+    try:
+        out, _ = run_ps(client,
+            "Get-Process -Name 'lSPAD*' -ErrorAction SilentlyContinue "
+            "| Measure-Object | Select-Object -ExpandProperty Count")
+        already = False
+        try:
+            already = int(out.strip()) > 0
+        except ValueError:
+            pass
+
+        if already:
+            log_fn(f'lSPAD already running on {host}.\n')
+            return
+
+        lspad_dir = find_lspad_dir(client)
+        if not lspad_dir:
+            raise RuntimeError(f'lSPAD.exe not found under {LSPAD_SEARCH_ROOT!r}')
+        start_detached(client, lspad_dir + '\\' + LSPAD_EXE, 'GUI', lspad_dir)
+        log_fn('lSPAD.exe started — waiting for TCP port …\n')
+        if not wait_for_port(client, lspad_port, timeout=40):
+            raise RuntimeError(f'lSPAD did not open port {lspad_port} within 40 s')
+        log_fn('lSPAD TCP port ready.\n')
+        time.sleep(2)
+    finally:
+        client.close()
+
+
+def query_r(host: str, username: str, password: str,
+            lspad_port: int = SPAD_PORT) -> dict | None:
+    """SSH in, send R command, parse and return sensor readings. Returns None on error."""
+    try:
+        client = ssh_connect(host, username, password)
+        try:
+            resp = send_lspad_cmd(client, lspad_port, 'R')
+            fields = resp.split(',')
+            if len(fields) >= 10:
+                return {
+                    'fpga_master_temp_c': float(fields[0]),
+                    'fpga_slave_temp_c':  float(fields[1]),
+                    'pcb_temp_c':         float(fields[2]),
+                    'pcb_temp2_c':        float(fields[3]),
+                    'chip_pcb_temp_c':    float(fields[4]),
+                    'humidity_pct':       float(fields[5]),
+                    'laser_freq_hz':      float(fields[6]),
+                    'frame_freq_hz':      float(fields[7]),
+                    'line_freq_hz':       float(fields[8]),
+                    'dwell_freq_hz':      float(fields[9]),
+                }
+        finally:
+            client.close()
+    except Exception:
+        pass
+    return None
+
+
 def get_dwell_freq(host: str, username: str, password: str,
                    lspad_port: int = SPAD_PORT) -> float:
     """SSH in, send R command, return dwell clock frequency (Hz). Best-effort: returns 0.0 on any error."""
