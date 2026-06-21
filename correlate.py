@@ -14,6 +14,7 @@ from tkinter import ttk, filedialog
 
 import numpy as np
 from numba import njit, prange
+from scipy.stats import poisson
 import matplotlib
 matplotlib.use('TkAgg')
 from matplotlib.figure import Figure
@@ -143,8 +144,26 @@ class CorrelateWindow(tk.Toplevel):
         ttk.Button(cfg, text='Browse…', command=self._browse_norm).grid(
             row=4, column=3, sticky='w', padx=(4, 8))
 
+        ttk.Label(cfg, text='Display mode:').grid(
+            row=5, column=0, padx=6, pady=4, sticky='w')
+        mode_frame = ttk.Frame(cfg)
+        mode_frame.grid(row=5, column=1, columnspan=3, sticky='w')
+        self.mode_var = tk.StringVar(value='histogram')
+        ttk.Radiobutton(mode_frame, text='g² histogram',
+                        variable=self.mode_var, value='histogram').pack(side='left', padx=(0, 12))
+        ttk.Radiobutton(mode_frame, text='Count distribution',
+                        variable=self.mode_var, value='distribution').pack(side='left')
+
+        ttk.Label(cfg, text='Expected rate (R):').grid(
+            row=6, column=0, padx=6, pady=4, sticky='w')
+        self.expected_var = tk.StringVar(value='')
+        ttk.Entry(cfg, textvariable=self.expected_var, width=12).grid(
+            row=6, column=1, sticky='w')
+        ttk.Label(cfg, text='Nc = mean × R').grid(
+            row=6, column=2, sticky='w', padx=(2, 6))
+
         btn_row = ttk.Frame(cfg)
-        btn_row.grid(row=5, column=2, columnspan=2, padx=8, pady=4)
+        btn_row.grid(row=7, column=2, columnspan=2, padx=8, pady=4)
         ttk.Button(btn_row, text='Enable',     width=8,
                    command=self._enable).grid(row=0, column=0, padx=3)
         ttk.Button(btn_row, text='Disable',    width=8,
@@ -154,7 +173,7 @@ class CorrelateWindow(tk.Toplevel):
 
         self.status_var = tk.StringVar(value='Disabled.')
         ttk.Label(cfg, textvariable=self.status_var, anchor='w').grid(
-            row=6, column=0, columnspan=4, sticky='w', padx=6, pady=(2, 4))
+            row=8, column=0, columnspan=4, sticky='w', padx=6, pady=(2, 4))
 
         # ── histogram plot ─────────────────────────────────────────────
         fig_frame = ttk.LabelFrame(self, text='g² Histogram')
@@ -450,14 +469,61 @@ class CorrelateWindow(tk.Toplevel):
             unit, scale = 'ps', 1.0
 
         self.ax.clear()
-        self.ax.stairs(plot_data, bins / scale, fill=True, color='steelblue', linewidth=0)
-        self.ax.set_xlabel(f'τ ({unit})')
-        self.ax.set_ylabel(ylabel)
-        self.ax.set_title(title)
+        if self.mode_var.get() == 'distribution':
+            self._draw_distribution(hist)
+        else:
+            self.ax.stairs(plot_data, bins / scale, fill=True, color='steelblue', linewidth=0)
+            self.ax.set_xlabel(f'τ ({unit})')
+            self.ax.set_ylabel(ylabel)
+            self.ax.set_title(title)
         self.fig.tight_layout()
         self.canvas.draw_idle()
         self._write_histogram(centers, hist)  # always save raw d(t) in ps
         return warn
+
+    def _draw_distribution(self, hist: np.ndarray) -> None:
+        counts   = hist.astype(float)
+        mean     = counts.mean()
+        std      = counts.std()
+        pois     = poisson(mean)
+        p_local  = pois.sf(counts.max())
+        N_trials = len(counts)
+        p_lee    = 1.0 - (1.0 - p_local) ** N_trials
+
+        self.ax.hist(counts, bins=50, density=True, alpha=0.6,
+                     color='steelblue', edgecolor='black')
+        self.ax.set_xlabel('counts per bin')
+        self.ax.set_ylabel('Probability density')
+        self.ax.set_title('Count distribution')
+
+        self.ax.axvline(mean, color='k', linestyle='solid', linewidth=1,
+                        label=f'Mean = {mean:.1f}')
+        self.ax.axvline(mean + std, color='k', linestyle='dashed', linewidth=1,
+                        label=f'±1σ = {std:.1f}')
+        self.ax.axvline(mean - std, color='k', linestyle='dashed', linewidth=1)
+
+        x = np.arange(max(0, int(mean - 4 * std)), int(mean + 4 * std) + 1)
+        self.ax.plot(x, pois.pmf(x), 'r-', linewidth=1.5, label='Poisson PMF')
+
+        expected_str = self.expected_var.get().strip()
+        if expected_str:
+            try:
+                R  = float(expected_str)
+                Nc = mean * R
+                self.ax.axvline(Nc, color='red', linestyle='dashed', linewidth=1,
+                                label=f'Nc = {Nc:.1f}  (mean×{R})')
+            except ValueError:
+                pass
+
+        self.ax.text(
+            0.97, 0.97,
+            f'Mean: {mean:.2f}\nStd: {std:.2f}\n'
+            f'P (local): {p_local:.2e}\nP (LEE, N={N_trials:,}): {p_lee:.2e}',
+            transform=self.ax.transAxes, fontsize=9,
+            verticalalignment='top', horizontalalignment='right',
+            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8),
+        )
+        self.ax.legend(loc='upper left', fontsize=8)
 
     def _write_histogram(self, centers: np.ndarray, hist: np.ndarray) -> None:
         try:
