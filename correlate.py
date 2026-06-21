@@ -397,6 +397,18 @@ class CorrelateWindow(tk.Toplevel):
         self.after(200, self._poll_results)
 
     @staticmethod
+    def _pick_unit(tmax_ps: float) -> tuple[str, float]:
+        """Return (label, scale) such that tmax_ps / scale is in [1, 1000)."""
+        if tmax_ps < 1_000:
+            return 'ps', 1.0
+        elif tmax_ps < 1_000_000:
+            return 'ns', 1_000.0
+        elif tmax_ps < 1_000_000_000:
+            return 'µs', 1_000_000.0
+        else:
+            return 'ms', 1_000_000_000.0
+
+    @staticmethod
     def _load_norm(path: str) -> tuple[np.ndarray, np.ndarray]:
         """Load (tau_ps, counts) from a two-column tab-separated file. Raises on error."""
         data = np.loadtxt(path, skiprows=1)
@@ -431,14 +443,20 @@ class CorrelateWindow(tk.Toplevel):
             except Exception as exc:
                 warn = f'[norm error: {exc}]'
 
+        try:
+            _, _, _, tmax, _ = self._get_params()
+            unit, scale = self._pick_unit(tmax)
+        except Exception:
+            unit, scale = 'ps', 1.0
+
         self.ax.clear()
-        self.ax.stairs(plot_data, bins, fill=True, color='steelblue', linewidth=0)
-        self.ax.set_xlabel('τ (ps)')
+        self.ax.stairs(plot_data, bins / scale, fill=True, color='steelblue', linewidth=0)
+        self.ax.set_xlabel(f'τ ({unit})')
         self.ax.set_ylabel(ylabel)
         self.ax.set_title(title)
         self.fig.tight_layout()
         self.canvas.draw_idle()
-        self._write_histogram(centers, hist)  # always save raw d(t)
+        self._write_histogram(centers, hist)  # always save raw d(t) in ps
         return warn
 
     def _write_histogram(self, centers: np.ndarray, hist: np.ndarray) -> None:

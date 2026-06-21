@@ -510,11 +510,15 @@ class ReceiverGUI:
         prog_frame.grid(row=2, column=0, padx=10, pady=(0, 4), sticky='ew')
 
         self._progress_var = tk.IntVar(value=0)
-        ttk.Progressbar(prog_frame, variable=self._progress_var,
-                        maximum=100, length=480, mode='determinate').grid(
-            row=0, column=0, padx=8, pady=6)
+        self._progressbar = ttk.Progressbar(prog_frame, variable=self._progress_var,
+                        maximum=100, length=480, mode='determinate')
+        self._progressbar.grid(row=0, column=0, padx=8, pady=6)
         self._progress_lbl = ttk.Label(prog_frame, text='0 %', width=5, anchor='e')
         self._progress_lbl.grid(row=0, column=1, padx=(0, 8))
+        self._timer_lbl = ttk.Label(prog_frame, text='00:00:00', width=10, anchor='w',
+                                    font=('Courier', 10))
+        self._timer_lbl.grid(row=0, column=0, padx=8, pady=6)
+        self._timer_lbl.grid_remove()
 
         btn_frame = ttk.Frame(acq)
         btn_frame.grid(row=0, column=5, padx=16, pady=6)
@@ -544,10 +548,10 @@ class ReceiverGUI:
     def _start_all(self) -> None:
         try:
             duration = float(self.duration_var.get())
-            if duration <= 0:
+            if duration < 0:
                 raise ValueError
         except ValueError:
-            self._enqueue_log('Error: duration must be a positive number.\n')
+            self._enqueue_log('Error: duration must be a non-negative number (0 = indefinite).\n')
             return
 
         if self.test_var.get():
@@ -564,11 +568,16 @@ class ReceiverGUI:
             self._enqueue_log('No nodes connected — nothing started.\n')
             return
 
-        self._enqueue_log(f'START sent to {sent} node(s) (real, {duration} s).\n')
         self._run_id += 1
-        self._set_progress(0)
-        step_ms = max(1, int(duration / 10 * 1000))
-        self._schedule_progress(step_ms, 1, self._run_id)
+        if duration == 0:
+            self._enqueue_log(f'START sent to {sent} node(s) (real, indefinite).\n')
+            self._start_timer()
+        else:
+            self._enqueue_log(f'START sent to {sent} node(s) (real, {duration} s).\n')
+            self._show_progress_bar()
+            self._set_progress(0)
+            step_ms = max(1, int(duration / 10 * 1000))
+            self._schedule_progress(step_ms, 1, self._run_id)
 
         if self._correlate_win.is_enabled:
             self._show_dwell_popup()
@@ -580,6 +589,7 @@ class ReceiverGUI:
             if node.is_ready():
                 node.send_abort()
         self._run_id += 1
+        self._show_progress_bar()
         self._set_progress(0)
         self._enqueue_log('ABORT sent to all connected nodes.\n')
 
@@ -712,6 +722,29 @@ class ReceiverGUI:
             if step < 10:
                 self._schedule_progress(step_ms, step + 1, run_id)
         self.root.after(step_ms, tick)
+
+    def _start_timer(self) -> None:
+        self._progressbar.grid_remove()
+        self._progress_lbl.grid_remove()
+        self._timer_lbl.config(text='00:00:00')
+        self._timer_lbl.grid()
+        self._schedule_timer(0, self._run_id)
+
+    def _show_progress_bar(self) -> None:
+        self._timer_lbl.grid_remove()
+        self._progressbar.grid()
+        self._progress_lbl.grid()
+
+    def _schedule_timer(self, elapsed_s: int, run_id: int) -> None:
+        def tick() -> None:
+            if run_id != self._run_id:
+                return
+            new_elapsed = elapsed_s + 10
+            h, rem = divmod(new_elapsed, 3600)
+            m, s = divmod(rem, 60)
+            self._timer_lbl.config(text=f'{h:02d}:{m:02d}:{s:02d}')
+            self._schedule_timer(new_elapsed, run_id)
+        self.root.after(10_000, tick)
 
     # ------------------------------------------------------------------
     # Dwell calibration popup
