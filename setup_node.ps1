@@ -94,9 +94,21 @@ Start-ScheduledTask -TaskName $TASK_NAME
 Write-Ok "Task '$TASK_NAME' registered and applied now"
 
 # ---------------------------------------------------------------------------
-# Step 3 — Python
+# Step 3 — ICMP ping (allow LAN devices to reach this node)
 # ---------------------------------------------------------------------------
-Write-Step 'Step 3: Python'
+Write-Step 'Step 3: ICMP ping firewall rule'
+
+# Windows disables the Private-profile ICMPv4-In rule by default, so LAN
+# machines on an unidentified network (no gateway) cannot ping this node.
+netsh advfirewall firewall set rule `
+    name="File and Printer Sharing (Echo Request - ICMPv4-In)" `
+    new enable=yes profile=private | Out-Null
+Write-Ok 'ICMPv4 ping enabled for Private network profile'
+
+# ---------------------------------------------------------------------------
+# Step 4 — Python
+# ---------------------------------------------------------------------------
+Write-Step 'Step 4: Python'
 
 $pythonCmd = Get-Command python -ErrorAction SilentlyContinue
 if ($pythonCmd) {
@@ -107,9 +119,9 @@ if ($pythonCmd) {
 }
 
 # ---------------------------------------------------------------------------
-# Step 4 — Git
+# Step 5 — Git
 # ---------------------------------------------------------------------------
-Write-Step 'Step 4: Git'
+Write-Step 'Step 5: Git'
 
 $gitCmd = Get-Command git -ErrorAction SilentlyContinue
 if ($gitCmd) {
@@ -120,9 +132,9 @@ if ($gitCmd) {
 }
 
 # ---------------------------------------------------------------------------
-# Step 5 — Clone / update repository
+# Step 6 — Clone / update repository
 # ---------------------------------------------------------------------------
-Write-Step 'Step 5: sii_wis repository'
+Write-Step 'Step 6: sii_wis repository'
 
 if (-not $gitCmd) {
     Write-Warn 'Skipping repo clone — Git not available'
@@ -141,9 +153,9 @@ if (-not $gitCmd) {
 }
 
 # ---------------------------------------------------------------------------
-# Step 6 — .venv + pip install
+# Step 7 — .venv + pip install
 # ---------------------------------------------------------------------------
-Write-Step 'Step 6: Python virtual environment + dependencies'
+Write-Step 'Step 7: Python virtual environment + dependencies'
 
 if (-not $pythonCmd) {
     Write-Warn 'Skipping venv — Python not available'
