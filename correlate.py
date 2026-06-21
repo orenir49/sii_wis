@@ -153,6 +153,7 @@ class CorrelateWindow(tk.Toplevel):
                         variable=self.mode_var, value='histogram').pack(side='left', padx=(0, 12))
         ttk.Radiobutton(mode_frame, text='Count distribution',
                         variable=self.mode_var, value='distribution').pack(side='left')
+        self.mode_var.trace_add('write', self._on_display_change)
 
         ttk.Label(cfg, text='Expected rate (R):').grid(
             row=6, column=0, padx=6, pady=4, sticky='w')
@@ -161,6 +162,7 @@ class CorrelateWindow(tk.Toplevel):
             row=6, column=1, sticky='w')
         ttk.Label(cfg, text='Nc = mean × R').grid(
             row=6, column=2, sticky='w', padx=(2, 6))
+        self.expected_var.trace_add('write', self._on_display_change)
 
         btn_row = ttk.Frame(cfg)
         btn_row.grid(row=7, column=2, columnspan=2, padx=8, pady=4)
@@ -273,6 +275,10 @@ class CorrelateWindow(tk.Toplevel):
         self.status_var.set(
             'Data cleared. ' + (
                 'Enabled — waiting for DWELL.' if self._active else 'Disabled.'))
+
+    def _on_display_change(self, *_) -> None:
+        if self._hist is not None and self._bins is not None:
+            self._update_plot(self._hist, self._bins)
 
     # ------------------------------------------------------------------
     # Hooks exposed to receiver nodes
