@@ -60,8 +60,11 @@ class NodePanel:
         self._ssh_creds: tuple | None = None       # (host, user, password) set after Launch
         self._shutdown_thread: threading.Thread | None = None
         self._dwell_freq: float | None = None      # dwell clock Hz from last Launch R command
+        self._event_accum: list = [0]              # [int] — incremented by data thread, read by GUI
+        self._data_streaming = False
 
         self._build_ui(parent, default_sender_ip, default_cmd_port, default_data_port, default_ssh_user)
+        self._schedule_rate_update()
 
 
     # ------------------------------------------------------------------
@@ -301,6 +304,7 @@ class NodePanel:
                     f'[N{self.node_id}] {m}' if m.endswith('\n') else f'[N{self.node_id}] {m}\n'
                 ),
                 pixel_hooks=hooks,
+                event_accum=self._event_accum,
             )
 
             self._data_conn = None
@@ -430,6 +434,7 @@ class NodePanel:
                 e.config(state='disabled')
 
     def _set_data_status(self, state: str) -> None:
+        self._data_streaming = (state == 'streaming')
         if state == 'streaming':
             self.data_status_var.set('  Data: ● Streaming')
             self._data_lbl.config(fg='#33aa33')
@@ -439,6 +444,23 @@ class NodePanel:
         else:
             self.data_status_var.set('  Data: ● Idle')
             self._data_lbl.config(fg='#888888')
+
+    def _schedule_rate_update(self) -> None:
+        self.root.after(10_000, self._update_rate)
+
+    def _update_rate(self) -> None:
+        count = self._event_accum[0]
+        self._event_accum[0] = 0
+        if self._data_streaming:
+            rate = count / 10.0
+            if rate >= 1e6:
+                rate_str = f'{rate/1e6:.2f} Mcps'
+            elif rate >= 1e3:
+                rate_str = f'{rate/1e3:.1f} kcps'
+            else:
+                rate_str = f'{rate:.0f} cps'
+            self.data_status_var.set(f'  Data: ● Streaming   {rate_str}')
+        self._schedule_rate_update()
 
     def _gui(self, fn) -> None:
         self.root.after(0, fn)

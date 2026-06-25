@@ -164,7 +164,6 @@ if (-not $pythonCmd) {
 } else {
     $venvDir = Join-Path $REPO_DIR '.venv'
     $venvPy  = Join-Path $venvDir 'Scripts\python.exe'
-    $venvPip = Join-Path $venvDir 'Scripts\pip.exe'
 
     if (-not (Test-Path $venvPy)) {
         Write-Info 'Creating .venv...'
@@ -177,7 +176,7 @@ if (-not $pythonCmd) {
     $reqFile = Join-Path $REPO_DIR 'requirements.txt'
     if (Test-Path $reqFile) {
         Write-Info 'Installing requirements...'
-        & $venvPip install -r $reqFile
+        & $venvPy -m pip install -r $reqFile
         Write-Ok 'Dependencies installed'
     } else {
         Write-Warn "requirements.txt not found at $reqFile"

@@ -78,14 +78,18 @@ def check_connection(sock: socket.socket) -> bool:
 
 
 def run_session_loop(conn: socket.socket, log_fn=print,
-                     pixel_hooks: dict | None = None) -> None:
+                     pixel_hooks: dict | None = None,
+                     event_accum: list | None = None) -> None:
     """
     Handle back-to-back acquisition sessions on an accepted connection.
     Blocks until the sender disconnects (ConnectionError).
     Protocol per session: KEY_SETUP → data chunks → KEY_END.
 
-    pixel_hooks: optional {key_id: queue.Queue} — matching chunks are put()
-    into the queue instead of written to disk (used by the live correlator).
+    pixel_hooks:  optional {key_id: queue.Queue} — matching chunks are put()
+                  into the queue instead of written to disk (live correlator).
+    event_accum:  optional single-element list [int]; the inner loop adds
+                  n_bytes//8 for every pixel chunk (key_id < 320) so the
+                  caller can poll it for a count-rate display.
     """
     session = 0
     try:
@@ -119,8 +123,8 @@ def run_session_loop(conn: socket.socket, log_fn=print,
                 else:
                     handles[key_id].write(payload)
                 chunks += 1
-                if chunks % 100 == 0:
-                    log_fn(f'  [session {session}] {chunks} chunks received')
+                if event_accum is not None and key_id < 320:
+                    event_accum[0] += n_bytes // 8
 
             for h in handles.values():
                 h.close()
