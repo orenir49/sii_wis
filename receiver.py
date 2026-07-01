@@ -28,6 +28,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from receiver_backend import start_server, check_connection, run_session_loop
 from correlate import CorrelateWindow
+from offset_tools import estimate_offset
 import ssh_launcher
 
 HEALTH_CHECK_MS = 2_000
@@ -322,6 +323,18 @@ class NodePanel:
                 break
         return last
 
+    def get_all_dwell_ps(self) -> np.ndarray:
+        """Drain the dwell queue and return all timestamps as a sorted int64 array."""
+        chunks = []
+        while True:
+            try:
+                chunks.append(self._dwell_q.get_nowait())
+            except queue.Empty:
+                break
+        if not chunks:
+            return np.array([], dtype=np.int64)
+        return np.concatenate([np.frombuffer(c, dtype=np.int64).copy() for c in chunks])
+
     # ------------------------------------------------------------------
     # Remote launch via SSH
     # ------------------------------------------------------------------
@@ -522,6 +535,11 @@ class ReceiverGUI:
         ttk.Radiobutton(acq, text='Monitor', variable=self.test_var,
                         value=True).grid(row=0, column=2, sticky='w', padx=(0, 16))
 
+        self._sparse_cal_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(acq, text='Sparse waveform calibration (auto 5 s)',
+                        variable=self._sparse_cal_var,
+                        ).grid(row=1, column=0, columnspan=5, sticky='w', padx=8, pady=(0, 6))
+
         ttk.Label(acq, text='Duration (s):').grid(row=0, column=3, sticky='w', padx=(12, 4))
         self.duration_var = tk.StringVar(value='1')
         ttk.Entry(acq, textvariable=self.duration_var, width=8).grid(
@@ -602,7 +620,11 @@ class ReceiverGUI:
             self._schedule_progress(step_ms, 1, self._run_id)
 
         if self._correlate_win.is_enabled:
-            self._show_dwell_popup()
+            if self._sparse_cal_var.get():
+                self._enqueue_log('Sparse cal: collecting dwell for 5 s…\n')
+                self.root.after(5000, self._apply_sparse_dwell_offset)
+            else:
+                self._show_dwell_popup()
 
     def _abort_all(self) -> None:
         if self._monitor_abort is not None:
@@ -809,6 +831,32 @@ class ReceiverGUI:
         x = self.root.winfo_x() + (self.root.winfo_width()  - popup.winfo_width())  // 2
         y = self.root.winfo_y() + (self.root.winfo_height() - popup.winfo_height()) // 2
         popup.geometry(f'+{x}+{y}')
+
+    def _apply_sparse_dwell_offset(self) -> None:
+        """Autonomous sparse-waveform dwell calibration using the first 5 s of dwell data."""
+        t1 = self.node1.get_all_dwell_ps()
+        t2 = self.node2.get_all_dwell_ps()
+        MIN_EVENTS = 5
+        if t1.size < MIN_EVENTS or t2.size < MIN_EVENTS:
+            self._enqueue_log(
+                f'Sparse cal failed: {t1.size} / {t2.size} dwell events '
+                f'(need ≥{MIN_EVENTS} each). Setting offset = 0.\n'
+            )
+            self._correlate_win.start_with_offset(0)
+            return
+        offset_ps, details = estimate_offset(
+            t1, t2,
+            cluster_tol=100_000,   # 100 ns in ps — covers jitter, << inter-pulse gap
+            return_details=True,
+        )
+        offset = int(round(offset_ps))
+        self._enqueue_log(
+            f'Sparse cal: offset = {offset:+,} ps  '
+            f'({details["n_matched"]} matched pairs, '
+            f'SEM = {details["sem"]:.0f} ps, '
+            f'streams: {details["n1"]} / {details["n2"]} events)\n'
+        )
+        self._correlate_win.start_with_offset(offset)
 
     def _apply_dwell_offset(self, err_var: tk.StringVar) -> str | None:
         """Read dwell queues from both nodes, compute offset, pass to correlator."""
