@@ -107,26 +107,43 @@ def wait_for_port(client: paramiko.SSHClient,
 # lSPAD TCP commands via SSH direct-tcpip tunnel
 # ---------------------------------------------------------------------------
 
-def _recv_lspad(chan: paramiko.Channel, timeout: float = 5.0) -> str:
-    """Read from channel until quiet for <timeout> seconds."""
-    chan.settimeout(timeout)
+def _recv_lspad(chan: paramiko.Channel, timeout: float = 5.0,
+                until: str | None = None, poll_interval: float = 2.0,
+                log_fn=None) -> str:
+    """
+    Read from channel until quiet for <timeout> seconds (default behavior),
+    or — when `until` is given — poll in <poll_interval>-second slices up to
+    a <timeout>-second cap and return as soon as a chunk containing `until`
+    (case-insensitive) has arrived. Each chunk is passed to `log_fn` (if
+    given) as it's received, so long-running commands show live progress.
+    """
+    chan.settimeout(poll_interval if until else timeout)
     buf = b''
-    while True:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
         try:
             chunk = chan.recv(4096)
             if not chunk:
                 break
             buf += chunk
+            if log_fn:
+                log_fn(chunk.decode('utf-8', errors='replace'))
+            if until and until.lower() in buf.decode('utf-8', errors='replace').lower():
+                break
         except socket.timeout:
+            if until:
+                continue   # still within the overall deadline — keep polling
             break
     return buf.decode('utf-8', errors='replace').strip()
 
 
 def send_lspad_cmd(client: paramiko.SSHClient, port: int,
-                   cmd: str, read_timeout: float = 5.0) -> str:
+                   cmd: str, read_timeout: float = 5.0,
+                   until: str | None = None, log_fn=None) -> str:
     """
     Open a direct-tcpip tunnel to sender's localhost:port,
     send one command (+ newline), read and return the response.
+    See `_recv_lspad` for `until` / `log_fn` polling behavior.
     """
     transport = client.get_transport()
     chan = transport.open_channel(
@@ -134,7 +151,7 @@ def send_lspad_cmd(client: paramiko.SSHClient, port: int,
     try:
         _recv_lspad(chan, timeout=1.0)   # drain "lSPAD command server" welcome banner
         chan.sendall((cmd + '\n').encode())
-        return _recv_lspad(chan, read_timeout)
+        return _recv_lspad(chan, read_timeout, until=until, log_fn=log_fn)
     finally:
         chan.close()
 
@@ -202,7 +219,7 @@ def query_r(host: str, username: str, password: str,
     try:
         client = ssh_connect(host, username, password)
         try:
-            resp = send_lspad_cmd(client, lspad_port, 'R')
+            resp = send_lspad_cmd(client, lspad_port, 'R', until='\n')
             fields = resp.split(',')
             if len(fields) >= 10:
                 return {
@@ -230,7 +247,7 @@ def get_dwell_freq(host: str, username: str, password: str,
     try:
         client = ssh_connect(host, username, password)
         try:
-            r_resp = send_lspad_cmd(client, lspad_port, 'R')
+            r_resp = send_lspad_cmd(client, lspad_port, 'R', until='\n')
             fields = r_resp.split(',')
             if len(fields) >= 10:
                 return float(fields[9])
@@ -288,15 +305,15 @@ def launch_node(host: str, username: str, password: str,
         if mask_filename.strip():
             mask_path = lspad_dir + '\\' + mask_filename
             log_fn(f'Applying mask: {mask_path}\n')
-            mask_resp = send_lspad_cmd(client, lspad_port, f'M,{mask_path}',
-                                       read_timeout=30.0)
-            log_fn(f'Mask: {mask_resp}\n')
+            send_lspad_cmd(client, lspad_port, f'M,{mask_path}',
+                          read_timeout=30.0, until='successful',
+                          log_fn=lambda s: log_fn(f'  {s}'))
         else:
             log_fn('No mask file specified — skipping mask command.\n')
 
         # 5. Read detector status (R) before calibration
         dwell_freq = 0.0
-        r_resp = send_lspad_cmd(client, lspad_port, 'R')
+        r_resp = send_lspad_cmd(client, lspad_port, 'R', until='\n')
         try:
             fields = r_resp.split(',')
             if len(fields) >= 10:   # humidity-sensor format (10 fields)
@@ -307,13 +324,14 @@ def launch_node(host: str, username: str, password: str,
             pass
 
         # 6. Check TDC calibration; run if needed
-        calib_state = send_lspad_cmd(client, lspad_port, 'T,v,1')
+        calib_state = send_lspad_cmd(client, lspad_port, 'T,v,1', until='\n')
         log_fn(f'TDC calibration state: {calib_state}\n')
         if 'invalid' in calib_state.lower():
             log_fn('Running TDC calibration (T,c,1) — this may take a moment …\n')
-            calib_resp = send_lspad_cmd(
-                client, lspad_port, 'T,c,1', read_timeout=120.0)
-            log_fn(f'Calibration result: {calib_resp}\n')
+            send_lspad_cmd(
+                client, lspad_port, 'T,c,1', read_timeout=120.0,
+                until='completed',
+                log_fn=lambda s: log_fn(f'  {s}'))
         else:
             log_fn('TDC already calibrated — skipping.\n')
 
