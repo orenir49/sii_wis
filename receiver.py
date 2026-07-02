@@ -61,6 +61,7 @@ class NodePanel:
         self._dwell_q: queue.Queue = queue.Queue()         # slave_dwell (key 323)
         self._master_dwell_q: queue.Queue = queue.Queue()  # master_dwell (key 320)
         self._output_dir: str | None = None
+        self._flush_active = False   # periodic post-calibration dwell-to-disk flush
         self._ssh_creds: tuple | None = None       # (host, user, password) set after Launch
         self._shutdown_thread: threading.Thread | None = None
         self._dwell_freq: float | None = None      # dwell clock Hz from last Launch R command
@@ -177,6 +178,8 @@ class NodePanel:
         threading.Thread(target=self._accept_data_thread, daemon=True).start()
 
     def _disconnect(self) -> None:
+        self.stop_dwell_flush()
+        self.dump_dwell_bins(self.get_all_dwell_ps(), self.get_all_master_dwell_ps())
         if self._ctrl_sock:
             try:
                 self._ctrl_sock.close()
@@ -274,11 +277,15 @@ class NodePanel:
             self._gui(lambda: self._set_data_status('streaming'))
         elif s == 'done':
             self._gui(lambda: self._set_data_status('idle'))
+            self.stop_dwell_flush()
+            self.dump_dwell_bins(self.get_all_dwell_ps(), self.get_all_master_dwell_ps())
         elif s == 'log':
             self.log_fn(f'[N{self.node_id}] {msg.get("msg", "")}\n')
         elif s == 'error':
             self.log_fn(f'[N{self.node_id}] Error: {msg.get("msg")}\n')
             self._gui(lambda: self._set_data_status('error'))
+            self.stop_dwell_flush()
+            self.dump_dwell_bins(self.get_all_dwell_ps(), self.get_all_master_dwell_ps())
         elif s == 'busy':
             self.log_fn(f'[N{self.node_id}] Sender busy — START ignored.\n')
 
@@ -293,7 +300,8 @@ class NodePanel:
             self._data_conn = conn
             self.log_fn(f'[N{self.node_id}] Data connection from {addr[0]}\n')
 
-            # Clear any stale dwell data from a previous session
+            # Stop any leftover flush loop and clear stale dwell data from a previous session
+            self.stop_dwell_flush()
             for q in (self._dwell_q, self._master_dwell_q):
                 while not q.empty():
                     try:
@@ -329,11 +337,6 @@ class NodePanel:
             return np.array([], dtype=np.int64)
         return np.concatenate([np.frombuffer(c, dtype=np.int64).copy() for c in chunks])
 
-    def get_last_dwell_ps(self) -> int | None:
-        """Drain the slave_dwell queue and return the last received timestamp, or None."""
-        arr = self._drain(self._dwell_q)
-        return int(arr[-1]) if arr.size else None
-
     def get_all_dwell_ps(self) -> np.ndarray:
         """Drain the slave_dwell queue and return all timestamps as an int64 array."""
         return self._drain(self._dwell_q)
@@ -343,16 +346,37 @@ class NodePanel:
         return self._drain(self._master_dwell_q)
 
     def dump_dwell_bins(self, slave_arr: np.ndarray, master_arr: np.ndarray) -> None:
-        """Write drained dwell arrays to this node's session dwell .bin files
-        (normally written incrementally by run_session_loop, but calibration
-        intercepts these keys into queues instead)."""
-        if not self._output_dir:
+        """Append newly drained dwell arrays to this node's session dwell .bin
+        files (run_session_loop truncates them to empty at session start, then
+        routes keys 320/323 into queues instead of writing them directly, so
+        every drain — calibration or periodic flush — must append, not overwrite)."""
+        if not self._output_dir or (slave_arr.size == 0 and master_arr.size == 0):
             return
         os.makedirs(self._output_dir, exist_ok=True)
-        with open(os.path.join(self._output_dir, 'slave_dwell.bin'), 'wb') as f:
-            f.write(slave_arr.tobytes())
-        with open(os.path.join(self._output_dir, 'master_dwell.bin'), 'wb') as f:
-            f.write(master_arr.tobytes())
+        if slave_arr.size:
+            with open(os.path.join(self._output_dir, 'slave_dwell.bin'), 'ab') as f:
+                f.write(slave_arr.tobytes())
+        if master_arr.size:
+            with open(os.path.join(self._output_dir, 'master_dwell.bin'), 'ab') as f:
+                f.write(master_arr.tobytes())
+
+    def start_dwell_flush(self, interval_ms: int = 2000) -> None:
+        """Begin periodically appending newly arrived dwell events to disk.
+        Call once calibration has consumed what it needs from the queues —
+        starting earlier would race calibration for the same events."""
+        if self._flush_active:
+            return
+        self._flush_active = True
+        self._schedule_dwell_flush(interval_ms)
+
+    def stop_dwell_flush(self) -> None:
+        self._flush_active = False
+
+    def _schedule_dwell_flush(self, interval_ms: int) -> None:
+        if not self._flush_active:
+            return
+        self.dump_dwell_bins(self.get_all_dwell_ps(), self.get_all_master_dwell_ps())
+        self.root.after(interval_ms, lambda: self._schedule_dwell_flush(interval_ms))
 
     # ------------------------------------------------------------------
     # Remote launch via SSH
@@ -855,6 +879,12 @@ class ReceiverGUI:
                    command=on_ok).grid(row=0, column=0, padx=6)
         ttk.Button(btn_frame, text='Skip (offset = 0)', width=16,
                    command=lambda: [
+                       self.node1.dump_dwell_bins(self.node1.get_all_dwell_ps(),
+                                                   self.node1.get_all_master_dwell_ps()),
+                       self.node2.dump_dwell_bins(self.node2.get_all_dwell_ps(),
+                                                   self.node2.get_all_master_dwell_ps()),
+                       self.node1.start_dwell_flush(),
+                       self.node2.start_dwell_flush(),
                        self._correlate_win.start_with_offset(0),
                        self._enqueue_log('Dwell skipped — offset set to 0.\n'),
                        self._set_cal_status('● Calibration skipped — offset = 0', color='#cc8800'),
@@ -890,6 +920,8 @@ class ReceiverGUI:
                 f'● Calibration failed ({t1.size}/{t2.size} events) — offset = 0',
                 color='#cc3333')
             self._correlate_win.start_with_offset(0)
+            self.node1.start_dwell_flush()
+            self.node2.start_dwell_flush()
             return
 
         cluster_tol = 10_000  # 10 ns: excludes ±32 ns TDC doublet sidelobes
@@ -928,11 +960,23 @@ class ReceiverGUI:
             f'● Calibrated — offset {slave_offset:+,} ps, acquisition running',
             color='#228822')
         self._correlate_win.start_with_offset(slave_offset)
+        self.node1.start_dwell_flush()
+        self.node2.start_dwell_flush()
 
     def _apply_dwell_offset(self, err_var: tk.StringVar) -> str | None:
         """Read dwell queues from both nodes, compute offset, pass to correlator."""
-        last1 = self.node1.get_last_dwell_ps()
-        last2 = self.node2.get_last_dwell_ps()
+        slave1 = self.node1.get_all_dwell_ps()
+        slave2 = self.node2.get_all_dwell_ps()
+        master1 = self.node1.get_all_master_dwell_ps()
+        master2 = self.node2.get_all_master_dwell_ps()
+
+        # Dump whatever was collected while waiting for the popup — safe to
+        # call on every attempt since it only appends newly drained events.
+        self.node1.dump_dwell_bins(slave1, master1)
+        self.node2.dump_dwell_bins(slave2, master2)
+
+        last1 = int(slave1[-1]) if slave1.size else None
+        last2 = int(slave2[-1]) if slave2.size else None
 
         if last1 is None:
             msg = 'No dwell signal received on Node 1 yet — press DWELL and retry.'
@@ -950,6 +994,8 @@ class ReceiverGUI:
             f'● Calibrated — offset {offset:+,} ps, acquisition running',
             color='#228822')
         self._correlate_win.start_with_offset(offset)
+        self.node1.start_dwell_flush()
+        self.node2.start_dwell_flush()
         return None
 
     # ------------------------------------------------------------------
