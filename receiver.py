@@ -32,6 +32,7 @@ from offset_tools import estimate_offset
 import ssh_launcher
 
 HEALTH_CHECK_MS = 2_000
+SPARSE_CAL_DURATION_S = 4.194304  # RIGOL sparse-pulse RAF waveform: 2**23 pts @ 2 MSa/s
 
 
 # ---------------------------------------------------------------------------
@@ -536,9 +537,13 @@ class ReceiverGUI:
                         value=True).grid(row=0, column=2, sticky='w', padx=(0, 16))
 
         self._sparse_cal_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(acq, text='Sparse waveform calibration (auto 5 s)',
+        ttk.Checkbutton(acq, text=f'Sparse waveform calibration (auto {SPARSE_CAL_DURATION_S:.2f} s)',
                         variable=self._sparse_cal_var,
                         ).grid(row=1, column=0, columnspan=5, sticky='w', padx=8, pady=(0, 6))
+
+        self._cal_status_var = tk.StringVar(value='')
+        self._cal_status_lbl = tk.Label(acq, textvariable=self._cal_status_var, anchor='w')
+        self._cal_status_lbl.grid(row=2, column=0, columnspan=5, sticky='w', padx=8, pady=(0, 6))
 
         ttk.Label(acq, text='Duration (s):').grid(row=0, column=3, sticky='w', padx=(12, 4))
         self.duration_var = tk.StringVar(value='1')
@@ -609,6 +614,7 @@ class ReceiverGUI:
             return
 
         self._run_id += 1
+        self._set_cal_status('')
         if duration == 0:
             self._enqueue_log(f'START sent to {sent} node(s) (real, indefinite).\n')
             self._start_timer()
@@ -621,9 +627,15 @@ class ReceiverGUI:
 
         if self._correlate_win.is_enabled:
             if self._sparse_cal_var.get():
-                self._enqueue_log('Sparse cal: collecting dwell for 5 s…\n')
-                self.root.after(5000, self._apply_sparse_dwell_offset)
+                self._enqueue_log(
+                    f'Sparse cal: collecting dwell for {SPARSE_CAL_DURATION_S:.2f} s…\n')
+                self._set_cal_status(
+                    f'● Calibrating dwell offset ({SPARSE_CAL_DURATION_S:.2f} s)…',
+                    color='#cc8800')
+                self.root.after(round(SPARSE_CAL_DURATION_S * 1000),
+                                 self._apply_sparse_dwell_offset)
             else:
+                self._set_cal_status('● Waiting for manual DWELL press…', color='#cc8800')
                 self._show_dwell_popup()
 
     def _abort_all(self) -> None:
@@ -794,6 +806,10 @@ class ReceiverGUI:
     # Dwell calibration popup
     # ------------------------------------------------------------------
 
+    def _set_cal_status(self, text: str, color: str = 'black') -> None:
+        self._cal_status_var.set(text)
+        self._cal_status_lbl.config(fg=color)
+
     def _show_dwell_popup(self) -> None:
         popup = tk.Toplevel(self.root)
         popup.title('Dwell Calibration')
@@ -823,6 +839,7 @@ class ReceiverGUI:
                    command=lambda: [
                        self._correlate_win.start_with_offset(0),
                        self._enqueue_log('Dwell skipped — offset set to 0.\n'),
+                       self._set_cal_status('● Calibration skipped — offset = 0', color='#cc8800'),
                        popup.destroy(),
                    ]).grid(row=0, column=1, padx=6)
 
@@ -833,7 +850,8 @@ class ReceiverGUI:
         popup.geometry(f'+{x}+{y}')
 
     def _apply_sparse_dwell_offset(self) -> None:
-        """Autonomous sparse-waveform dwell calibration using the first 5 s of dwell data."""
+        """Autonomous sparse-waveform dwell calibration using the first
+        SPARSE_CAL_DURATION_S of dwell data."""
         t1 = self.node1.get_all_dwell_ps()
         t2 = self.node2.get_all_dwell_ps()
         MIN_EVENTS = 5
@@ -842,11 +860,14 @@ class ReceiverGUI:
                 f'Sparse cal failed: {t1.size} / {t2.size} dwell events '
                 f'(need ≥{MIN_EVENTS} each). Setting offset = 0.\n'
             )
+            self._set_cal_status(
+                f'● Calibration failed ({t1.size}/{t2.size} events) — offset = 0',
+                color='#cc3333')
             self._correlate_win.start_with_offset(0)
             return
         offset_ps, details = estimate_offset(
             t1, t2,
-            cluster_tol=100_000,   # 100 ns in ps — covers jitter, << inter-pulse gap
+            cluster_tol=10_000,    # 10 ns: excludes ±32 ns TDC doublet sidelobes
             return_details=True,
         )
         offset = int(round(offset_ps))
@@ -856,6 +877,9 @@ class ReceiverGUI:
             f'SEM = {details["sem"]:.0f} ps, '
             f'streams: {details["n1"]} / {details["n2"]} events)\n'
         )
+        self._set_cal_status(
+            f'● Calibrated — offset {offset:+,} ps, acquisition running',
+            color='#228822')
         self._correlate_win.start_with_offset(offset)
 
     def _apply_dwell_offset(self, err_var: tk.StringVar) -> str | None:
@@ -875,6 +899,9 @@ class ReceiverGUI:
         offset = last2 - last1
         self._enqueue_log(f'Dwell offset: {offset:+,} ps  '
                           f'(node1={last1:,} ps, node2={last2:,} ps)\n')
+        self._set_cal_status(
+            f'● Calibrated — offset {offset:+,} ps, acquisition running',
+            color='#228822')
         self._correlate_win.start_with_offset(offset)
         return None
 
