@@ -58,7 +58,9 @@ class NodePanel:
         self._data_conn:   socket.socket | None = None
         self._ctrl_lock    = threading.Lock()
         self._state        = 'idle'   # 'idle' | 'ready' | 'streaming'
-        self._dwell_q: queue.Queue = queue.Queue()
+        self._dwell_q: queue.Queue = queue.Queue()         # slave_dwell (key 323)
+        self._master_dwell_q: queue.Queue = queue.Queue()  # master_dwell (key 320)
+        self._output_dir: str | None = None
         self._ssh_creds: tuple | None = None       # (host, user, password) set after Launch
         self._shutdown_thread: threading.Thread | None = None
         self._dwell_freq: float | None = None      # dwell clock Hz from last Launch R command
@@ -208,6 +210,7 @@ class NodePanel:
         recv_host  = self._ctrl_sock.getsockname()[0]
         recv_port  = int(self.data_port_var.get())
         output_dir = f'./spad_data/node{self.node_id}'
+        self._output_dir = output_dir
         self._send_ctrl({
             'cmd':        'start',
             'recv_host':  recv_host,
@@ -291,14 +294,16 @@ class NodePanel:
             self.log_fn(f'[N{self.node_id}] Data connection from {addr[0]}\n')
 
             # Clear any stale dwell data from a previous session
-            while not self._dwell_q.empty():
-                try:
-                    self._dwell_q.get_nowait()
-                except queue.Empty:
-                    break
+            for q in (self._dwell_q, self._master_dwell_q):
+                while not q.empty():
+                    try:
+                        q.get_nowait()
+                    except queue.Empty:
+                        break
 
             hooks = dict(self._get_hooks_fn() if self._get_hooks_fn else {})
-            hooks[323] = self._dwell_q  # slave_dwell — needed for clock-offset calibration
+            hooks[320] = self._master_dwell_q  # master_dwell — offset diagnostics
+            hooks[323] = self._dwell_q         # slave_dwell — needed for clock-offset calibration
 
             run_session_loop(
                 conn,
@@ -311,30 +316,43 @@ class NodePanel:
 
             self._data_conn = None
 
-    def get_last_dwell_ps(self) -> int | None:
-        """Drain the dwell queue and return the last received timestamp, or None."""
-        last = None
-        while True:
-            try:
-                raw = self._dwell_q.get_nowait()
-                arr = np.frombuffer(raw, dtype=np.int64)
-                if len(arr) > 0:
-                    last = int(arr[-1])
-            except queue.Empty:
-                break
-        return last
-
-    def get_all_dwell_ps(self) -> np.ndarray:
-        """Drain the dwell queue and return all timestamps as a sorted int64 array."""
+    @staticmethod
+    def _drain(q: queue.Queue) -> np.ndarray:
+        """Drain a queue of raw int64-timestamp byte chunks into one array."""
         chunks = []
         while True:
             try:
-                chunks.append(self._dwell_q.get_nowait())
+                chunks.append(q.get_nowait())
             except queue.Empty:
                 break
         if not chunks:
             return np.array([], dtype=np.int64)
         return np.concatenate([np.frombuffer(c, dtype=np.int64).copy() for c in chunks])
+
+    def get_last_dwell_ps(self) -> int | None:
+        """Drain the slave_dwell queue and return the last received timestamp, or None."""
+        arr = self._drain(self._dwell_q)
+        return int(arr[-1]) if arr.size else None
+
+    def get_all_dwell_ps(self) -> np.ndarray:
+        """Drain the slave_dwell queue and return all timestamps as an int64 array."""
+        return self._drain(self._dwell_q)
+
+    def get_all_master_dwell_ps(self) -> np.ndarray:
+        """Drain the master_dwell queue and return all timestamps as an int64 array."""
+        return self._drain(self._master_dwell_q)
+
+    def dump_dwell_bins(self, slave_arr: np.ndarray, master_arr: np.ndarray) -> None:
+        """Write drained dwell arrays to this node's session dwell .bin files
+        (normally written incrementally by run_session_loop, but calibration
+        intercepts these keys into queues instead)."""
+        if not self._output_dir:
+            return
+        os.makedirs(self._output_dir, exist_ok=True)
+        with open(os.path.join(self._output_dir, 'slave_dwell.bin'), 'wb') as f:
+            f.write(slave_arr.tobytes())
+        with open(os.path.join(self._output_dir, 'master_dwell.bin'), 'wb') as f:
+            f.write(master_arr.tobytes())
 
     # ------------------------------------------------------------------
     # Remote launch via SSH
@@ -852,12 +870,20 @@ class ReceiverGUI:
     def _apply_sparse_dwell_offset(self) -> None:
         """Autonomous sparse-waveform dwell calibration using the first
         SPARSE_CAL_DURATION_S of dwell data."""
-        t1 = self.node1.get_all_dwell_ps()
-        t2 = self.node2.get_all_dwell_ps()
+        t1 = self.node1.get_all_dwell_ps()          # slave_dwell
+        t2 = self.node2.get_all_dwell_ps()          # slave_dwell
+        m1 = self.node1.get_all_master_dwell_ps()   # master_dwell
+        m2 = self.node2.get_all_master_dwell_ps()   # master_dwell
+
+        # Dwell keys are intercepted into queues instead of being written to
+        # disk by run_session_loop — dump them to the usual dwell .bin files now.
+        self.node1.dump_dwell_bins(t1, m1)
+        self.node2.dump_dwell_bins(t2, m2)
+
         MIN_EVENTS = 5
         if t1.size < MIN_EVENTS or t2.size < MIN_EVENTS:
             self._enqueue_log(
-                f'Sparse cal failed: {t1.size} / {t2.size} dwell events '
+                f'Sparse cal failed: {t1.size} / {t2.size} slave dwell events '
                 f'(need ≥{MIN_EVENTS} each). Setting offset = 0.\n'
             )
             self._set_cal_status(
@@ -865,22 +891,43 @@ class ReceiverGUI:
                 color='#cc3333')
             self._correlate_win.start_with_offset(0)
             return
-        offset_ps, details = estimate_offset(
-            t1, t2,
-            cluster_tol=10_000,    # 10 ns: excludes ±32 ns TDC doublet sidelobes
-            return_details=True,
-        )
-        offset = int(round(offset_ps))
+
+        cluster_tol = 10_000  # 10 ns: excludes ±32 ns TDC doublet sidelobes
+        slave_offset_ps, slave_details = estimate_offset(
+            t1, t2, cluster_tol=cluster_tol, return_details=True)
+
+        if m1.size >= MIN_EVENTS and m2.size >= MIN_EVENTS:
+            master_offset_ps, master_details = estimate_offset(
+                m1, m2, cluster_tol=cluster_tol, return_details=True)
+        else:
+            master_offset_ps, master_details = float('nan'), None
+
+        slave_offset = int(round(slave_offset_ps))
+
+        self._enqueue_log('Automatic dwell calibration\n')
+        if master_details is not None and not np.isnan(master_offset_ps):
+            self._enqueue_log(
+                f'  Master offset = {int(round(master_offset_ps)):+,} ps  '
+                f'({master_details["n_matched"]} matched pairs, '
+                f'SEM = {master_details["sem"]:.0f} ps, '
+                f'streams: {master_details["n1"]} / {master_details["n2"]} events)\n'
+            )
+        else:
+            self._enqueue_log(
+                f'  Master offset: unavailable ({m1.size} / {m2.size} master dwell events)\n'
+            )
         self._enqueue_log(
-            f'Sparse cal: offset = {offset:+,} ps  '
-            f'({details["n_matched"]} matched pairs, '
-            f'SEM = {details["sem"]:.0f} ps, '
-            f'streams: {details["n1"]} / {details["n2"]} events)\n'
+            f'  Slave offset  = {slave_offset:+,} ps  '
+            f'({slave_details["n_matched"]} matched pairs, '
+            f'SEM = {slave_details["sem"]:.0f} ps, '
+            f'streams: {slave_details["n1"]} / {slave_details["n2"]} events)\n'
         )
+        self._enqueue_log('Acquiring\n')
+
         self._set_cal_status(
-            f'● Calibrated — offset {offset:+,} ps, acquisition running',
+            f'● Calibrated — offset {slave_offset:+,} ps, acquisition running',
             color='#228822')
-        self._correlate_win.start_with_offset(offset)
+        self._correlate_win.start_with_offset(slave_offset)
 
     def _apply_dwell_offset(self, err_var: tk.StringVar) -> str | None:
         """Read dwell queues from both nodes, compute offset, pass to correlator."""
