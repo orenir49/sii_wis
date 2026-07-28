@@ -105,8 +105,14 @@ class NodePanel:
 
         ttk.Label(frame, text='Mask file:').grid(row=1, column=2, sticky='w', padx=(12, 4))
         self.mask_var = tk.StringVar(value='')
-        self._mask_entry = ttk.Entry(frame, textvariable=self.mask_var, width=22)
-        self._mask_entry.grid(row=1, column=3, columnspan=3, sticky='w', padx=(0, 8))
+        self._mask_entry = ttk.Entry(frame, textvariable=self.mask_var, width=16)
+        self._mask_entry.grid(row=1, column=3, columnspan=2, sticky='w')
+
+        ttk.Label(frame, text='Pixel:').grid(row=1, column=5, sticky='w', padx=(8, 4))
+        self.pixel_var = tk.StringVar(value='')
+        self.pixel_var.trace_add('write', self._on_pixel_changed)
+        self._pixel_entry = ttk.Entry(frame, textvariable=self.pixel_var, width=5)
+        self._pixel_entry.grid(row=1, column=6, sticky='w', padx=(0, 8))
 
         # Row 2 — status + launch / connect buttons
         self.ctrl_status_var = tk.StringVar(value='● Disconnected')
@@ -382,14 +388,31 @@ class NodePanel:
     # Remote launch via SSH
     # ------------------------------------------------------------------
 
+    def _on_pixel_changed(self, *_args) -> None:
+        """Mirror the chosen pixel into the mask-file field, purely for display."""
+        pixel_str = self.pixel_var.get().strip()
+        if pixel_str:
+            self.mask_var.set(f'mask_{pixel_str}.txt')
+
     def _on_launch(self) -> None:
         """Ask for SSH password (main thread) then start the launch thread."""
         if self._state != 'idle':
             self.log_fn(f'Node {self.node_id}: already connected or launching.\n')
             return
-        host     = self.ip_var.get().strip()
-        username = self.ssh_user_var.get().strip()
-        mask     = self.mask_var.get().strip()
+        host       = self.ip_var.get().strip()
+        username   = self.ssh_user_var.get().strip()
+        mask       = self.mask_var.get().strip()
+        pixel_str  = self.pixel_var.get().strip()
+        mask_pixel = None
+        if pixel_str:
+            try:
+                mask_pixel = int(pixel_str)
+            except ValueError:
+                self.log_fn(f'Node {self.node_id}: invalid pixel value {pixel_str!r}.\n')
+                return
+            if not (0 <= mask_pixel <= 319):
+                self.log_fn(f'Node {self.node_id}: pixel must be between 0 and 319.\n')
+                return
         password = simpledialog.askstring(
             'SSH Password',
             f'Password for {username}@{host}:',
@@ -399,11 +422,11 @@ class NodePanel:
             return
         threading.Thread(
             target=self._ssh_launch,
-            args=(host, username, password, mask),
+            args=(host, username, password, mask, mask_pixel),
             daemon=True).start()
 
     def _ssh_launch(self, host: str, username: str,
-                    password: str, mask: str) -> None:
+                    password: str, mask: str, mask_pixel: int | None) -> None:
         """Background thread: run full node launch sequence then auto-connect."""
         self._gui(lambda: self._set_ctrl_status('launching'))
         self.log_fn(f'Node {self.node_id}: launching remote node …\n')
@@ -416,6 +439,7 @@ class NodePanel:
         try:
             self._dwell_freq = ssh_launcher.launch_node(
                 host=host, username=username, password=password,
+                mask_pixel=mask_pixel,
                 mask_filename=mask, log_fn=_log)
             time.sleep(3)           # give sender.py command server time to start
             self._gui(self._connect)

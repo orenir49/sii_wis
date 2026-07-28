@@ -137,6 +137,22 @@ def _recv_lspad(chan: paramiko.Channel, timeout: float = 5.0,
     return buf.decode('utf-8', errors='replace').strip()
 
 
+def generate_mask_content(pix: int) -> bytes:
+    """Mask listing every raw lSPAD pixel index 0-319 except `pix` (keeps only `pix` active)."""
+    lines = [str(i) for i in range(320) if i != pix]
+    return ('\n'.join(lines) + '\n').encode('ascii')
+
+
+def upload_file(client: paramiko.SSHClient, remote_path: str, content: bytes) -> None:
+    """Write `content` to `remote_path` on the host `client` is connected to, via SFTP."""
+    sftp = client.open_sftp()
+    try:
+        with sftp.open(remote_path, 'wb') as f:
+            f.write(content)
+    finally:
+        sftp.close()
+
+
 def send_lspad_cmd(client: paramiko.SSHClient, port: int,
                    cmd: str, read_timeout: float = 5.0,
                    until: str | None = None, log_fn=None) -> str:
@@ -271,7 +287,8 @@ def shutdown_lspad(host: str, username: str, password: str) -> None:
 
 def launch_node(host: str, username: str, password: str,
                 mask_filename: str, log_fn,
-                lspad_port: int = SPAD_PORT) -> float:
+                lspad_port: int = SPAD_PORT,
+                mask_pixel: int | None = None) -> float:
     """
     Full launch sequence for one sender node.
     log_fn receives plain text lines (already newline-terminated).
@@ -301,15 +318,24 @@ def launch_node(host: str, username: str, password: str,
         log_fn('lSPAD TCP port ready.\n')
         time.sleep(2)   # let lSPAD finish GUI/hardware init before sending commands
 
-        # 4. Apply pixel mask (skip if no filename provided)
-        if mask_filename.strip():
+        # 4. Apply pixel mask (generated single-pixel mask takes priority over a manual filename)
+        if mask_pixel is not None:
+            generated_filename = f'mask_{mask_pixel}.txt'
+            mask_path = lspad_dir + '\\' + generated_filename
+            log_fn(f'Generating and uploading {generated_filename} …\n')
+            upload_file(client, mask_path, generate_mask_content(mask_pixel))
+            log_fn(f'Applying mask: {mask_path}\n')
+            send_lspad_cmd(client, lspad_port, f'M,{mask_path}',
+                          read_timeout=30.0, until='successful',
+                          log_fn=lambda s: log_fn(f'  {s}'))
+        elif mask_filename.strip():
             mask_path = lspad_dir + '\\' + mask_filename
             log_fn(f'Applying mask: {mask_path}\n')
             send_lspad_cmd(client, lspad_port, f'M,{mask_path}',
                           read_timeout=30.0, until='successful',
                           log_fn=lambda s: log_fn(f'  {s}'))
         else:
-            log_fn('No mask file specified — skipping mask command.\n')
+            log_fn('No mask specified — skipping mask command.\n')
 
         # 5. Read detector status (R) before calibration
         dwell_freq = 0.0
