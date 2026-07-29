@@ -47,11 +47,13 @@ class NodePanel:
                  default_data_port: int,
                  default_ssh_user: str = 'user',
                  log_fn=None,
-                 get_hooks_fn=None) -> None:
+                 get_hooks_fn=None,
+                 set_correlate_pixel_fn=None) -> None:
         self.root          = root
         self.node_id       = node_id
         self.log_fn        = log_fn
         self._get_hooks_fn = get_hooks_fn
+        self._set_correlate_pixel_fn = set_correlate_pixel_fn
 
         self._ctrl_sock:   socket.socket | None = None
         self._data_server: socket.socket | None = None
@@ -413,6 +415,8 @@ class NodePanel:
             if not (0 <= mask_pixel <= 319):
                 self.log_fn(f'Node {self.node_id}: pixel must be between 0 and 319.\n')
                 return
+            if self._set_correlate_pixel_fn:
+                self._set_correlate_pixel_fn(mask_pixel)
         password = simpledialog.askstring(
             'SSH Password',
             f'Password for {username}@{host}:',
@@ -581,7 +585,8 @@ class ReceiverGUI:
                                default_data_port=50007,
                                default_ssh_user='labcomp1',
                                log_fn=self._enqueue_log,
-                               get_hooks_fn=lambda: self._correlate_win.hooks_node1)
+                               get_hooks_fn=lambda: self._correlate_win.hooks_node1,
+                               set_correlate_pixel_fn=lambda pix: self._correlate_win.px1_var.set(str(pix)))
         self.node2 = NodePanel(nodes_frame, self.root,
                                node_id=2,
                                default_sender_ip='192.168.1.12',
@@ -589,7 +594,8 @@ class ReceiverGUI:
                                default_data_port=50008,
                                default_ssh_user='oreni',
                                log_fn=self._enqueue_log,
-                               get_hooks_fn=lambda: self._correlate_win.hooks_node2)
+                               get_hooks_fn=lambda: self._correlate_win.hooks_node2,
+                               set_correlate_pixel_fn=lambda pix: self._correlate_win.px2_var.set(str(pix)))
 
         # ── acquisition controls ───────────────────────────────────────
         acq = ttk.LabelFrame(self.root, text='Acquisition')
