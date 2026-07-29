@@ -258,6 +258,10 @@ def run(sock: socket.socket,
 
                     if done:
                         break
+
+                if stop_event.is_set():
+                    log_fn('Aborted — sending STOP to lSPAD.\n')
+                    spad_sock.send(b'STOP\n')
             finally:
                 spad_sock.close()
 
