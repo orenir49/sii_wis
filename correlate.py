@@ -10,7 +10,7 @@ updated histogram back to the main thread for display.
 import queue
 import threading
 import tkinter as tk
-from tkinter import ttk, filedialog
+from tkinter import ttk
 
 import numpy as np
 from numba import njit, prange
@@ -136,18 +136,10 @@ class CorrelateWindow(tk.Toplevel):
         ttk.Entry(cfg, textvariable=self.suffix_var, width=32).grid(
             row=3, column=1, columnspan=3, sticky='w')
 
-        ttk.Label(cfg, text='Norm file:').grid(
-            row=4, column=0, padx=6, pady=4, sticky='w')
-        self.norm_var = tk.StringVar(value='')
-        ttk.Entry(cfg, textvariable=self.norm_var, width=28).grid(
-            row=4, column=1, columnspan=2, sticky='ew')
-        ttk.Button(cfg, text='Browse…', command=self._browse_norm).grid(
-            row=4, column=3, sticky='w', padx=(4, 8))
-
         ttk.Label(cfg, text='Display mode:').grid(
-            row=5, column=0, padx=6, pady=4, sticky='w')
+            row=4, column=0, padx=6, pady=4, sticky='w')
         mode_frame = ttk.Frame(cfg)
-        mode_frame.grid(row=5, column=1, columnspan=3, sticky='w')
+        mode_frame.grid(row=4, column=1, columnspan=3, sticky='w')
         self.mode_var = tk.StringVar(value='histogram')
         ttk.Radiobutton(mode_frame, text='g² histogram',
                         variable=self.mode_var, value='histogram').pack(side='left', padx=(0, 12))
@@ -156,16 +148,16 @@ class CorrelateWindow(tk.Toplevel):
         self.mode_var.trace_add('write', self._on_display_change)
 
         ttk.Label(cfg, text='Expected rate (R):').grid(
-            row=6, column=0, padx=6, pady=4, sticky='w')
+            row=5, column=0, padx=6, pady=4, sticky='w')
         self.expected_var = tk.StringVar(value='')
         ttk.Entry(cfg, textvariable=self.expected_var, width=12).grid(
-            row=6, column=1, sticky='w')
+            row=5, column=1, sticky='w')
         ttk.Label(cfg, text='Nc = mean × R').grid(
-            row=6, column=2, sticky='w', padx=(2, 6))
+            row=5, column=2, sticky='w', padx=(2, 6))
         self.expected_var.trace_add('write', self._on_display_change)
 
         btn_row = ttk.Frame(cfg)
-        btn_row.grid(row=7, column=2, columnspan=2, padx=8, pady=4)
+        btn_row.grid(row=6, column=2, columnspan=2, padx=8, pady=4)
         ttk.Button(btn_row, text='Enable',     width=8,
                    command=self._enable).grid(row=0, column=0, padx=3)
         ttk.Button(btn_row, text='Disable',    width=8,
@@ -175,7 +167,7 @@ class CorrelateWindow(tk.Toplevel):
 
         self.status_var = tk.StringVar(value='Disabled.')
         ttk.Label(cfg, textvariable=self.status_var, anchor='w').grid(
-            row=8, column=0, columnspan=4, sticky='w', padx=6, pady=(2, 4))
+            row=7, column=0, columnspan=4, sticky='w', padx=6, pady=(2, 4))
 
         # ── histogram plot ─────────────────────────────────────────────
         fig_frame = ttk.LabelFrame(self, text='g² Histogram')
@@ -245,14 +237,6 @@ class CorrelateWindow(tk.Toplevel):
         self._active       = False
         self._accumulating = False
         self.status_var.set('Disabled.')
-
-    def _browse_norm(self) -> None:
-        path = filedialog.askopenfilename(
-            title='Select normalisation histogram',
-            filetypes=[('Text files', '*.txt'), ('All files', '*.*')],
-        )
-        if path:
-            self.norm_var.set(path)
 
     def _reset(self) -> None:
         self._t1           = np.empty(0, dtype=np.int64)
@@ -406,12 +390,10 @@ class CorrelateWindow(tk.Toplevel):
                     self._bins = bins
                 else:
                     self._hist = self._hist + partial_hist
-                warn   = self._update_plot(self._hist, self._bins)
+                self._update_plot(self._hist, self._bins)
                 busy   = '  (correlating …)' if self._correlating else ''
                 off_s  = f'  offset {self._offset:+,} ps' if self._offset is not None else ''
                 status = f'Accumulating{off_s} — {n1:,} px1, {n2:,} px2 events{busy}'
-                if warn:
-                    status += f'  {warn}'
                 self.status_var.set(status)
                 if self._has_new_data:
                     self._launch_correlation()
@@ -433,40 +415,12 @@ class CorrelateWindow(tk.Toplevel):
         else:
             return 'ms', 1_000_000_000.0
 
-    @staticmethod
-    def _load_norm(path: str) -> tuple[np.ndarray, np.ndarray]:
-        """Load (tau_ps, counts) from a two-column tab-separated file. Raises on error."""
-        data = np.loadtxt(path, skiprows=1)
-        if data.ndim != 2 or data.shape[1] < 2:
-            raise ValueError('expected ≥2 columns (tau_ps, counts)')
-        return data[:, 0], data[:, 1]
-
-    def _update_plot(self, hist: np.ndarray, bins: np.ndarray) -> str:
-        """Draw histogram; returns a warning string for the status bar (empty if none)."""
+    def _update_plot(self, hist: np.ndarray, bins: np.ndarray) -> None:
+        """Draw histogram."""
         centers   = (bins[:-1] + bins[1:]) / 2
         plot_data = hist.astype(float)
         ylabel    = 'Counts'
         title     = 'g² — live'
-        warn      = ''
-
-        norm_path = self.norm_var.get().strip()
-        if norm_path:
-            try:
-                tau_norm, counts_norm = self._load_norm(norm_path)
-                if len(tau_norm) != len(centers) or not np.allclose(tau_norm, centers):
-                    warn  = '[⚠ norm axis mismatch — showing raw counts]'
-                    title = 'g² — live  [norm axis mismatch]'
-                else:
-                    with np.errstate(divide='ignore', invalid='ignore'):
-                        d_prime = np.where(counts_norm > 0,
-                                           hist.astype(float) / counts_norm, np.nan)
-                    finite    = d_prime[np.isfinite(d_prime)]
-                    med       = np.nanmedian(finite) if len(finite) > 0 else np.nan
-                    plot_data = d_prime / med if (np.isfinite(med) and med != 0) else d_prime
-                    ylabel    = 'g²(τ)'
-                    title     = 'g² — live  (normalized)'
-            except Exception as exc:
-                warn = f'[norm error: {exc}]'
 
         try:
             _, _, _, tmax, _ = self._get_params()
@@ -485,7 +439,6 @@ class CorrelateWindow(tk.Toplevel):
         self.fig.tight_layout()
         self.canvas.draw_idle()
         self._write_histogram(centers, hist)  # always save raw d(t) in ps
-        return warn
 
     def _draw_distribution(self, hist: np.ndarray) -> None:
         counts   = hist.astype(float)
