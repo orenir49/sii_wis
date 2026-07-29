@@ -602,10 +602,8 @@ class ReceiverGUI:
         ttk.Radiobutton(acq, text='Monitor', variable=self.test_var,
                         value=True).grid(row=0, column=2, sticky='w', padx=(0, 16))
 
-        self._sparse_cal_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(acq, text=f'Sparse waveform calibration (auto {SPARSE_CAL_DURATION_S:.2f} s)',
-                        variable=self._sparse_cal_var,
-                        ).grid(row=1, column=0, columnspan=5, sticky='w', padx=8, pady=(0, 6))
+        ttk.Label(acq, text=f'Sparse waveform calibration (auto {SPARSE_CAL_DURATION_S:.2f} s)',
+                  ).grid(row=1, column=0, columnspan=5, sticky='w', padx=8, pady=(0, 6))
 
         self._cal_status_var = tk.StringVar(value='')
         self._cal_status_lbl = tk.Label(acq, textvariable=self._cal_status_var, anchor='w')
@@ -692,17 +690,13 @@ class ReceiverGUI:
             self._schedule_progress(step_ms, 1, self._run_id)
 
         if self._correlate_win.is_enabled:
-            if self._sparse_cal_var.get():
-                self._enqueue_log(
-                    f'Sparse cal: collecting dwell for {SPARSE_CAL_DURATION_S:.2f} s…\n')
-                self._set_cal_status(
-                    f'● Calibrating dwell offset ({SPARSE_CAL_DURATION_S:.2f} s)…',
-                    color='#cc8800')
-                self.root.after(round(SPARSE_CAL_DURATION_S * 1000),
-                                 self._apply_sparse_dwell_offset)
-            else:
-                self._set_cal_status('● Waiting for manual DWELL press…', color='#cc8800')
-                self._show_dwell_popup()
+            self._enqueue_log(
+                f'Sparse cal: collecting dwell for {SPARSE_CAL_DURATION_S:.2f} s…\n')
+            self._set_cal_status(
+                f'● Calibrating dwell offset ({SPARSE_CAL_DURATION_S:.2f} s)…',
+                color='#cc8800')
+            self.root.after(round(SPARSE_CAL_DURATION_S * 1000),
+                             self._apply_sparse_dwell_offset)
 
     def _abort_all(self) -> None:
         if self._monitor_abort is not None:
@@ -869,57 +863,12 @@ class ReceiverGUI:
         self.root.after(10_000, tick)
 
     # ------------------------------------------------------------------
-    # Dwell calibration popup
+    # Dwell calibration
     # ------------------------------------------------------------------
 
     def _set_cal_status(self, text: str, color: str = 'black') -> None:
         self._cal_status_var.set(text)
         self._cal_status_lbl.config(fg=color)
-
-    def _show_dwell_popup(self) -> None:
-        popup = tk.Toplevel(self.root)
-        popup.title('Dwell Calibration')
-        popup.resizable(False, False)
-        popup.grab_set()
-        popup.protocol('WM_DELETE_WINDOW', lambda: None)  # block accidental close
-
-        ttk.Label(popup,
-                  text='Press the DWELL button on the detector,\nthen click OK.',
-                  justify='center',
-                  font=('TkDefaultFont', 11)).pack(padx=30, pady=(20, 8))
-
-        err_var = tk.StringVar(value='')
-        ttk.Label(popup, textvariable=err_var,
-                  foreground='#cc3333', wraplength=300).pack(padx=20, pady=(0, 4))
-
-        btn_frame = ttk.Frame(popup)
-        btn_frame.pack(pady=(4, 20))
-
-        def on_ok():
-            if self._apply_dwell_offset(err_var) is None:
-                popup.destroy()
-
-        ttk.Button(btn_frame, text='OK', width=10,
-                   command=on_ok).grid(row=0, column=0, padx=6)
-        ttk.Button(btn_frame, text='Skip (offset = 0)', width=16,
-                   command=lambda: [
-                       self.node1.dump_dwell_bins(self.node1.get_all_dwell_ps(),
-                                                   self.node1.get_all_master_dwell_ps()),
-                       self.node2.dump_dwell_bins(self.node2.get_all_dwell_ps(),
-                                                   self.node2.get_all_master_dwell_ps()),
-                       self.node1.start_dwell_flush(),
-                       self.node2.start_dwell_flush(),
-                       self._correlate_win.start_with_offset(0),
-                       self._enqueue_log('Dwell skipped — offset set to 0.\n'),
-                       self._set_cal_status('● Calibration skipped — offset = 0', color='#cc8800'),
-                       popup.destroy(),
-                   ]).grid(row=0, column=1, padx=6)
-
-        popup.transient(self.root)
-        popup.update_idletasks()
-        x = self.root.winfo_x() + (self.root.winfo_width()  - popup.winfo_width())  // 2
-        y = self.root.winfo_y() + (self.root.winfo_height() - popup.winfo_height()) // 2
-        popup.geometry(f'+{x}+{y}')
 
     def _apply_sparse_dwell_offset(self) -> None:
         """Autonomous sparse-waveform dwell calibration using the first
@@ -986,41 +935,6 @@ class ReceiverGUI:
         self._correlate_win.start_with_offset(slave_offset)
         self.node1.start_dwell_flush()
         self.node2.start_dwell_flush()
-
-    def _apply_dwell_offset(self, err_var: tk.StringVar) -> str | None:
-        """Read dwell queues from both nodes, compute offset, pass to correlator."""
-        slave1 = self.node1.get_all_dwell_ps()
-        slave2 = self.node2.get_all_dwell_ps()
-        master1 = self.node1.get_all_master_dwell_ps()
-        master2 = self.node2.get_all_master_dwell_ps()
-
-        # Dump whatever was collected while waiting for the popup — safe to
-        # call on every attempt since it only appends newly drained events.
-        self.node1.dump_dwell_bins(slave1, master1)
-        self.node2.dump_dwell_bins(slave2, master2)
-
-        last1 = int(slave1[-1]) if slave1.size else None
-        last2 = int(slave2[-1]) if slave2.size else None
-
-        if last1 is None:
-            msg = 'No dwell signal received on Node 1 yet — press DWELL and retry.'
-            err_var.set(msg)
-            return msg
-        if last2 is None:
-            msg = 'No dwell signal received on Node 2 yet — press DWELL and retry.'
-            err_var.set(msg)
-            return msg
-
-        offset = last2 - last1
-        self._enqueue_log(f'Dwell offset: {offset:+,} ps  '
-                          f'(node1={last1:,} ps, node2={last2:,} ps)\n')
-        self._set_cal_status(
-            f'● Calibrated — offset {offset:+,} ps, acquisition running',
-            color='#228822')
-        self._correlate_win.start_with_offset(offset)
-        self.node1.start_dwell_flush()
-        self.node2.start_dwell_flush()
-        return None
 
     # ------------------------------------------------------------------
     # Health check
