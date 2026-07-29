@@ -164,6 +164,7 @@ def run(sock: socket.socket,
                 stop_event.wait(timeout=min(1.0, max(0.0, remaining)))
 
         else:
+            # lSPAD's own TCP command protocol — see LSPAD_CLI.md for the full command set.
             spad_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             spad_sock.connect((SPAD_HOST, SPAD_PORT))
             log_fn(spad_sock.recv(8192).decode('utf8'))

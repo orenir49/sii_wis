@@ -160,6 +160,7 @@ def send_lspad_cmd(client: paramiko.SSHClient, port: int,
     Open a direct-tcpip tunnel to sender's localhost:port,
     send one command (+ newline), read and return the response.
     See `_recv_lspad` for `until` / `log_fn` polling behavior.
+    `cmd` is one of lSPAD's own TCP commands — see LSPAD_CLI.md for the full command set.
     """
     transport = client.get_transport()
     chan = transport.open_channel(
