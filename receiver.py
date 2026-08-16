@@ -75,6 +75,7 @@ class NodePanel:
         self._dwell_freq: float | None = None      # dwell clock Hz from last Launch R command
         self._event_accum: list = [0]              # [int] — incremented by data thread, read by GUI
         self._data_streaming = False
+        self._session_active = False   # START sent, 'done'/'error' not yet received
 
         self._build_ui(parent, default_sender_ip, default_cmd_port, default_data_port, default_ssh_user)
         self._schedule_rate_update()
@@ -192,6 +193,7 @@ class NodePanel:
         threading.Thread(target=self._accept_data_thread, daemon=True).start()
 
     def _disconnect(self) -> None:
+        self._session_active = False
         self.stop_dwell_drain()
         if self._ctrl_sock:
             try:
@@ -223,6 +225,7 @@ class NodePanel:
     def send_start(self, duration: float, test: bool) -> None:
         if self._ctrl_sock is None or self._state == 'idle':
             return
+        self._session_active = True
         recv_host  = self._ctrl_sock.getsockname()[0]
         recv_port  = int(self.data_port_var.get())
         output_dir = f'./spad_data/node{self.node_id}'
@@ -235,6 +238,15 @@ class NodePanel:
             'duration':   duration,
             'test':       test,
         })
+
+    def is_finishing(self) -> bool:
+        """True while a previous run is still being torn down.
+
+        Abort now parses whatever lSPAD had buffered rather than discarding
+        it, so teardown takes a few seconds at high rate. Starting during
+        that window just gets refused by the sender as 'busy'.
+        """
+        return self._session_active
 
     def send_abort(self) -> None:
         self._send_ctrl({'cmd': 'abort'})
@@ -289,12 +301,14 @@ class NodePanel:
         elif s == 'streaming':
             self._gui(lambda: self._set_data_status('streaming'))
         elif s == 'done':
+            self._session_active = False
             self._gui(lambda: self._set_data_status('idle'))
             self.stop_dwell_drain()
             self._record_session_stats(msg.get('stats') or {})
         elif s == 'log':
             self.log_fn(f'[N{self.node_id}] {msg.get("msg", "")}\n')
         elif s == 'error':
+            self._session_active = False
             self.log_fn(f'[N{self.node_id}] Error: {msg.get("msg")}\n')
             self._gui(lambda: self._set_data_status('error'))
             self.stop_dwell_drain()
@@ -549,6 +563,9 @@ class NodePanel:
         if state == 'streaming':
             self.data_status_var.set('  Data: ● Streaming')
             self._data_lbl.config(fg='#33aa33')
+        elif state == 'stopping':
+            self.data_status_var.set('  Data: ● Stopping — flushing buffered data')
+            self._data_lbl.config(fg='#cc8800')
         elif state == 'error':
             self.data_status_var.set('  Data: ● Error')
             self._data_lbl.config(fg='#cc3333')
@@ -707,6 +724,15 @@ class ReceiverGUI:
             self._start_monitor(duration)
             return
 
+        busy = [n.node_id for n in (self.node1, self.node2)
+                if n.is_ready() and n.is_finishing()]
+        if busy:
+            self._enqueue_log(
+                f'Node(s) {busy} are still flushing the previous run — wait for\n'
+                f'  Data: Idle before starting again (aborting no longer discards\n'
+                f'  buffered photons, so teardown takes a few seconds).\n')
+            return
+
         sent = 0
         for node in (self.node1, self.node2):
             if node.is_ready():
@@ -753,6 +779,8 @@ class ReceiverGUI:
         for node in (self.node1, self.node2):
             if node.is_ready():
                 node.send_abort()
+                if node.is_finishing():
+                    node._set_data_status('stopping')
         self._run_id += 1          # invalidates pending progress/timer/sparse-cal callbacks
         self._cal_waiting.clear()
         self._show_progress_bar()
