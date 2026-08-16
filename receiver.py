@@ -715,7 +715,8 @@ class ReceiverGUI:
                 f'● Calibrating dwell offset ({SPARSE_CAL_DURATION_S:.2f} s)…',
                 color='#cc8800')
             self.root.after(round(SPARSE_CAL_DURATION_S * 1000),
-                             self._apply_sparse_dwell_offset)
+                             lambda rid=self._run_id:
+                                 self._apply_sparse_dwell_offset(rid))
 
     def _abort_all(self) -> None:
         if self._monitor_abort is not None:
@@ -726,9 +727,10 @@ class ReceiverGUI:
                               f'abort {"sent" if ready else "SKIPPED"}\n')
             if ready:
                 node.send_abort()
-        self._run_id += 1
+        self._run_id += 1          # invalidates pending progress/timer/sparse-cal callbacks
         self._show_progress_bar()
         self._set_progress(0)
+        self._set_cal_status('● Aborted — not calibrated', color='#cc8800')
         self._enqueue_log('ABORT sent to all connected nodes.\n')
 
     # ------------------------------------------------------------------
@@ -892,9 +894,20 @@ class ReceiverGUI:
         self._cal_status_var.set(text)
         self._cal_status_lbl.config(fg=color)
 
-    def _apply_sparse_dwell_offset(self) -> None:
+    def _apply_sparse_dwell_offset(self, run_id: int) -> None:
         """Autonomous sparse-waveform dwell calibration using the first
-        SPARSE_CAL_DURATION_S of dwell data."""
+        SPARSE_CAL_DURATION_S of dwell data.
+
+        `run_id` guards against a timer armed by a run that was since aborted
+        or restarted: such a callback would drain the *new* run's dwell queues
+        and reset the correlator to offset 0, leaving the g² histogram empty.
+        """
+        if run_id != self._run_id:
+            self._enqueue_log(
+                f'Sparse cal: stale timer from run {run_id} ignored '
+                f'(current run {self._run_id}).\n')
+            return
+
         t1 = self.node1.get_all_dwell_ps()          # slave_dwell
         t2 = self.node2.get_all_dwell_ps()          # slave_dwell
         m1 = self.node1.get_all_master_dwell_ps()   # master_dwell
