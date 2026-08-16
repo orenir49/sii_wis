@@ -176,7 +176,7 @@ def run(sock: socket.socket,
     stats = {'records': 0, 'overflow': 0, 'unknown': 0,
              'lag_s': 0.0, 'lag_max_s': 0.0,
              'queue_max': 0, 'queue_blocks': 0,
-             'recv_calls': 0, 'recv_mean_b': 0,
+             'recv_calls': 0, 'recv_mean_b': 0, 'discarded_b': 0,
              'first_ts': None, 'last_ts': None}
 
     # --- session preamble -------------------------------------------------
@@ -330,8 +330,11 @@ def run(sock: socket.socket,
                         continue
                     if stopping and time.time() > stop_deadline:
                         lost = drain_lspad(spad_sock, quiet_for=0.5, cap=2.0)
+                        stats['discarded_b'] += len(lost)
                         log_fn(f'WARNING: lSPAD still streaming {STOP_CONFIRM_S:.0f} s '
-                               f'after STOP — {len(lost)} B discarded unparsed\n')
+                               f'after STOP — {len(lost):,} B discarded unparsed. '
+                               f'This is real photon loss: the parser was behind, so '
+                               f'lSPAD had buffered more than we could drain.\n')
                         break
                     data = spad_sock.recv(57344)
                     if not data:
@@ -471,7 +474,11 @@ def run(sock: socket.socket,
                     if done:
                         break
 
-                if not stop_event.is_set():
+                # Only surprising for an indefinite run: SB,0 should stream until
+                # we abort. A fixed-duration run ending by itself is the normal
+                # case, and warning about it every time trains people to ignore
+                # the warnings that matter.
+                if not stop_event.is_set() and duration <= 0:
                     log_fn(f'WARNING: stream ended without an abort after '
                            f'{total_bytes} B / {time.time() - t_stream:.1f} s '
                            f'— lSPAD ended an indefinite (SB,0) acquisition\n')

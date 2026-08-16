@@ -34,6 +34,7 @@ import ssh_launcher
 
 HEALTH_CHECK_MS = 2_000
 SPARSE_CAL_WAVEFORM_S = 4.194304  # RIGOL sparse-pulse RAF waveform: 2**23 pts @ 2 MSa/s
+LAG_ALERT_S   = 2.0               # parser this far behind is worth reporting
 CAL_ARM_TIMEOUT_MS = 20_000       # give up waiting for a node's first chunk
 CAL_POLL_MS   = 250               # how often to check collected dwell span
 CAL_MAX_WAIT_S = 30.0             # backstop if a period never accumulates
@@ -323,13 +324,31 @@ class NodePanel:
         """
         if not stats:
             return
-        overflow = stats.get('overflow', 0)
-        unknown  = stats.get('unknown', 0)
+        overflow  = stats.get('overflow', 0)
+        unknown   = stats.get('unknown', 0)
+        discarded = stats.get('discarded_b', 0)
+        lag_max   = stats.get('lag_max_s', 0.0)
         if overflow or unknown:
             self.log_fn(
                 f'[N{self.node_id}] ⚠ PHOTON LOSS: {overflow:,} FIFO overflow '
                 f'event(s) dropped by the detector, {unknown:,} unrecognised '
                 f'record(s). Reduce active pixels or count rate.\n')
+        # Measured: the detector's own FIFO marker never fires even when most of
+        # a run is lost. What actually loses photons is the parser falling
+        # behind — lSPAD then buffers, and an abort throws that buffer away.
+        # So report lag and discarded bytes as loss in their own right.
+        if discarded:
+            self.log_fn(
+                f'[N{self.node_id}] ⚠ PHOTON LOSS: {discarded / 1e6:,.1f} MB '
+                f'(~{discarded // 7:,} records) were still buffered in lSPAD at '
+                f'abort and were discarded. Use a fixed duration, or fewer '
+                f'active pixels, to keep the parser ahead.\n')
+        elif lag_max >= LAG_ALERT_S:
+            self.log_fn(
+                f'[N{self.node_id}] ⚠ The parser fell {lag_max:.1f} s behind the '
+                f'detector. Nothing was lost this run, but the data arrived long '
+                f'after it was taken, and an abort at this rate would have '
+                f'discarded whatever was still buffered.\n')
         # lag peak and queue depth are what say whether overflow came from the
         # detector's own readout limit or from us stalling the parser.
         self.log_fn(
