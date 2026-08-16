@@ -34,12 +34,9 @@ import ssh_launcher
 
 HEALTH_CHECK_MS = 2_000
 SPARSE_CAL_WAVEFORM_S = 4.194304  # RIGOL sparse-pulse RAF waveform: 2**23 pts @ 2 MSa/s
-# Dwell-collection window: exactly one waveform period. Measured capture with a
-# single-pixel mask is 9.6-15 dwell events/s across the whole window, i.e. the
-# ~50 pulses a period contains. A wider window is only needed if the parser
-# cannot keep up (many active pixels), which starves the window instead.
-SPARSE_CAL_DURATION_S = SPARSE_CAL_WAVEFORM_S
 CAL_ARM_TIMEOUT_MS = 20_000       # give up waiting for a node's first chunk
+CAL_POLL_MS   = 250               # how often to check collected dwell span
+CAL_MAX_WAIT_S = 30.0             # backstop if a period never accumulates
 
 
 # ---------------------------------------------------------------------------
@@ -294,6 +291,7 @@ class NodePanel:
         elif s == 'done':
             self._gui(lambda: self._set_data_status('idle'))
             self.stop_dwell_drain()
+            self._record_session_stats(msg.get('stats') or {})
         elif s == 'log':
             self.log_fn(f'[N{self.node_id}] {msg.get("msg", "")}\n')
         elif s == 'error':
@@ -302,6 +300,33 @@ class NodePanel:
             self.stop_dwell_drain()
         elif s == 'busy':
             self.log_fn(f'[N{self.node_id}] Sender busy — START ignored.\n')
+
+    def _record_session_stats(self, stats: dict) -> None:
+        """Log the sender's end-of-session counters and persist them next to the data.
+
+        FIFO overflow is unrecoverable photon loss, so it belongs in the run
+        directory rather than only in a log window that scrolls.
+        """
+        if not stats:
+            return
+        overflow = stats.get('overflow', 0)
+        unknown  = stats.get('unknown', 0)
+        if overflow or unknown:
+            self.log_fn(
+                f'[N{self.node_id}] ⚠ PHOTON LOSS: {overflow:,} FIFO overflow '
+                f'event(s) dropped by the detector, {unknown:,} unrecognised '
+                f'record(s). Reduce active pixels or count rate.\n')
+        self.log_fn(
+            f'[N{self.node_id}] Session: {stats.get("records", 0):,} records, '
+            f'{overflow:,} overflow, parser lag {stats.get("lag_s", 0):.1f} s\n')
+        if not self._output_dir:
+            return
+        try:
+            os.makedirs(self._output_dir, exist_ok=True)
+            with open(os.path.join(self._output_dir, 'session_stats.json'), 'w') as f:
+                json.dump(stats, f, indent=2)
+        except OSError as exc:
+            self.log_fn(f'[N{self.node_id}] could not write session_stats.json — {exc}\n')
 
     def _accept_data_thread(self) -> None:
         """Accept data connections from sender and run session loops."""
@@ -567,6 +592,8 @@ class ReceiverGUI:
         self._cal_waiting: set[int] = set()   # nodes whose first data chunk is still pending
         self._cal_run = -1                    # run_id that opened the current wait
         self._cal_armed_run = -1              # run_id whose cal window has been opened
+        self._cal_acc: dict = {}              # node_id -> [slave_dwell, master_dwell]
+        self._cal_deadline = 0.0
 
         self._correlate_win = CorrelateWindow(root)
         self._monitor_abort: threading.Event | None = None
@@ -615,7 +642,7 @@ class ReceiverGUI:
         ttk.Radiobutton(acq, text='Monitor', variable=self.test_var,
                         value=True).grid(row=0, column=2, sticky='w', padx=(0, 16))
 
-        ttk.Label(acq, text=f'Sparse waveform calibration (auto {SPARSE_CAL_DURATION_S:.2f} s)',
+        ttk.Label(acq, text=f'Sparse waveform calibration (auto {SPARSE_CAL_WAVEFORM_S:.2f} s)',
                   ).grid(row=1, column=0, columnspan=5, sticky='w', padx=8, pady=(0, 6))
 
         self._cal_status_var = tk.StringVar(value='')
@@ -900,6 +927,11 @@ class ReceiverGUI:
             # late chunk from a superseded run must not calibrate the new one.
             self._arm_sparse_cal(self._cal_run)
 
+    @staticmethod
+    def _span_s(arr: np.ndarray) -> float:
+        """Detector-time span of a timestamp array, in seconds."""
+        return 0.0 if arr.size < 2 else float(arr.max() - arr.min()) / 1e12
+
     def _arm_sparse_cal(self, run_id: int, timed_out: bool = False) -> None:
         """Open the calibration window now that data is flowing on every node."""
         if run_id != self._run_id or self._cal_armed_run == run_id:
@@ -909,21 +941,61 @@ class ReceiverGUI:
                 f'Sparse cal: no data from node(s) {sorted(self._cal_waiting)} after '
                 f'{CAL_ARM_TIMEOUT_MS / 1000:.0f} s — calibrating on what we have.\n')
         self._cal_armed_run = run_id
+        self._cal_acc = {n.node_id: [np.empty(0, dtype=np.int64),
+                                     np.empty(0, dtype=np.int64)]
+                         for n in (self.node1, self.node2)}
+        self._cal_deadline = time.time() + CAL_MAX_WAIT_S
         self._enqueue_log(
-            f'Sparse cal: collecting dwell for {SPARSE_CAL_DURATION_S:.2f} s…\n')
+            f'Sparse cal: collecting one waveform period '
+            f'({SPARSE_CAL_WAVEFORM_S:.2f} s) of dwell…\n')
         self._set_cal_status(
-            f'● Calibrating dwell offset ({SPARSE_CAL_DURATION_S:.2f} s)…',
+            f'● Calibrating dwell offset ({SPARSE_CAL_WAVEFORM_S:.2f} s)…',
             color='#cc8800')
-        self.root.after(round(SPARSE_CAL_DURATION_S * 1000),
-                        lambda: self._apply_sparse_dwell_offset(run_id))
+        self.root.after(CAL_POLL_MS, lambda: self._poll_sparse_cal(run_id))
+
+    def _poll_sparse_cal(self, run_id: int) -> None:
+        """Close the window on collected detector time, not on wall-clock.
+
+        A wall-clock timer hands the fit only as much of the waveform as the
+        parser managed to deliver — under lag that was a fraction of a period
+        and too few pulses to converge. Waiting for the dwell timestamps to
+        actually span a period makes the pulse count independent of throughput;
+        it just takes longer when the sender is behind.
+        """
+        if run_id != self._run_id:
+            self._enqueue_log(
+                f'Sparse cal: stale collection from run {run_id} abandoned '
+                f'(current run {self._run_id}).\n')
+            return
+
+        for node in (self.node1, self.node2):
+            acc = self._cal_acc.get(node.node_id)
+            if acc is None:
+                continue
+            for i, new in enumerate((node.get_all_dwell_ps(),
+                                     node.get_all_master_dwell_ps())):
+                if new.size:
+                    acc[i] = np.concatenate([acc[i], new])
+
+        spans = [self._span_s(acc[0]) for acc in self._cal_acc.values()]
+        if spans and min(spans) >= SPARSE_CAL_WAVEFORM_S:
+            self._apply_sparse_dwell_offset(run_id)
+            return
+        if time.time() >= self._cal_deadline:
+            self._enqueue_log(
+                f'Sparse cal: only {min(spans) if spans else 0:.2f} s of dwell '
+                f'collected after {CAL_MAX_WAIT_S:.0f} s — calibrating anyway.\n')
+            self._apply_sparse_dwell_offset(run_id)
+            return
+        self.root.after(CAL_POLL_MS, lambda: self._poll_sparse_cal(run_id))
 
     def _apply_sparse_dwell_offset(self, run_id: int) -> None:
-        """Autonomous sparse-waveform dwell calibration using the first
-        SPARSE_CAL_DURATION_S of dwell data.
+        """Fit the clock offset from one waveform period of collected dwell data.
 
-        `run_id` guards against a timer armed by a run that was since aborted
-        or restarted: such a callback would drain the *new* run's dwell queues
-        and reset the correlator to offset 0, leaving the g² histogram empty.
+        `run_id` guards against a collection started by a run that was since
+        aborted or restarted: such a callback would consume the *new* run's
+        dwell data and reset the correlator to offset 0, leaving the g²
+        histogram empty.
         """
         if run_id != self._run_id:
             self._enqueue_log(
@@ -931,13 +1003,18 @@ class ReceiverGUI:
                 f'(current run {self._run_id}).\n')
             return
 
-        t1 = self.node1.get_all_dwell_ps()          # slave_dwell
-        t2 = self.node2.get_all_dwell_ps()          # slave_dwell
-        m1 = self.node1.get_all_master_dwell_ps()   # master_dwell
-        m2 = self.node2.get_all_master_dwell_ps()   # master_dwell
+        # One last sweep, then read from the accumulator _poll_sparse_cal filled.
+        for node in (self.node1, self.node2):
+            acc = self._cal_acc.get(node.node_id)
+            if acc is None:
+                continue
+            for i, new in enumerate((node.get_all_dwell_ps(),
+                                     node.get_all_master_dwell_ps())):
+                if new.size:
+                    acc[i] = np.concatenate([acc[i], new])
 
-        # Dwell keys are intercepted into queues instead of being written to
-        # disk by run_session_loop — dump them to the usual dwell .bin files now.
+        t1, m1 = self._cal_acc[self.node1.node_id]   # slave_dwell, master_dwell
+        t2, m2 = self._cal_acc[self.node2.node_id]
 
         MIN_EVENTS = 5
         if t1.size < MIN_EVENTS or t2.size < MIN_EVENTS:
@@ -961,7 +1038,7 @@ class ReceiverGUI:
                 span_s = float(arr.max() - arr.min()) / 1e12
                 self._enqueue_log(
                     f'  {label}: {arr.size} dwell events over {span_s:.2f} s '
-                    f'of a {SPARSE_CAL_DURATION_S:.2f} s window '
+                    f'of a {SPARSE_CAL_WAVEFORM_S:.2f} s target '
                     f'({arr.size / max(span_s, 1e-9):.1f} /s)\n')
 
         cluster_tol = 10_000  # 10 ns: excludes ±32 ns TDC doublet sidelobes

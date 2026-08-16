@@ -71,6 +71,12 @@ PIXMAP = np.array([
 ])
 
 SPECIAL = {225: 'dwell', 226: 'line', 228: 'frame'}
+RESET_ID          = 234      # coarse-counter reset marker
+OVERFLOW_ID       = 247      # detector FIFO overflow: photons already lost
+KNOWN_MARKER_IDS  = np.array(sorted(SPECIAL) + [RESET_ID, OVERFLOW_ID])
+
+LAG_CHECK_S = 5.0      # how often to recompute parser lag
+LAG_WARN_S  = 2.0      # lag above this means data is queueing up
 
 master_loc = np.array([PIXMAP[170 + i] for i in range(150)])
 slave_loc  = np.array([PIXMAP[i]       for i in range(170)])
@@ -150,12 +156,19 @@ def run(sock: socket.socket,
         duration: float,
         test_mode: bool,
         stop_event: threading.Event,
-        log_fn=print) -> None:
+        log_fn=print) -> dict:
     """
     Run one acquisition session over an already-connected socket.
     Sends KEY_SETUP, streams data chunks, then sends KEY_END.
     Does NOT close the socket — the caller owns it.
+
+    Returns per-session counters: records parsed, FIFO-overflow markers (photons
+    the detector dropped — unrecoverable, so they are totalled rather than just
+    warned about), records with an unrecognised pixel number, and the final
+    parser lag in seconds.
     """
+    stats = {'records': 0, 'overflow': 0, 'unknown': 0,
+             'lag_s': 0.0, 'first_ts': None, 'last_ts': None}
 
     # --- session preamble -------------------------------------------------
     outdir_bytes = output_dir.encode('utf-8')
@@ -268,6 +281,7 @@ def run(sock: socket.socket,
             first_chunk = True
             total_bytes = 0
             t_stream    = time.time()
+            last_lag_check = t_stream
 
             stopping      = False
             stop_deadline = 0.0
@@ -341,9 +355,29 @@ def run(sock: socket.socket,
                               | (raw[:, 5].astype(np.int64) << 8)
                               |  raw[:, 6].astype(np.int64))
 
+                    # FIFO overflow is the one loss that cannot be recovered
+                    # afterwards, so total it for the session rather than
+                    # letting per-chunk warnings scroll past.
                     n_overflow = int(np.sum(pixel_nr == 247))
                     if n_overflow:
-                        log_fn(f'Warning: {n_overflow} FIFO overflow event(s)')
+                        stats['overflow'] += n_overflow
+                    stats['records'] += len(raw)
+
+                    # Lag = wall-clock elapsed minus reconstructed detector time.
+                    # It grows when the parser cannot keep up, which is what
+                    # pushes loss into the detector's FIFO.
+                    if stats['first_ts'] is None:
+                        stats['first_ts'] = int(time_ps[0])
+                    stats['last_ts'] = int(time_ps[-1])
+                    if time.time() - last_lag_check >= LAG_CHECK_S:
+                        last_lag_check = time.time()
+                        lag = ((last_lag_check - t_stream)
+                               - (stats['last_ts'] - stats['first_ts']) / 1e12)
+                        stats['lag_s'] = round(lag, 2)
+                        if lag > LAG_WARN_S:
+                            log_fn(f'WARNING: parser is {lag:.1f} s behind the '
+                                   f'detector — data is queueing and photons will '
+                                   f'be lost to FIFO overflow if this grows\n')
 
                     cs_m = np.cumsum((is_mast  & (pixel_nr == 234)).astype(np.int64))
                     cs_s = np.cumsum((~is_mast & (pixel_nr == 234)).astype(np.int64))
@@ -359,6 +393,14 @@ def run(sock: socket.socket,
 
                     reset_arr = np.where(is_mast, cum_reset_m, cum_reset_s)
                     time_ps   = (reset_arr * COUNTS_PER_RESET + coarse) * PS_PER_COUNT + fine
+
+                    # Anything that is neither a physical pixel nor a known
+                    # marker is discarded by the loop below; count it rather
+                    # than dropping it silently.
+                    recognised = ((is_mast & (pixel_nr < 150))
+                                  | (~is_mast & (pixel_nr < 170))
+                                  | np.isin(pixel_nr, KNOWN_MARKER_IDS))
+                    stats['unknown'] += int((~recognised).sum())
 
                     dwell_seen = False
                     for chip_flag, loc_map, n_phys, chip_name in (
@@ -420,7 +462,17 @@ def run(sock: socket.socket,
             if sys.exc_info()[0] is None:
                 raise
 
-    log_fn(f'Done. Elapsed: {time.time() - start:.1f} s')
+    elapsed = time.time() - start
+    stats.pop('first_ts', None)
+    stats.pop('last_ts', None)
+    stats['elapsed_s'] = round(elapsed, 1)
+    if stats['overflow'] or stats['unknown']:
+        log_fn(f'WARNING: {stats["overflow"]:,} FIFO overflow event(s) — those '
+               f'photons were dropped by the detector and cannot be recovered; '
+               f'{stats["unknown"]:,} record(s) had an unrecognised pixel number\n')
+    log_fn(f'Done. Elapsed: {elapsed:.1f} s — {stats["records"]:,} records, '
+           f'{stats["overflow"]:,} overflow, lag {stats["lag_s"]:.1f} s')
+    return stats
 
 
 # ---------------------------------------------------------------------------
@@ -556,13 +608,14 @@ def _run_acquisition_cmd(params: dict, stop_event: threading.Event,
         send_ctrl({'status': 'streaming'})
         status_fn({'event': 'streaming'})
 
+        stats = None
         try:
-            run(sock, output_dir, duration, test_mode, stop_event,
-                log_fn=lambda msg: send_ctrl({'status': 'log', 'msg': msg}))
+            stats = run(sock, output_dir, duration, test_mode, stop_event,
+                        log_fn=lambda msg: send_ctrl({'status': 'log', 'msg': msg}))
         finally:
             sock.close()
 
-        send_ctrl({'status': 'done'})
+        send_ctrl({'status': 'done', 'stats': stats or {}})
     except Exception as exc:
         send_ctrl({'status': 'error', 'msg': f'{type(exc).__name__}: {exc}'})
         send_ctrl({'status': 'log',
