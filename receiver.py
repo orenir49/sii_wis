@@ -33,7 +33,11 @@ from offset_tools import estimate_offset
 import ssh_launcher
 
 HEALTH_CHECK_MS = 2_000
-SPARSE_CAL_DURATION_S = 4.194304  # RIGOL sparse-pulse RAF waveform: 2**23 pts @ 2 MSa/s
+SPARSE_CAL_WAVEFORM_S = 4.194304  # RIGOL sparse-pulse RAF waveform: 2**23 pts @ 2 MSa/s
+# Dwell-collection window. Longer than one waveform period: measured capture runs
+# well below the ~50 pulses a period contains, so the extra time buys matched
+# pairs for the fit. Raise it if calibration still fails.
+SPARSE_CAL_DURATION_S = 6.0
 CAL_ARM_TIMEOUT_MS = 20_000       # give up waiting for a node's first chunk
 
 
@@ -981,6 +985,17 @@ class ReceiverGUI:
             self.node1.start_dwell_flush()
             self.node2.start_dwell_flush()
             return
+
+        # Capture diagnostics: a span well short of the window means dwell data
+        # stopped arriving early (sender-side queue lag); a full span with too
+        # few events means pulses are genuinely being missed.
+        for label, arr in (('node1', t1), ('node2', t2)):
+            if arr.size >= 2:
+                span_s = float(arr.max() - arr.min()) / 1e12
+                self._enqueue_log(
+                    f'  {label}: {arr.size} dwell events over {span_s:.2f} s '
+                    f'of a {SPARSE_CAL_DURATION_S:.2f} s window '
+                    f'({arr.size / max(span_s, 1e-9):.1f} /s)\n')
 
         cluster_tol = 10_000  # 10 ns: excludes ±32 ns TDC doublet sidelobes
         slave_offset_ps, slave_details = estimate_offset(
