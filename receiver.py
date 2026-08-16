@@ -34,6 +34,7 @@ import ssh_launcher
 
 HEALTH_CHECK_MS = 2_000
 SPARSE_CAL_DURATION_S = 4.194304  # RIGOL sparse-pulse RAF waveform: 2**23 pts @ 2 MSa/s
+CAL_ARM_TIMEOUT_MS = 20_000       # give up waiting for a node's first chunk
 
 
 # ---------------------------------------------------------------------------
@@ -49,12 +50,14 @@ class NodePanel:
                  default_ssh_user: str = 'user',
                  log_fn=None,
                  get_hooks_fn=None,
-                 set_correlate_pixel_fn=None) -> None:
+                 set_correlate_pixel_fn=None,
+                 on_first_data_fn=None) -> None:
         self.root          = root
         self.node_id       = node_id
         self.log_fn        = log_fn
         self._get_hooks_fn = get_hooks_fn
         self._set_correlate_pixel_fn = set_correlate_pixel_fn
+        self._on_first_data_fn = on_first_data_fn
 
         self._ctrl_sock:   socket.socket | None = None
         self._data_server: socket.socket | None = None
@@ -330,6 +333,9 @@ class NodePanel:
                     ),
                     pixel_hooks=hooks,
                     event_accum=self._event_accum,
+                    on_first_chunk=(
+                        (lambda: self._on_first_data_fn(self.node_id))
+                        if self._on_first_data_fn else None),
                 )
             except Exception:
                 # Never let the accept loop die — otherwise the next START connects
@@ -575,6 +581,9 @@ class ReceiverGUI:
 
         self._log_queue: queue.Queue = queue.Queue()
         self._run_id = 0
+        self._cal_waiting: set[int] = set()   # nodes whose first data chunk is still pending
+        self._cal_run = -1                    # run_id that opened the current wait
+        self._cal_armed_run = -1              # run_id whose cal window has been opened
 
         self._correlate_win = CorrelateWindow(root)
         self._monitor_abort: threading.Event | None = None
@@ -599,7 +608,8 @@ class ReceiverGUI:
                                default_ssh_user='labcomp1',
                                log_fn=self._enqueue_log,
                                get_hooks_fn=lambda: self._correlate_win.hooks_node1,
-                               set_correlate_pixel_fn=lambda pix: self._correlate_win.px1_var.set(str(pix)))
+                               set_correlate_pixel_fn=lambda pix: self._correlate_win.px1_var.set(str(pix)),
+                               on_first_data_fn=self._on_node_first_data)
         self.node2 = NodePanel(nodes_frame, self.root,
                                node_id=2,
                                default_sender_ip='192.168.1.12',
@@ -608,7 +618,8 @@ class ReceiverGUI:
                                default_ssh_user='oreni',
                                log_fn=self._enqueue_log,
                                get_hooks_fn=lambda: self._correlate_win.hooks_node2,
-                               set_correlate_pixel_fn=lambda pix: self._correlate_win.px2_var.set(str(pix)))
+                               set_correlate_pixel_fn=lambda pix: self._correlate_win.px2_var.set(str(pix)),
+                               on_first_data_fn=self._on_node_first_data)
 
         # ── acquisition controls ───────────────────────────────────────
         acq = ttk.LabelFrame(self.root, text='Acquisition')
@@ -709,14 +720,22 @@ class ReceiverGUI:
             self._schedule_progress(step_ms, 1, self._run_id)
 
         if self._correlate_win.is_enabled:
+            # Wait for data to actually flow before opening the calibration
+            # window. Between START and the first timestamp the sender still has
+            # to reach the receiver and negotiate with lSPAD (STOP, drain,
+            # T,v,1, SB) — seconds. Timing the window from the button press
+            # spent most of it on an idle link and captured only the tail of the
+            # sparse-pulse waveform, so the fit had too few pulses to converge.
+            self._cal_waiting = {n.node_id for n in (self.node1, self.node2)
+                                 if n.is_ready()}
+            self._cal_run = self._run_id
             self._enqueue_log(
-                f'Sparse cal: collecting dwell for {SPARSE_CAL_DURATION_S:.2f} s…\n')
-            self._set_cal_status(
-                f'● Calibrating dwell offset ({SPARSE_CAL_DURATION_S:.2f} s)…',
-                color='#cc8800')
-            self.root.after(round(SPARSE_CAL_DURATION_S * 1000),
-                             lambda rid=self._run_id:
-                                 self._apply_sparse_dwell_offset(rid))
+                f'Sparse cal: waiting for data from node(s) '
+                f'{sorted(self._cal_waiting)} …\n')
+            self._set_cal_status('● Waiting for data …', color='#cc8800')
+            # Fallback: never hang if a node never delivers a first chunk.
+            self.root.after(CAL_ARM_TIMEOUT_MS,
+                            lambda rid=self._run_id: self._arm_sparse_cal(rid, timed_out=True))
 
     def _abort_all(self) -> None:
         if self._monitor_abort is not None:
@@ -728,6 +747,7 @@ class ReceiverGUI:
             if ready:
                 node.send_abort()
         self._run_id += 1          # invalidates pending progress/timer/sparse-cal callbacks
+        self._cal_waiting.clear()
         self._show_progress_bar()
         self._set_progress(0)
         self._set_cal_status('● Aborted — not calibrated', color='#cc8800')
@@ -893,6 +913,36 @@ class ReceiverGUI:
     def _set_cal_status(self, text: str, color: str = 'black') -> None:
         self._cal_status_var.set(text)
         self._cal_status_lbl.config(fg=color)
+
+    def _on_node_first_data(self, node_id: int) -> None:
+        """Called from a node's data thread when its first chunk of a session lands."""
+        self.root.after(0, lambda: self._note_first_data(node_id))
+
+    def _note_first_data(self, node_id: int) -> None:
+        if node_id not in self._cal_waiting:
+            return
+        self._cal_waiting.discard(node_id)
+        if not self._cal_waiting:
+            # Arm for the run that opened the wait, not whatever is current — a
+            # late chunk from a superseded run must not calibrate the new one.
+            self._arm_sparse_cal(self._cal_run)
+
+    def _arm_sparse_cal(self, run_id: int, timed_out: bool = False) -> None:
+        """Open the calibration window now that data is flowing on every node."""
+        if run_id != self._run_id or self._cal_armed_run == run_id:
+            return
+        if timed_out and self._cal_waiting:
+            self._enqueue_log(
+                f'Sparse cal: no data from node(s) {sorted(self._cal_waiting)} after '
+                f'{CAL_ARM_TIMEOUT_MS / 1000:.0f} s — calibrating on what we have.\n')
+        self._cal_armed_run = run_id
+        self._enqueue_log(
+            f'Sparse cal: collecting dwell for {SPARSE_CAL_DURATION_S:.2f} s…\n')
+        self._set_cal_status(
+            f'● Calibrating dwell offset ({SPARSE_CAL_DURATION_S:.2f} s)…',
+            color='#cc8800')
+        self.root.after(round(SPARSE_CAL_DURATION_S * 1000),
+                        lambda: self._apply_sparse_dwell_offset(run_id))
 
     def _apply_sparse_dwell_offset(self, run_id: int) -> None:
         """Autonomous sparse-waveform dwell calibration using the first

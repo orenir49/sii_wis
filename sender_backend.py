@@ -213,23 +213,22 @@ def run(sock: socket.socket,
             spad_sock.settimeout(LSPAD_HANDSHAKE_S)
             log_fn(f'[dbg] connecting to lSPAD {SPAD_HOST}:{SPAD_PORT} …\n')
             spad_sock.connect((SPAD_HOST, SPAD_PORT))
-            log_fn('[dbg] lSPAD connected, awaiting banner …\n')
-            banner = drain_lspad(spad_sock, quiet_for=0.5, cap=LSPAD_HANDSHAKE_S)
-            log_fn(f'[dbg] banner ({len(banner)} B): {banner[:120]!r}\n')
-            log_fn(banner.decode('utf8', errors='replace'))
-
             # Clear any acquisition still running from a previous session before
             # touching the command protocol. lSPAD streams to every connected
             # client, so a leftover SB would be read as our command replies and
             # would desynchronise the 7-byte record framing for the whole run.
+            # Sending STOP straight away lets one drain cover the banner, any
+            # leftover stream and the STOP reply — three waits cost >1 s of the
+            # sparse-cal window.
             spad_sock.sendall(b'STOP\n')
-            residue = drain_lspad(spad_sock, quiet_for=0.5, cap=STOP_CONFIRM_S)
-            if len(residue) > 64:
-                log_fn(f'[dbg] pre-START STOP: discarded {len(residue)} B of '
+            preamble = drain_lspad(spad_sock, quiet_for=0.4, cap=STOP_CONFIRM_S)
+            log_fn(f'[dbg] preamble ({len(preamble)} B): {preamble[:120]!r}\n')
+            if len(preamble) > 256:
+                log_fn(f'[dbg] pre-START STOP: discarded {len(preamble)} B of '
                        f'leftover stream before lSPAD went quiet\n')
 
             spad_sock.sendall(b'T,v,1\n')
-            tdc_reply = drain_lspad(spad_sock, quiet_for=0.4, cap=LSPAD_HANDSHAKE_S)
+            tdc_reply = drain_lspad(spad_sock, quiet_for=0.2, cap=LSPAD_HANDSHAKE_S)
             log_fn(f'[dbg] T,v,1 reply ({len(tdc_reply)} B): {tdc_reply[:120]!r}\n')
             if not is_text_reply(tdc_reply):
                 raise RuntimeError(

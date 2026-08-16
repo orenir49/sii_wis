@@ -79,7 +79,8 @@ def check_connection(sock: socket.socket) -> bool:
 
 def run_session_loop(conn: socket.socket, log_fn=print,
                      pixel_hooks: dict | None = None,
-                     event_accum: list | None = None) -> None:
+                     event_accum: list | None = None,
+                     on_first_chunk=None) -> None:
     """
     Handle back-to-back acquisition sessions on an accepted connection.
     Blocks until the sender disconnects (ConnectionError).
@@ -90,6 +91,10 @@ def run_session_loop(conn: socket.socket, log_fn=print,
     event_accum:  optional single-element list [int]; the inner loop adds
                   n_bytes//8 for every pixel chunk (key_id < 320) so the
                   caller can poll it for a count-rate display.
+    on_first_chunk: optional callable, invoked once per session when the first
+                  data chunk arrives. Marks the moment acquisition is genuinely
+                  under way — several seconds after START, since the sender
+                  still has to reach the receiver and negotiate with lSPAD.
     """
     session = 0
     try:
@@ -118,6 +123,8 @@ def run_session_loop(conn: socket.socket, log_fn=print,
                 if key_id == KEY_END:
                     break
                 payload = recvall(conn, n_bytes)
+                if chunks == 0 and on_first_chunk is not None:
+                    on_first_chunk()
                 if pixel_hooks and key_id in pixel_hooks:
                     pixel_hooks[key_id].put(payload)
                 else:
