@@ -138,7 +138,11 @@ def _recv_lspad(chan: paramiko.Channel, timeout: float = 5.0,
 
 
 def generate_mask_content(pix: int) -> bytes:
-    """Mask listing every raw lSPAD pixel index 0-319 except `pix` (keeps only `pix` active)."""
+    """Mask listing every physical pixel location 0-319 except `pix` (keeps only `pix` active).
+
+    `pix` is a physical sensor location (a PIXMAP *value*, the same units as the
+    correlator's "Pixel (loc)" fields), not a pix ID (a PIXMAP index).
+    """
     lines = [str(i) for i in range(320) if i != pix]
     return ('\n'.join(lines) + '\n').encode('ascii')
 
@@ -293,6 +297,8 @@ def launch_node(host: str, username: str, password: str,
     """
     Full launch sequence for one sender node.
     log_fn receives plain text lines (already newline-terminated).
+    `mask_pixel` (a physical sensor location, not a pix ID) generates a
+    single-pixel mask and takes priority over `mask_filename`.
     Returns the dwell clock frequency (Hz) from the R command.
     Raises RuntimeError on fatal errors.
     """
