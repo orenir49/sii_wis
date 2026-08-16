@@ -14,6 +14,7 @@ import os
 import select
 import socket
 import struct
+import time
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -100,7 +101,9 @@ def run_session_loop(conn: socket.socket, log_fn=print,
     Protocol per session: KEY_SETUP → data chunks → KEY_END.
 
     pixel_hooks:  optional {key_id: queue.Queue} — matching chunks are put()
-                  into the queue instead of written to disk (live correlator).
+                  into the queue *in addition to* being written to disk (live
+                  correlator). A read tap, not a diversion: every payload is
+                  persisted regardless of who else is watching it.
     event_accum:  optional single-element list [int]; the inner loop adds
                   n_bytes//8 for every pixel chunk (key_id < 320) so the
                   caller can poll it for a count-rate display.
@@ -130,8 +133,10 @@ def run_session_loop(conn: socket.socket, log_fn=print,
             for kid, fname in SPECIAL_KEY_TO_FILENAME.items():
                 handles[kid] = open(os.path.join(output_dir, fname), 'wb')
 
-            chunks  = 0
-            unknown = 0
+            chunks    = 0
+            unknown   = 0
+            written   = 0      # bytes committed to disk this session
+            write_s   = 0.0    # seconds spent inside handle.write
             try:
                 while True:
                     header          = readall(stream, 8)
@@ -148,7 +153,14 @@ def run_session_loop(conn: socket.socket, log_fn=print,
                     # meant the correlated pixels were the only ones with no file.
                     handle = handles.get(key_id)
                     if handle is not None:
+                        # Timed: if the master's disk is the bottleneck, the
+                        # sender's TCP window closes and the loss resurfaces as
+                        # detector FIFO overflow. write_s is what distinguishes
+                        # "the detector is too fast" from "we are too slow".
+                        t0 = time.perf_counter()
                         handle.write(payload)
+                        write_s += time.perf_counter() - t0
+                        written += n_bytes
                     else:
                         unknown += 1
                     if pixel_hooks and key_id in pixel_hooks:
@@ -166,7 +178,10 @@ def run_session_loop(conn: socket.socket, log_fn=print,
             if unknown:
                 log_fn(f'[session {session}] WARNING: {unknown} chunk(s) with an '
                        f'unrecognised key_id were not written')
-            log_fn(f'[session {session}] Done — {chunks} chunks written to {output_dir}')
+            log_fn(f'[session {session}] Done — {chunks} chunks, '
+                   f'{written / 1e6:.1f} MB to {output_dir} '
+                   f'({write_s:.1f} s in write'
+                   + (f', {written / 1e6 / write_s:.0f} MB/s)' if write_s > 0.05 else ')'))
 
     except ConnectionError:
         log_fn('Sender disconnected.')

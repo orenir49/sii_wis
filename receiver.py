@@ -330,9 +330,15 @@ class NodePanel:
                 f'[N{self.node_id}] ⚠ PHOTON LOSS: {overflow:,} FIFO overflow '
                 f'event(s) dropped by the detector, {unknown:,} unrecognised '
                 f'record(s). Reduce active pixels or count rate.\n')
+        # lag peak and queue depth are what say whether overflow came from the
+        # detector's own readout limit or from us stalling the parser.
         self.log_fn(
             f'[N{self.node_id}] Session: {stats.get("records", 0):,} records, '
-            f'{overflow:,} overflow, parser lag {stats.get("lag_s", 0):.1f} s\n')
+            f'{overflow:,} overflow, parser lag {stats.get("lag_s", 0):.1f} s '
+            f'(peak {stats.get("lag_max_s", 0):.1f} s), send queue peak '
+            f'{stats.get("queue_max", 0)}'
+            + (f', BLOCKED {stats["queue_blocks"]:,}x'
+               if stats.get('queue_blocks') else '') + '\n')
         if not self._output_dir:
             return
         try:

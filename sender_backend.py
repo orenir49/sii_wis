@@ -164,11 +164,19 @@ def run(sock: socket.socket,
 
     Returns per-session counters: records parsed, FIFO-overflow markers (photons
     the detector dropped — unrecoverable, so they are totalled rather than just
-    warned about), records with an unrecognised pixel number, and the final
-    parser lag in seconds.
+    warned about), records with an unrecognised pixel number, parser lag (final
+    and peak), and the send-queue high-water mark.
+
+    lag_max_s and queue_max exist to tell two very different causes of overflow
+    apart. Overflow with both low means the detector's own readout is the
+    ceiling. Lag climbing first, or queue_max approaching QUEUE_MAXSIZE, means
+    the blocking sq.put() stalled the parser — so the ceiling is ours, and the
+    photons were lost downstream of the detector rather than by it.
     """
     stats = {'records': 0, 'overflow': 0, 'unknown': 0,
-             'lag_s': 0.0, 'first_ts': None, 'last_ts': None}
+             'lag_s': 0.0, 'lag_max_s': 0.0,
+             'queue_max': 0, 'queue_blocks': 0,
+             'first_ts': None, 'last_ts': None}
 
     # --- session preamble -------------------------------------------------
     outdir_bytes = output_dir.encode('utf-8')
@@ -205,7 +213,19 @@ def run(sock: socket.socket,
                 parts.append(payload)
                 bufs[key] = []
         if parts:
-            sq.put(b''.join(parts))
+            blob = b''.join(parts)
+            # Depth *before* enqueuing, so a full queue is visible as such. The
+            # put below blocks when the queue is full, and a blocked put is what
+            # stops the parser reading the socket and pushes loss into lSPAD's
+            # FIFO — so count the blocks directly rather than inferring them.
+            depth = sq.qsize()
+            if depth > stats['queue_max']:
+                stats['queue_max'] = depth
+            try:
+                sq.put_nowait(blob)
+            except queue.Full:
+                stats['queue_blocks'] += 1
+                sq.put(blob)
 
     def sender_fn() -> None:
         while True:
@@ -389,6 +409,11 @@ def run(sock: socket.socket,
                         lag = ((last_lag_check - t_stream)
                                - (stats['last_ts'] - stats['first_ts']) / 1e12)
                         stats['lag_s'] = round(lag, 2)
+                        # lag_s is overwritten every LAG_CHECK_S, so a spike
+                        # that recovers before the run ends leaves no trace in
+                        # the final record. Keep the peak too.
+                        if lag > stats['lag_max_s']:
+                            stats['lag_max_s'] = round(lag, 2)
                         if lag > LAG_WARN_S:
                             log_fn(f'WARNING: parser is {lag:.1f} s behind the '
                                    f'detector — data is queueing and photons will '
@@ -470,8 +495,16 @@ def run(sock: socket.socket,
         log_fn(f'WARNING: {stats["overflow"]:,} FIFO overflow event(s) — those '
                f'photons were dropped by the detector and cannot be recovered; '
                f'{stats["unknown"]:,} record(s) had an unrecognised pixel number\n')
+    if stats['queue_blocks']:
+        # Overflow with blocks is our fault, not the detector's — say which.
+        log_fn(f'WARNING: the send queue was full {stats["queue_blocks"]:,} time(s) '
+               f'(peak depth {stats["queue_max"]}/{QUEUE_MAXSIZE}) — the parser was '
+               f'stalled waiting on the receiver, so any FIFO overflow above was '
+               f'caused downstream of the detector, not by it\n')
     log_fn(f'Done. Elapsed: {elapsed:.1f} s — {stats["records"]:,} records, '
-           f'{stats["overflow"]:,} overflow, lag {stats["lag_s"]:.1f} s')
+           f'{stats["overflow"]:,} overflow, lag {stats["lag_s"]:.1f} s '
+           f'(peak {stats["lag_max_s"]:.1f} s), queue peak '
+           f'{stats["queue_max"]}/{QUEUE_MAXSIZE}')
     return stats
 
 

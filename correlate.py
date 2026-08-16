@@ -1,10 +1,14 @@
 """
 Live g² correlator — opened automatically by spad_receiver_gui.py.
 
-Two pixel timestamp streams are intercepted in RAM (never written to disk) via
-queue hooks injected into run_session_loop.  A background thread runs the
-multistart-multistop algorithm on all accumulated timestamps and posts the
-updated histogram back to the main thread for display.
+Two pixel timestamp streams are tapped in RAM via queue hooks injected into
+run_session_loop.  The tap is a copy, not a diversion — run_session_loop still
+writes both pixels to px_<n>.bin, so nothing seen here is exclusive to RAM.  A
+background thread runs the multistart-multistop algorithm on all accumulated
+timestamps and posts the updated histogram back to the main thread for display.
+
+No event is ever dropped to keep up. If the correlator falls behind the detector
+the backlog simply grows, and the status line reports how far behind it is.
 """
 
 import queue
@@ -40,6 +44,9 @@ def _multistart_multistop(t1, t2, idx, bin_width, tmax, nbins, n_shift):
     return hist_priv.sum(axis=0)
 
 
+BACKLOG_WARN_S = 2.0    # unprocessed detector time before the display says so
+
+
 def _prewarm():
     """Trigger numba JIT compilation on a tiny dummy array."""
     d   = np.array([0, 1, 2], dtype=np.int64)
@@ -61,9 +68,17 @@ class CorrelateWindow(tk.Toplevel):
         self._q1: queue.Queue = queue.Queue()
         self._q2: queue.Queue = queue.Queue()
 
-        # Accumulated int64 timestamp arrays
+        # Accumulated int64 timestamp arrays, plus the chunks not yet merged
+        # into them. Merging is deferred to _launch_correlation so that polling
+        # stays O(chunk) instead of O(everything accumulated) — otherwise a
+        # correlator that falls behind pays a full copy of a growing array on
+        # the Tk main thread every poll, and the GUI freezes exactly when the
+        # backlog warning becomes worth reading.
         self._t1 = np.empty(0, dtype=np.int64)
         self._t2 = np.empty(0, dtype=np.int64)
+        self._p1: list = []
+        self._p2: list = []
+        self._backlog_s = 0.0
 
         self._active        = False
         self._accumulating  = False   # True only after dwell offset is set
@@ -241,6 +256,9 @@ class CorrelateWindow(tk.Toplevel):
     def _reset(self) -> None:
         self._t1           = np.empty(0, dtype=np.int64)
         self._t2           = np.empty(0, dtype=np.int64)
+        self._p1           = []
+        self._p2           = []
+        self._backlog_s    = 0.0
         self._hist         = None
         self._bins         = None
         self._offset       = None
@@ -307,6 +325,9 @@ class CorrelateWindow(tk.Toplevel):
                     break
         self._t1           = np.empty(0, dtype=np.int64)
         self._t2           = np.empty(0, dtype=np.int64)
+        self._p1           = []
+        self._p2           = []
+        self._backlog_s    = 0.0
         self._hist         = None
         self._bins         = None
         self._offset       = offset
@@ -320,25 +341,28 @@ class CorrelateWindow(tk.Toplevel):
     def _poll_data(self) -> None:
         new_data = False
 
-        for q, attr in ((self._q1, '_t1'), (self._q2, '_t2')):
-            chunks = []
+        for q, pending in ((self._q1, self._p1), (self._q2, self._p2)):
             while True:
                 try:
                     raw = q.get_nowait()
+                    # Pre-calibration events are dropped here by design: they
+                    # are on disk, and the histogram starts at the dwell offset.
                     if self._accumulating:
-                        chunks.append(np.frombuffer(raw, dtype=np.int64).copy())
+                        pending.append(np.frombuffer(raw, dtype=np.int64).copy())
                         new_data = True
                 except queue.Empty:
                     break
-            if chunks:
-                current = getattr(self, attr)
-                setattr(self, attr, np.concatenate([current] + chunks))
 
-        if new_data and len(self._t1) > 0 and len(self._t2) > 0:
+        if new_data and (self._t1.size or self._p1) and (self._t2.size or self._p2):
             if not self._correlating:
                 self._launch_correlation()
             else:
                 self._has_new_data = True
+                # Batches get rarer as the backlog grows, so _poll_results is
+                # too slow a channel for this warning — say it from here.
+                note = self._backlog_note()
+                if note:
+                    self.status_var.set(f'Accumulating — {note}')
 
         try:
             interval_ms = max(100, int(float(self.interval_var.get()) * 1000))
@@ -349,6 +373,42 @@ class CorrelateWindow(tk.Toplevel):
     # ------------------------------------------------------------------
     # Correlation  (background thread)
     # ------------------------------------------------------------------
+
+    def _span_and_size(self) -> tuple[float, int]:
+        """Detector-time span and event count of everything not yet correlated.
+
+        Computed without merging, so calling it every poll stays cheap.
+        """
+        first = last = None
+        n     = self._t1.size + self._t2.size
+        if self._t1.size:
+            first, last = int(self._t1[0]), int(self._t1[-1])
+        for c in self._p1:
+            if not c.size:
+                continue
+            n += c.size
+            if first is None:
+                first = int(c[0])
+            last = int(c[-1])
+        for c in self._p2:
+            n += c.size
+        if first is None or last is None:
+            return 0.0, n
+        return (last - first) / 1e12, n
+
+    def _backlog_note(self) -> str:
+        """Non-empty only when the correlator has fallen meaningfully behind.
+
+        Nothing is discarded to catch up — the backlog is allowed to grow — so
+        the only honest thing to do is say how far behind the histogram is.
+        """
+        span, n = self._span_and_size()
+        self._backlog_s = span
+        if span < BACKLOG_WARN_S:
+            return ''
+        return (f'⚠ correlator {span:.1f} s behind the detector '
+                f'({n:,} events, {n * 8 / 1e6:.0f} MB held) — the histogram is '
+                f'not current; raw data is still complete on disk')
 
     def _launch_correlation(self) -> None:
         """Correlate every t1 event whose full ±tmax partner window has arrived.
@@ -364,6 +424,14 @@ class CorrelateWindow(tk.Toplevel):
             _, _, bw, tmax, nshift = self._get_params()
         except Exception:
             return          # entry box mid-edit; retry on the next poll
+
+        # One concatenate per batch, not one per poll.
+        if self._p1:
+            self._t1 = np.concatenate([self._t1] + self._p1)
+            self._p1 = []
+        if self._p2:
+            self._t2 = np.concatenate([self._t2] + self._p2)
+            self._p2 = []
         if self._t1.size == 0 or self._t2.size == 0:
             return
 
@@ -422,7 +490,9 @@ class CorrelateWindow(tk.Toplevel):
                 self._update_plot(self._hist, self._bins)
                 busy   = '  (correlating …)' if self._correlating else ''
                 off_s  = f'  offset {self._offset:+,} ps' if self._offset is not None else ''
-                status = f'Accumulating{off_s} — {n1:,} px1, {n2:,} px2 events{busy}'
+                note   = self._backlog_note()
+                status = (f'Accumulating{off_s} — {n1:,} px1, {n2:,} px2 events{busy}'
+                          + (f'   {note}' if note else ''))
                 self.status_var.set(status)
                 if self._has_new_data:
                     self._launch_correlation()
