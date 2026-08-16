@@ -300,7 +300,7 @@ def run(sock: socket.socket,
                         except OSError as exc:
                             log_fn(f'STOP failed: {exc!r}\n')
                         stopping      = True
-                        stop_deadline = time.time() + STOP_DRAIN_S
+                        stop_deadline = time.time() + STOP_CONFIRM_S
 
                     r, _, _ = select.select([spad_sock], [], [], 0.5)
                     if not r:
@@ -309,7 +309,7 @@ def run(sock: socket.socket,
                         continue
                     if stopping and time.time() > stop_deadline:
                         lost = drain_lspad(spad_sock, quiet_for=0.5, cap=2.0)
-                        log_fn(f'WARNING: lSPAD still streaming {STOP_DRAIN_S:.0f} s '
+                        log_fn(f'WARNING: lSPAD still streaming {STOP_CONFIRM_S:.0f} s '
                                f'after STOP — {len(lost)} B discarded unparsed\n')
                         break
                     data = spad_sock.recv(57344)
