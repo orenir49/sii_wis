@@ -354,7 +354,7 @@ def run(sock: socket.socket,
                     if stopping and stop_deadline is None and not is_soft():
                         log_fn('Soft stop escalated to abort — giving up on the '
                                'remaining backlog.\n')
-                        stats['stop_mode'] = 'soft→abort'
+                        stats['stop_mode'] = 'soft_then_abort'   # ASCII: this lands in JSON
                         stop_deadline = time.time()
 
                     if stopping and time.time() - last_report >= DRAIN_REPORT_S:
