@@ -42,6 +42,8 @@ QUEUE_MAXSIZE     = 200
 LSPAD_HANDSHAKE_S = 10.0    # banner / T,v,1 — never block forever on a wedged lSPAD
 STOP_CONFIRM_S    = 5.0     # hard-abort drain budget; a soft stop has none
 DRAIN_REPORT_S    = 5.0     # progress cadence while draining after STOP
+PRESTART_DRAIN_S  = 120.0   # budget for reading a stale backlog to silence;
+                            # ~120 MB/s on loopback, so this covers ~14 GB
 TDC_CALIB_S       = 180.0   # T,c,1 runs for minutes
 
 # ---------------------------------------------------------------------------
@@ -110,25 +112,37 @@ def connect_receiver(host: str, port: int) -> socket.socket:
 
 
 def drain_lspad(sock: socket.socket, quiet_for: float = 0.5,
-                cap: float = 5.0) -> bytes:
+                cap: float = 5.0, keep: int = 8192) -> tuple[bytes, int]:
     """
     Read from lSPAD until it stays quiet for `quiet_for` s, or `cap` s elapse.
+    Returns (head, total_bytes) — at most `keep` bytes are retained.
 
     lSPAD's command server fans a running acquisition out to *every* connected
     client, so command replies and stream data share one byte flow. Draining to
     silence is the only way to know an acquisition has actually stopped.
+
+    Nothing accumulates the discarded bytes. Measured: no lSPAD command purges
+    a buffered backlog — not STOP, a second STOP, N,0/N,1, a fresh SB, another
+    acquisition mode, or even a POW,0/POW,1 power cycle, and it survives closing
+    the socket. Reading is the only way to clear it, and reading is fast
+    (~120 MB/s on loopback). Materialising it was not: holding 2.2 GB in a
+    bytearray and then copying it with bytes() put ~3.5 GB live on a laptop and
+    turned a 15 s drain into 270 s.
     """
-    out      = bytearray()
+    head     = b''
+    total    = 0
     deadline = time.time() + cap
     while time.time() < deadline:
         r, _, _ = select.select([sock], [], [], quiet_for)
         if not r:
             break
-        chunk = sock.recv(65536)
+        chunk = sock.recv(1 << 20)
         if not chunk:
             break
-        out += chunk
-    return bytes(out)
+        if len(head) < keep:
+            head += chunk[:keep - len(head)]
+        total += len(chunk)
+    return head, total
 
 
 def is_text_reply(data: bytes) -> bool:
@@ -288,22 +302,25 @@ def run(sock: socket.socket,
             # leftover stream and the STOP reply — three waits cost >1 s of the
             # sparse-cal window.
             spad_sock.sendall(b'STOP\n')
-            preamble = drain_lspad(spad_sock, quiet_for=0.4, cap=STOP_CONFIRM_S)
-            if len(preamble) > 256:
-                log_fn(f'pre-START STOP: discarded {len(preamble)} B of '
-                       f'leftover stream before lSPAD went quiet\n')
+            t_pre = time.time()
+            _, pre_n = drain_lspad(spad_sock, quiet_for=0.4, cap=PRESTART_DRAIN_S)
+            if pre_n > 256:
+                dt = time.time() - t_pre
+                log_fn(f'pre-START STOP: discarded {pre_n / 1e6:,.0f} MB of '
+                       f'leftover stream in {dt:.1f} s before lSPAD went quiet\n')
 
             spad_sock.sendall(b'T,v,1\n')
-            tdc_reply = drain_lspad(spad_sock, quiet_for=0.2, cap=LSPAD_HANDSHAKE_S)
+            tdc_reply, tdc_n = drain_lspad(spad_sock, quiet_for=0.2,
+                                           cap=LSPAD_HANDSHAKE_S)
             if not is_text_reply(tdc_reply):
                 raise RuntimeError(
-                    f'lSPAD is still streaming: T,v,1 returned {len(tdc_reply)} bytes '
+                    f'lSPAD is still streaming: T,v,1 returned {tdc_n:,} bytes '
                     'of binary data instead of a calibration state. A previous '
                     'acquisition was not stopped — refusing to start, since the '
                     'record framing would be desynchronised.')
             if tdc_reply.decode('utf8', errors='replace').strip() == 'TDC calibration is invalid':
                 spad_sock.sendall(b'T,c,1\n')
-                log_fn(drain_lspad(spad_sock, quiet_for=2.0, cap=TDC_CALIB_S)
+                log_fn(drain_lspad(spad_sock, quiet_for=2.0, cap=TDC_CALIB_S)[0]
                        .decode('utf8', errors='replace'))
 
             spad_sock.settimeout(None)   # stream loop drives its own select()
@@ -369,13 +386,21 @@ def run(sock: socket.socket,
                             break        # quiet: acquisition has really ended
                         continue
                     if stopping and stop_deadline is not None and time.time() > stop_deadline:
-                        lost = drain_lspad(spad_sock, quiet_for=0.5, cap=2.0)
-                        stats['discarded_b'] += len(lost)
+                        # Drain the rest to silence rather than walking away.
+                        # No lSPAD command purges its buffer and it survives a
+                        # disconnect, so anything left here would be handed to
+                        # the *next* START, which would then refuse to begin
+                        # until it had cleared it. Discarding costs seconds;
+                        # deferring it cost minutes and an aborted run.
+                        t_lost = time.time()
+                        _, lost_n = drain_lspad(spad_sock, quiet_for=0.5,
+                                                cap=PRESTART_DRAIN_S)
+                        stats['discarded_b'] += lost_n
                         log_fn(f'WARNING: lSPAD still streaming after STOP — '
-                               f'{len(lost):,} B discarded unparsed. This is real '
-                               f'photon loss: the parser was behind, so lSPAD had '
-                               f'buffered more than we could drain. Use Soft stop '
-                               f'to keep it.\n')
+                               f'{lost_n / 1e6:,.0f} MB discarded unparsed in '
+                               f'{time.time() - t_lost:.1f} s. This is real photon '
+                               f'loss: the parser was behind, so lSPAD had buffered '
+                               f'more than we could parse. Use Soft stop to keep it.\n')
                         break
                     data = spad_sock.recv(57344)
                     if not data:
