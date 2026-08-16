@@ -176,6 +176,7 @@ def run(sock: socket.socket,
     stats = {'records': 0, 'overflow': 0, 'unknown': 0,
              'lag_s': 0.0, 'lag_max_s': 0.0,
              'queue_max': 0, 'queue_blocks': 0,
+             'recv_calls': 0, 'recv_mean_b': 0,
              'first_ts': None, 'last_ts': None}
 
     # --- session preamble -------------------------------------------------
@@ -340,6 +341,11 @@ def run(sock: socket.socket,
                         first_chunk = False
 
                     total_bytes += len(data)
+                    # The parse loop has a large fixed cost per chunk (the
+                    # grouping loop makes one numpy call per active pixel
+                    # regardless of array length), so throughput depends
+                    # strongly on how much recv() hands over at a time.
+                    stats['recv_calls'] += 1
 
                     done  = data[-4:] == b'DONE'
                     error = data[-5:] == b'ERROR'
@@ -491,6 +497,8 @@ def run(sock: socket.socket,
     stats.pop('first_ts', None)
     stats.pop('last_ts', None)
     stats['elapsed_s'] = round(elapsed, 1)
+    if stats['recv_calls']:
+        stats['recv_mean_b'] = int(total_bytes / stats['recv_calls'])
     if stats['overflow'] or stats['unknown']:
         log_fn(f'WARNING: {stats["overflow"]:,} FIFO overflow event(s) — those '
                f'photons were dropped by the detector and cannot be recovered; '
@@ -504,7 +512,8 @@ def run(sock: socket.socket,
     log_fn(f'Done. Elapsed: {elapsed:.1f} s — {stats["records"]:,} records, '
            f'{stats["overflow"]:,} overflow, lag {stats["lag_s"]:.1f} s '
            f'(peak {stats["lag_max_s"]:.1f} s), queue peak '
-           f'{stats["queue_max"]}/{QUEUE_MAXSIZE}')
+           f'{stats["queue_max"]}/{QUEUE_MAXSIZE}, '
+           f'{stats["recv_calls"]:,} recv of {stats["recv_mean_b"]:,} B mean')
     return stats
 
 
