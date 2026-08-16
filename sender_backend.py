@@ -15,10 +15,12 @@ import os
 import select
 import socket
 import struct
+import sys
 import numpy as np
 import threading
 import queue
 import time
+import traceback
 
 # ---------------------------------------------------------------------------
 # Configuration (standalone defaults)
@@ -297,8 +299,15 @@ def run(sock: socket.socket,
         sender_thread.join()
         log_fn('[dbg] teardown: sender_thread joined; sending KEY_END …\n')
         # Signal end of session; receiver loops back to await the next KEY_SETUP.
-        sock.sendall(struct.pack('>II', KEY_END, 0))
-        log_fn('[dbg] teardown: KEY_END sent\n')
+        try:
+            sock.sendall(struct.pack('>II', KEY_END, 0))
+            log_fn('[dbg] teardown: KEY_END sent\n')
+        except OSError as exc:
+            # Never let this mask an exception already propagating out of the
+            # try block — that one is the real diagnosis.
+            log_fn(f'[dbg] teardown: KEY_END failed: {exc!r}\n')
+            if sys.exc_info()[0] is None:
+                raise
 
     log_fn(f'Done. Elapsed: {time.time() - start:.1f} s')
 
@@ -452,7 +461,9 @@ def _run_acquisition_cmd(params: dict, stop_event: threading.Event,
 
         send_ctrl({'status': 'done'})
     except Exception as exc:
-        send_ctrl({'status': 'error', 'msg': str(exc)})
+        send_ctrl({'status': 'error', 'msg': f'{type(exc).__name__}: {exc}'})
+        send_ctrl({'status': 'log',
+                   'msg': f'[dbg] acquisition traceback:\n{traceback.format_exc()}\n'})
     finally:
         status_fn({'event': 'idle'})
 
