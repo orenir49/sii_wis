@@ -500,7 +500,10 @@ def run(sock: socket.socket,
                         # the final record. Keep the peak too.
                         if lag > stats['lag_max_s']:
                             stats['lag_max_s'] = round(lag, 2)
-                        if lag > LAG_WARN_S:
+                        # Only meaningful while still acquiring. During a drain
+                        # the lag is the backlog by definition, nothing is being
+                        # lost, and the Draining line already reports it.
+                        if lag > LAG_WARN_S and not stopping:
                             log_fn(f'WARNING: parser is {lag:.1f} s behind the '
                                    f'detector — data is queueing and photons will '
                                    f'be lost to FIFO overflow if this grows\n')
