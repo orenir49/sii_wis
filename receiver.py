@@ -243,13 +243,22 @@ class NodePanel:
     def is_finishing(self) -> bool:
         """True while a previous run is still being torn down.
 
-        Abort now parses whatever lSPAD had buffered rather than discarding
-        it, so teardown takes a few seconds at high rate. Starting during
-        that window just gets refused by the sender as 'busy'.
+        Stopping parses whatever lSPAD had buffered rather than discarding it,
+        so teardown takes seconds at high rate — and a soft stop takes as long
+        as the backlog needs. Starting during that window just gets refused by
+        the sender as 'busy'.
         """
         return self._session_active
 
+    def send_soft_stop(self) -> None:
+        """Stop acquiring, but parse the whole buffered backlog. Loses nothing."""
+        self._send_ctrl({'cmd': 'stop', 'mode': 'soft'})
+
     def send_abort(self) -> None:
+        """Stop now, discarding whatever cannot be drained within the budget.
+
+        Also escalates an in-progress soft stop, so a soft stop is never a trap.
+        """
         self._send_ctrl({'cmd': 'abort'})
 
     def _send_ctrl(self, msg: dict) -> None:
@@ -357,7 +366,10 @@ class NodePanel:
             f'(peak {stats.get("lag_max_s", 0):.1f} s), send queue peak '
             f'{stats.get("queue_max", 0)}'
             + (f', BLOCKED {stats["queue_blocks"]:,}x'
-               if stats.get('queue_blocks') else '') + '\n')
+               if stats.get('queue_blocks') else '')
+            + f', ended by {stats.get("stop_mode", "?")}'
+            + (f', {stats["epoch_fixes"]:,} epoch fixes'
+               if stats.get('epoch_fixes') else '') + '\n')
         if not self._output_dir:
             return
         try:
@@ -589,7 +601,10 @@ class NodePanel:
             self.data_status_var.set('  Data: ● Streaming')
             self._data_lbl.config(fg='#33aa33')
         elif state == 'stopping':
-            self.data_status_var.set('  Data: ● Stopping — flushing buffered data')
+            self.data_status_var.set('  Data: ● Aborting — discarding what will not drain')
+            self._data_lbl.config(fg='#cc8800')
+        elif state == 'draining':
+            self.data_status_var.set('  Data: ● Soft stop — draining, nothing discarded')
             self._data_lbl.config(fg='#cc8800')
         elif state == 'error':
             self.data_status_var.set('  Data: ● Error')
@@ -718,9 +733,13 @@ class ReceiverGUI:
                                     command=self._start_all)
         self.start_btn.grid(row=0, column=0, padx=6)
 
+        self.soft_stop_btn = ttk.Button(btn_frame, text='SOFT STOP', width=12,
+                                        command=self._soft_stop_all)
+        self.soft_stop_btn.grid(row=0, column=1, padx=6)
+
         self.abort_btn = ttk.Button(btn_frame, text='ABORT ALL', width=12,
                                     command=self._abort_all)
-        self.abort_btn.grid(row=0, column=1, padx=6)
+        self.abort_btn.grid(row=0, column=2, padx=6)
 
         # ── log ───────────────────────────────────────────────────────
         log_frame = ttk.LabelFrame(self.root, text='Log')
@@ -798,20 +817,40 @@ class ReceiverGUI:
             self.root.after(CAL_ARM_TIMEOUT_MS,
                             lambda rid=self._run_id: self._arm_sparse_cal(rid, timed_out=True))
 
+    def _soft_stop_all(self) -> None:
+        """Stop acquiring but keep every photon lSPAD has already buffered.
+
+        The drain runs at parser speed, so at a high count rate it can take far
+        longer than the acquisition did. ABORT ALL escalates out of it.
+        """
+        self._end_run('soft')
+
     def _abort_all(self) -> None:
+        self._end_run('abort')
+
+    def _end_run(self, mode: str) -> None:
         if self._monitor_abort is not None:
             self._monitor_abort.set()
+        soft = (mode == 'soft')
         for node in (self.node1, self.node2):
             if node.is_ready():
-                node.send_abort()
+                node.send_soft_stop() if soft else node.send_abort()
                 if node.is_finishing():
-                    node._set_data_status('stopping')
+                    node._set_data_status('draining' if soft else 'stopping')
         self._run_id += 1          # invalidates pending progress/timer/sparse-cal callbacks
         self._cal_waiting.clear()
         self._show_progress_bar()
         self._set_progress(0)
-        self._set_cal_status('● Aborted — not calibrated', color='#cc8800')
-        self._enqueue_log('ABORT sent to all connected nodes.\n')
+        if soft:
+            self._set_cal_status('● Soft stop — draining', color='#cc8800')
+            self._enqueue_log(
+                'SOFT STOP sent to all connected nodes — acquisition halted, but '
+                'everything lSPAD has buffered will be parsed and kept. At a high\n'
+                '  count rate this can take much longer than the run itself; press '
+                'ABORT ALL to give up on the remainder.\n')
+        else:
+            self._set_cal_status('● Aborted — not calibrated', color='#cc8800')
+            self._enqueue_log('ABORT sent to all connected nodes.\n')
 
     # ------------------------------------------------------------------
     # Monitor mode  (environmental polling via SSH R command)

@@ -40,7 +40,8 @@ QUEUE_MAXSIZE     = 200
 
 # lSPAD command-protocol timings (seconds)
 LSPAD_HANDSHAKE_S = 10.0    # banner / T,v,1 — never block forever on a wedged lSPAD
-STOP_CONFIRM_S    = 5.0     # drain-to-silence budget proving STOP took effect
+STOP_CONFIRM_S    = 5.0     # hard-abort drain budget; a soft stop has none
+DRAIN_REPORT_S    = 5.0     # progress cadence while draining after STOP
 TDC_CALIB_S       = 180.0   # T,c,1 runs for minutes
 
 # ---------------------------------------------------------------------------
@@ -48,6 +49,7 @@ TDC_CALIB_S       = 180.0   # T,c,1 runs for minutes
 # ---------------------------------------------------------------------------
 PS_PER_COUNT     = int((1 / 10e6) * 1e12)
 COUNTS_PER_RESET = 2**16
+TOP_COARSE       = COUNTS_PER_RESET - 1   # last tick of an epoch; see the reset fix in run()
 
 # ---------------------------------------------------------------------------
 # Pixel mapping
@@ -156,7 +158,8 @@ def run(sock: socket.socket,
         duration: float,
         test_mode: bool,
         stop_event: threading.Event,
-        log_fn=print) -> dict:
+        log_fn=print,
+        soft_event: threading.Event | None = None) -> dict:
     """
     Run one acquisition session over an already-connected socket.
     Sends KEY_SETUP, streams data chunks, then sends KEY_END.
@@ -166,6 +169,12 @@ def run(sock: socket.socket,
     the detector dropped — unrecoverable, so they are totalled rather than just
     warned about), records with an unrecognised pixel number, parser lag (final
     and peak), and the send-queue high-water mark.
+
+    stop_event ends the acquisition. If soft_event is also set, the stop is
+    "soft": lSPAD is told to STOP so no new photons are acquired, but everything
+    it has already buffered is parsed to completion and nothing is discarded —
+    however long that takes. Clearing soft_event mid-drain escalates to a hard
+    abort, which discards the remainder after STOP_CONFIRM_S.
 
     lag_max_s and queue_max exist to tell two very different causes of overflow
     apart. Overflow with both low means the detector's own readout is the
@@ -177,7 +186,11 @@ def run(sock: socket.socket,
              'lag_s': 0.0, 'lag_max_s': 0.0,
              'queue_max': 0, 'queue_blocks': 0,
              'recv_calls': 0, 'recv_mean_b': 0, 'discarded_b': 0,
+             'epoch_fixes': 0, 'stop_mode': 'duration',
              'first_ts': None, 'last_ts': None}
+
+    def is_soft() -> bool:
+        return soft_event is not None and soft_event.is_set()
 
     # --- session preamble -------------------------------------------------
     outdir_bytes = output_dir.encode('utf-8')
@@ -305,7 +318,10 @@ def run(sock: socket.socket,
             last_lag_check = t_stream
 
             stopping      = False
-            stop_deadline = 0.0
+            stop_deadline = None      # None while a soft stop is draining
+            drain_start   = 0.0
+            drain_at_stop = 0
+            last_report   = 0.0
 
             try:
                 while True:
@@ -315,26 +331,51 @@ def run(sock: socket.socket,
                     # parser had not yet caught up on. Exit when lSPAD goes
                     # quiet, which is also the proof that STOP took effect.
                     if stop_event.is_set() and not stopping:
-                        log_fn('Aborted — sending STOP to lSPAD.\n')
+                        soft = is_soft()
+                        stats['stop_mode'] = 'soft' if soft else 'abort'
+                        log_fn(('Soft stop — sending STOP to lSPAD, then draining '
+                                'everything it has buffered. At a high count rate '
+                                'this can take much longer than the acquisition; '
+                                'press Abort to give up on the remainder.\n')
+                               if soft else 'Aborted — sending STOP to lSPAD.\n')
                         try:
                             spad_sock.sendall(b'STOP\n')
                         except OSError as exc:
                             log_fn(f'STOP failed: {exc!r}\n')
                         stopping      = True
-                        stop_deadline = time.time() + STOP_CONFIRM_S
+                        # None = drain to completion, discard nothing.
+                        stop_deadline = None if soft else time.time() + STOP_CONFIRM_S
+                        drain_start   = time.time()
+                        drain_at_stop = total_bytes
+                        last_report   = drain_start
+
+                    # A soft stop is never a trap: a later Abort clears the soft
+                    # flag, and the deadline applies from that moment.
+                    if stopping and stop_deadline is None and not is_soft():
+                        log_fn('Soft stop escalated to abort — giving up on the '
+                               'remaining backlog.\n')
+                        stats['stop_mode'] = 'soft→abort'
+                        stop_deadline = time.time()
+
+                    if stopping and time.time() - last_report >= DRAIN_REPORT_S:
+                        last_report = time.time()
+                        log_fn(f'Draining: {(total_bytes - drain_at_stop) / 1e6:,.0f} MB '
+                               f'parsed since STOP, {last_report - drain_start:.0f} s '
+                               f'elapsed, parser {stats["lag_s"]:.1f} s behind\n')
 
                     r, _, _ = select.select([spad_sock], [], [], 0.5)
                     if not r:
                         if stopping:
                             break        # quiet: acquisition has really ended
                         continue
-                    if stopping and time.time() > stop_deadline:
+                    if stopping and stop_deadline is not None and time.time() > stop_deadline:
                         lost = drain_lspad(spad_sock, quiet_for=0.5, cap=2.0)
                         stats['discarded_b'] += len(lost)
-                        log_fn(f'WARNING: lSPAD still streaming {STOP_CONFIRM_S:.0f} s '
-                               f'after STOP — {len(lost):,} B discarded unparsed. '
-                               f'This is real photon loss: the parser was behind, so '
-                               f'lSPAD had buffered more than we could drain.\n')
+                        log_fn(f'WARNING: lSPAD still streaming after STOP — '
+                               f'{len(lost):,} B discarded unparsed. This is real '
+                               f'photon loss: the parser was behind, so lSPAD had '
+                               f'buffered more than we could drain. Use Soft stop '
+                               f'to keep it.\n')
                         break
                     data = spad_sock.recv(57344)
                     if not data:
@@ -405,6 +446,42 @@ def run(sock: socket.socket,
                     reset_s += int(cs_s[-1])
 
                     reset_arr = np.where(is_mast, cum_reset_m, cum_reset_s)
+
+                    # lSPAD emits the reset marker (id 234) just *before* the
+                    # final coarse=0xFFFF tick of the epoch it closes, so that
+                    # photon gets the incremented epoch and lands one full reset
+                    # period (6.5536 ms) in the future — which also breaks the
+                    # sortedness np.searchsorted relies on downstream.
+                    #
+                    # A correctly assigned top-of-range record is by definition
+                    # the LAST record of its epoch, so if the next record on the
+                    # same chip still carries the same epoch, this one was
+                    # over-counted. Runs of two share the same successor logic
+                    # and need no iteration.
+                    #
+                    # The reset marker itself must be excluded from that
+                    # comparison: it sits exactly on the boundary and carries the
+                    # pre-increment epoch, so a correctly ordered 0xFFFF record
+                    # followed by its marker would otherwise look stale.
+                    #
+                    # Residual: the final record of each chip in a chunk has no
+                    # successor here, so it is left alone. That matters only if
+                    # it sits exactly at 0xFFFF — 1/65536 per chip per chunk,
+                    # under 0.1 occurrences per 30 s run. Carrying records across
+                    # chunks to close that costs more than the defect.
+                    not_reset = pixel_nr != RESET_ID
+                    for chip in (is_mast, ~is_mast):
+                        idx = np.nonzero(chip & not_reset)[0]
+                        if idx.size < 2:
+                            continue
+                        prev, nxt = idx[:-1], idx[1:]
+                        stale = ((coarse[prev] == TOP_COARSE)
+                                 & (reset_arr[nxt] == reset_arr[prev]))
+                        n_stale = int(stale.sum())
+                        if n_stale:
+                            reset_arr[prev[stale]] -= 1
+                            stats['epoch_fixes'] += n_stale
+
                     time_ps   = (reset_arr * COUNTS_PER_RESET + coarse) * PS_PER_COUNT + fine
 
                     # Lag = wall-clock elapsed minus reconstructed detector time.
@@ -591,6 +668,7 @@ def _send_ctrl_msg(conn: socket.socket, lock: threading.Lock,
 def _handle_controller(conn: socket.socket, status_fn) -> None:
     lock        = threading.Lock()
     stop_event: threading.Event | None = None
+    soft_event: threading.Event | None = None
     acq_thread: threading.Thread | None = None
     acq_started = 0.0
 
@@ -625,14 +703,24 @@ def _handle_controller(conn: socket.socket, status_fn) -> None:
                                      f'(stop_event set={stop_event.is_set()})\n'})
                         continue
                     stop_event  = threading.Event()
+                    soft_event  = threading.Event()
                     acq_started = time.time()
                     acq_thread = threading.Thread(
                         target=_run_acquisition_cmd,
-                        args=(msg, stop_event, send, status_fn),
+                        args=(msg, stop_event, send, status_fn, soft_event),
                         daemon=True,
                     )
                     acq_thread.start()
+                elif cmd == 'stop' and msg.get('mode') == 'soft':
+                    # Drain everything lSPAD has buffered; discard nothing.
+                    if stop_event is not None:
+                        soft_event.set()
+                        stop_event.set()
                 elif cmd == 'abort':
+                    # Also the escalation path: clearing soft_event mid-drain
+                    # tells run() to stop waiting and drop the remainder.
+                    if soft_event is not None:
+                        soft_event.clear()
                     if stop_event is not None:
                         stop_event.set()
     except OSError:
@@ -644,7 +732,8 @@ def _handle_controller(conn: socket.socket, status_fn) -> None:
 
 
 def _run_acquisition_cmd(params: dict, stop_event: threading.Event,
-                          send_ctrl, status_fn) -> None:
+                          send_ctrl, status_fn,
+                          soft_event: threading.Event | None = None) -> None:
     try:
         recv_host  = params['recv_host']
         recv_port  = int(params['recv_port'])
@@ -660,7 +749,8 @@ def _run_acquisition_cmd(params: dict, stop_event: threading.Event,
         stats = None
         try:
             stats = run(sock, output_dir, duration, test_mode, stop_event,
-                        log_fn=lambda msg: send_ctrl({'status': 'log', 'msg': msg}))
+                        log_fn=lambda msg: send_ctrl({'status': 'log', 'msg': msg}),
+                        soft_event=soft_event)
         finally:
             sock.close()
 
