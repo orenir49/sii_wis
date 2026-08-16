@@ -22,7 +22,7 @@ import threading
 import time
 import traceback
 import tkinter as tk
-from tkinter import ttk, scrolledtext, simpledialog, messagebox
+from tkinter import ttk, scrolledtext, messagebox
 
 import numpy as np
 
@@ -73,7 +73,7 @@ class NodePanel:
         self._master_dwell_q: queue.Queue = queue.Queue()  # master_dwell (key 320)
         self._output_dir: str | None = None
         self._drain_active = False   # periodic discard of the post-calibration dwell tap
-        self._ssh_creds: tuple | None = None       # (host, user, password) set after Launch
+        self._ssh_creds: tuple | None = None       # (host, user) set after Launch
         self._shutdown_thread: threading.Thread | None = None
         self._dwell_freq: float | None = None      # dwell clock Hz from last Launch R command
         self._event_accum: list = [0]              # [int] — incremented by data thread, read by GUI
@@ -406,7 +406,7 @@ class NodePanel:
             self.mask_var.set(f'mask_{pixel_str}.txt')
 
     def _on_launch(self) -> None:
-        """Ask for SSH password (main thread) then start the launch thread."""
+        """Validate the mask/pixel fields, then start the launch thread."""
         if self._state != 'idle':
             self.log_fn(f'Node {self.node_id}: already connected or launching.\n')
             return
@@ -426,24 +426,17 @@ class NodePanel:
                 return
             if self._set_correlate_pixel_fn:
                 self._set_correlate_pixel_fn(mask_pixel)
-        password = simpledialog.askstring(
-            'SSH Password',
-            f'Password for {username}@{host}:',
-            show='*',
-            parent=self.root)
-        if password is None:
-            return
         threading.Thread(
             target=self._ssh_launch,
-            args=(host, username, password, mask, mask_pixel),
+            args=(host, username, mask, mask_pixel),
             daemon=True).start()
 
     def _ssh_launch(self, host: str, username: str,
-                    password: str, mask: str, mask_pixel: int | None) -> None:
+                    mask: str, mask_pixel: int | None) -> None:
         """Background thread: run full node launch sequence then auto-connect."""
         self._gui(lambda: self._set_ctrl_status('launching'))
         self.log_fn(f'Node {self.node_id}: launching remote node …\n')
-        self._ssh_creds = (host, username, password)   # store early so shutdown works on any error
+        self._ssh_creds = (host, username)   # store early so shutdown works on any error
 
         def _log(msg: str) -> None:
             self.log_fn(f'[N{self.node_id}] {msg}' if msg.endswith('\n')
@@ -451,7 +444,7 @@ class NodePanel:
 
         try:
             self._dwell_freq = ssh_launcher.launch_node(
-                host=host, username=username, password=password,
+                host=host, username=username,
                 mask_pixel=mask_pixel,
                 mask_filename=mask, log_fn=_log)
             time.sleep(3)           # give sender.py command server time to start
@@ -477,11 +470,11 @@ class NodePanel:
                 target=self._shutdown_remote, args=creds, daemon=False)
             self._shutdown_thread.start()
 
-    def _shutdown_remote(self, host: str, username: str, password: str) -> None:
+    def _shutdown_remote(self, host: str, username: str) -> None:
         """Background thread: SSH in and kill lSPAD on the sender machine."""
         self.log_fn(f'Node {self.node_id}: shutting down lSPAD on {host} …\n')
         try:
-            ssh_launcher.shutdown_lspad(host, username, password)
+            ssh_launcher.shutdown_lspad(host, username)
             self.log_fn(f'Node {self.node_id}: lSPAD shut down.\n')
         except Exception as exc:
             self.log_fn(f'Node {self.node_id}: lSPAD shutdown failed — {exc}\n')
@@ -749,7 +742,8 @@ class ReceiverGUI:
             self._enqueue_log('Monitor already running — click ABORT to stop it first.\n')
             return
 
-        # Collect SSH credentials for each node; ask for password if not cached.
+        # SSH targets per node. Key auth means these need no prompt — the host
+        # and user in the panel are all that is required.
         node_creds: list[tuple[int, tuple]] = []
         for node in (self.node1, self.node2):
             creds = node._ssh_creds
@@ -758,15 +752,7 @@ class ReceiverGUI:
                 user = node.ssh_user_var.get().strip()
                 if not host:
                     continue
-                pw = simpledialog.askstring(
-                    'SSH Password',
-                    f'Password for {user}@{host} (Node {node.node_id}):',
-                    show='*', parent=self.root)
-                if pw:
-                    creds = (host, user, pw)
-                else:
-                    self._enqueue_log(f'Node {node.node_id}: skipped (no password).\n')
-                    continue
+                creds = (host, user)
             node_creds.append((node.node_id, creds))
 
         if not node_creds:
@@ -790,7 +776,7 @@ class ReceiverGUI:
         self._schedule_progress(step_ms, 1, self._run_id)
 
     def _run_monitor_node(self, node_id: int, creds: tuple, duration: float) -> None:
-        host, username, password = creds
+        host, username = creds
         rows: list[dict] = []
 
         def log(msg: str) -> None:
@@ -798,7 +784,7 @@ class ReceiverGUI:
                 f'[N{node_id}] {msg}' if msg.endswith('\n') else f'[N{node_id}] {msg}\n')
 
         try:
-            ssh_launcher.ensure_lspad_running(host, username, password, log)
+            ssh_launcher.ensure_lspad_running(host, username, log)
         except Exception as exc:
             log(f'Cannot start lSPAD: {exc}')
             return
@@ -812,7 +798,7 @@ class ReceiverGUI:
                 break
 
             ts = time.strftime('%Y-%m-%dT%H:%M:%S')
-            reading = ssh_launcher.query_r(host, username, password)
+            reading = ssh_launcher.query_r(host, username)
             if reading is not None:
                 reading['timestamp'] = ts
                 reading['elapsed_s'] = round(elapsed, 1)

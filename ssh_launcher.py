@@ -2,7 +2,7 @@
 Remote node launcher via SSH (paramiko).
 
 Sequence per node:
-  1. SSH in (password auth)
+  1. SSH in (public-key auth, see ssh_key_path())
   2. Find lSPAD.exe under C:\\Program Files (x86)\\SPADlambda
   3. Start lSPAD.exe GUI on remote desktop (detached)
   4. Wait for lSPAD TCP port (default 9999) to open
@@ -13,6 +13,7 @@ Sequence per node:
 """
 
 import base64
+import os
 import socket
 import time
 
@@ -23,6 +24,7 @@ class UncommittedChangesError(RuntimeError):
     """Raised when the remote repo has uncommitted changes; payload is git status output."""
 
 
+DEFAULT_SSH_KEY   = r'~\.ssh\sii_wis_nodes'   # override with SII_WIS_SSH_KEY
 LSPAD_SEARCH_ROOT = r'C:\Program Files (x86)\SPADlambda'
 LSPAD_EXE         = 'lSPAD.exe'
 SPAD_PORT         = 9999
@@ -32,10 +34,30 @@ SPAD_PORT         = 9999
 # SSH helpers
 # ---------------------------------------------------------------------------
 
-def ssh_connect(host: str, username: str, password: str) -> paramiko.SSHClient:
+def ssh_key_path() -> str:
+    """Path to the private key used for every node connection."""
+    return os.environ.get('SII_WIS_SSH_KEY') or os.path.expanduser(DEFAULT_SSH_KEY)
+
+
+def ssh_connect(host: str, username: str) -> paramiko.SSHClient:
+    """Connect with public-key auth. Raises a descriptive error if the key is
+    missing or rejected — see tools/install_ssh_key.py to enrol a node."""
+    key = ssh_key_path()
+    if not os.path.exists(key):
+        raise RuntimeError(
+            f'SSH key not found: {key}\n'
+            f'Run tools/install_ssh_key.py to generate and enrol one, or set '
+            f'SII_WIS_SSH_KEY to an existing key.')
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(host, username=username, password=password, timeout=10)
+    try:
+        client.connect(host, username=username, key_filename=key,
+                       look_for_keys=False, allow_agent=False, timeout=10)
+    except paramiko.AuthenticationException as exc:
+        raise RuntimeError(
+            f'SSH key auth rejected for {username}@{host} using {key}.\n'
+            f'Run tools/install_ssh_key.py {host} {username} to enrol this node.'
+        ) from exc
     return client
 
 
@@ -203,10 +225,10 @@ def git_update(client: paramiko.SSHClient, repo_dir: str, log_fn) -> None:
 # Full node launch sequence
 # ---------------------------------------------------------------------------
 
-def ensure_lspad_running(host: str, username: str, password: str, log_fn,
+def ensure_lspad_running(host: str, username: str, log_fn,
                          lspad_port: int = SPAD_PORT) -> None:
     """Start lSPAD.exe on the remote host if it is not already running."""
-    client = ssh_connect(host, username, password)
+    client = ssh_connect(host, username)
     try:
         out, _ = run_ps(client,
             "Get-Process -Name 'lSPAD*' -ErrorAction SilentlyContinue "
@@ -234,11 +256,11 @@ def ensure_lspad_running(host: str, username: str, password: str, log_fn,
         client.close()
 
 
-def query_r(host: str, username: str, password: str,
+def query_r(host: str, username: str,
             lspad_port: int = SPAD_PORT) -> dict | None:
     """SSH in, send R command, parse and return sensor readings. Returns None on error."""
     try:
-        client = ssh_connect(host, username, password)
+        client = ssh_connect(host, username)
         try:
             resp = send_lspad_cmd(client, lspad_port, 'R', until='\n')
             fields = resp.split(',')
@@ -262,26 +284,10 @@ def query_r(host: str, username: str, password: str,
     return None
 
 
-def get_dwell_freq(host: str, username: str, password: str,
-                   lspad_port: int = SPAD_PORT) -> float:
-    """SSH in, send R command, return dwell clock frequency (Hz). Best-effort: returns 0.0 on any error."""
-    try:
-        client = ssh_connect(host, username, password)
-        try:
-            r_resp = send_lspad_cmd(client, lspad_port, 'R', until='\n')
-            fields = r_resp.split(',')
-            if len(fields) >= 10:
-                return float(fields[9])
-        finally:
-            client.close()
-    except Exception:
-        pass
-    return 0.0
 
-
-def shutdown_lspad(host: str, username: str, password: str) -> None:
+def shutdown_lspad(host: str, username: str) -> None:
     """SSH into host and kill any running lSPAD process. Best-effort."""
-    client = ssh_connect(host, username, password)
+    client = ssh_connect(host, username)
     try:
         run_ps(client,
                "Get-Process -Name 'lSPAD*' -ErrorAction SilentlyContinue | "
@@ -309,7 +315,7 @@ def kill_sender(client: paramiko.SSHClient) -> str:
     return out.strip()
 
 
-def launch_node(host: str, username: str, password: str,
+def launch_node(host: str, username: str,
                 mask_filename: str, log_fn,
                 lspad_port: int = SPAD_PORT,
                 mask_pixel: int | None = None) -> float:
@@ -321,7 +327,7 @@ def launch_node(host: str, username: str, password: str,
     Returns the dwell clock frequency (Hz) from the R command.
     Raises RuntimeError on fatal errors.
     """
-    client = ssh_connect(host, username, password)
+    client = ssh_connect(host, username)
     log_fn(f'SSH connected to {host}\n')
 
     try:
