@@ -363,6 +363,21 @@ def run(sock: socket.socket,
                         stats['overflow'] += n_overflow
                     stats['records'] += len(raw)
 
+                    cs_m = np.cumsum((is_mast  & (pixel_nr == 234)).astype(np.int64))
+                    cs_s = np.cumsum((~is_mast & (pixel_nr == 234)).astype(np.int64))
+
+                    cum_reset_m    = np.empty(len(raw), dtype=np.int64)
+                    cum_reset_s    = np.empty(len(raw), dtype=np.int64)
+                    cum_reset_m[0] = reset_m
+                    cum_reset_s[0] = reset_s
+                    cum_reset_m[1:] = reset_m + cs_m[:-1]
+                    cum_reset_s[1:] = reset_s + cs_s[:-1]
+                    reset_m += int(cs_m[-1])
+                    reset_s += int(cs_s[-1])
+
+                    reset_arr = np.where(is_mast, cum_reset_m, cum_reset_s)
+                    time_ps   = (reset_arr * COUNTS_PER_RESET + coarse) * PS_PER_COUNT + fine
+
                     # Lag = wall-clock elapsed minus reconstructed detector time.
                     # It grows when the parser cannot keep up, which is what
                     # pushes loss into the detector's FIFO.
@@ -378,21 +393,6 @@ def run(sock: socket.socket,
                             log_fn(f'WARNING: parser is {lag:.1f} s behind the '
                                    f'detector — data is queueing and photons will '
                                    f'be lost to FIFO overflow if this grows\n')
-
-                    cs_m = np.cumsum((is_mast  & (pixel_nr == 234)).astype(np.int64))
-                    cs_s = np.cumsum((~is_mast & (pixel_nr == 234)).astype(np.int64))
-
-                    cum_reset_m    = np.empty(len(raw), dtype=np.int64)
-                    cum_reset_s    = np.empty(len(raw), dtype=np.int64)
-                    cum_reset_m[0] = reset_m
-                    cum_reset_s[0] = reset_s
-                    cum_reset_m[1:] = reset_m + cs_m[:-1]
-                    cum_reset_s[1:] = reset_s + cs_s[:-1]
-                    reset_m += int(cs_m[-1])
-                    reset_s += int(cs_s[-1])
-
-                    reset_arr = np.where(is_mast, cum_reset_m, cum_reset_s)
-                    time_ps   = (reset_arr * COUNTS_PER_RESET + coarse) * PS_PER_COUNT + fine
 
                     # Anything that is neither a physical pixel nor a known
                     # marker is discarded by the loop below; count it rather

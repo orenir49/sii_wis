@@ -109,6 +109,33 @@ def start_detached(client: paramiko.SSHClient,
         raise RuntimeError(f'start_detached: {err}')
 
 
+def start_interactive(client: paramiko.SSHClient, exe: str, args: str,
+                      username: str, task_name: str = 'sii_wis_gui') -> None:
+    """
+    Start a GUI process in the logged-on user's desktop session.
+
+    Win32_Process.Create (start_detached) always lands in session 0, which has
+    no desktop. lSPAD started that way reports Responding=True but never
+    initialises its GUI and never opens its TCP port — and because a
+    console-session instance is usually already running, wait_for_port sees
+    *that* one and the failure goes unnoticed until the console instance stops.
+
+    A scheduled task created with /IT runs in the interactive session, so this
+    requires `username` to be logged on at the console.
+    """
+    script = (
+        f'schtasks /delete /tn {task_name} /f 2>$null | Out-Null; '
+        f'$c = schtasks /create /tn {task_name} /tr "\'{exe}\' {args}" '
+        f'/sc once /st 00:00 /it /ru {username} /f 2>&1; '
+        f'if ($LASTEXITCODE -ne 0) {{ throw "schtasks create failed: $c" }}; '
+        f'$r = schtasks /run /tn {task_name} 2>&1; '
+        f'if ($LASTEXITCODE -ne 0) {{ throw "schtasks run failed: $r" }}'
+    )
+    _, err = run_ps(client, script)
+    if err:
+        raise RuntimeError(f'start_interactive: {err}')
+
+
 def wait_for_port(client: paramiko.SSHClient,
                   port: int = SPAD_PORT, timeout: int = 20) -> bool:
     """Poll sender's localhost:port via SSH until it accepts a TCP connection."""
@@ -340,13 +367,16 @@ def launch_node(host: str, username: str,
 
         # 2. Start lSPAD.exe with GUI on remote desktop
         lspad_exe = lspad_dir + '\\' + LSPAD_EXE
-        start_detached(client, lspad_exe, 'GUI', lspad_dir)
+        # Must run in the interactive session — see start_interactive().
+        start_interactive(client, lspad_exe, 'GUI', username)
         log_fn('lSPAD.exe started — waiting for TCP port …\n')
 
         # 3. Wait for lSPAD to accept connections, then let it finish initialising
         if not wait_for_port(client, lspad_port, timeout=40):
             raise RuntimeError(
-                f'lSPAD did not open port {lspad_port} within 40 s')
+                f'lSPAD did not open port {lspad_port} within 40 s — is '
+                f'{username} logged on at the console? A GUI app cannot start '
+                f'without a desktop session.')
         log_fn('lSPAD TCP port ready.\n')
         time.sleep(2)   # let lSPAD finish GUI/hardware init before sending commands
 
