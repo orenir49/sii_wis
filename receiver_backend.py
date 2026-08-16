@@ -51,6 +51,19 @@ def recvall(sock: socket.socket, n: int) -> bytes:
         received += chunk
     return bytes(buf)
 
+
+def readall(stream, n: int) -> bytes:
+    """Read exactly n bytes from a buffered stream, or raise ConnectionError.
+
+    The sender coalesces a whole flush into one write, so a single flush can
+    carry hundreds of small frames. Reading them straight off the socket costs
+    two syscalls per frame; a BufferedReader serves them from one large read.
+    """
+    data = stream.read(n)
+    if data is None or len(data) < n:
+        raise ConnectionError('Connection closed mid-message')
+    return data
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -97,15 +110,16 @@ def run_session_loop(conn: socket.socket, log_fn=print,
                   still has to reach the receiver and negotiate with lSPAD.
     """
     session = 0
+    stream  = conn.makefile('rb', buffering=1 << 20)
     try:
         while True:
-            header          = recvall(conn, 8)
+            header          = readall(stream, 8)
             key_id, n_bytes = struct.unpack('>II', header)
 
             if key_id != KEY_SETUP:
                 raise RuntimeError(f'Expected KEY_SETUP, got 0x{key_id:08X}')
 
-            output_dir = recvall(conn, n_bytes).decode('utf-8')
+            output_dir = readall(stream, n_bytes).decode('utf-8')
             session   += 1
             log_fn(f'[session {session}] Output: {output_dir}')
 
@@ -120,11 +134,11 @@ def run_session_loop(conn: socket.socket, log_fn=print,
             unknown = 0
             try:
                 while True:
-                    header          = recvall(conn, 8)
+                    header          = readall(stream, 8)
                     key_id, n_bytes = struct.unpack('>II', header)
                     if key_id == KEY_END:
                         break
-                    payload = recvall(conn, n_bytes)
+                    payload = readall(stream, n_bytes)
                     if chunks == 0 and on_first_chunk is not None:
                         on_first_chunk()
 
@@ -156,6 +170,11 @@ def run_session_loop(conn: socket.socket, log_fn=print,
 
     except ConnectionError:
         log_fn('Sender disconnected.')
+    finally:
+        try:
+            stream.close()
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------------------

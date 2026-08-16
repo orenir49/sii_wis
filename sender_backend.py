@@ -31,8 +31,12 @@ DURATION_S  = 1
 TARGET_HOST = '10.7.136.94'
 TARGET_PORT = 50007
 
-FLUSH_EVERY   = 1_000
-QUEUE_MAXSIZE = 200
+# Pixel buffers flush on whichever bound arrives first: enough events to make a
+# frame worth sending, or enough time that a slow source still reaches the live
+# correlator. The old 1_000-event bound flushed on essentially every chunk.
+FLUSH_EVERY       = 50_000
+FLUSH_INTERVAL_S  = 0.2
+QUEUE_MAXSIZE     = 200
 
 # lSPAD command-protocol timings (seconds)
 LSPAD_HANDSHAKE_S = 10.0    # banner / T,v,1 — never block forever on a wedged lSPAD
@@ -164,35 +168,52 @@ def run(sock: socket.socket,
     for _chip in ('master', 'slave'):
         for _name in SPECIAL.values():
             bufs[(_chip, _name)] = []
+    MARKER_BUF_KEYS = [k for k in bufs if not isinstance(k, int)]
 
-    def flush() -> None:
-        for key, buf in bufs.items():
+    def flush(keys=None) -> None:
+        """Coalesce the named buffers (all of them by default) into ONE blob.
+
+        The wire format is unchanged — frames are simply concatenated before the
+        write, which the receiver cannot tell apart from separate writes. One
+        queue item and one sendall per flush instead of one per pixel: at 320
+        active pixels that collapses 326 syscalls into 1. The old behaviour
+        issued ~265k sendall/s at full rate and overfilled the 200-slot queue on
+        a single flush, blocking the parser mid-flush — which stopped it reading
+        the socket and pushed the loss into lSPAD's FIFO.
+        """
+        parts = []
+        for key in (bufs if keys is None else keys):
+            buf = bufs[key]
             if buf:
-                arr    = np.concatenate(buf)
-                key_id = key if isinstance(key, int) else SPECIAL_KEY[key]
-                sq.put((key_id, arr.tobytes()))
+                arr     = np.concatenate(buf)
+                key_id  = key if isinstance(key, int) else SPECIAL_KEY[key]
+                payload = arr.tobytes()
+                parts.append(struct.pack('>II', key_id, len(payload)))
+                parts.append(payload)
                 bufs[key] = []
+        if parts:
+            sq.put(b''.join(parts))
 
     def sender_fn() -> None:
         while True:
-            item = sq.get()
-            if item is None:
-                sq.task_done()
-                break
-            key_id, payload = item
+            blob = sq.get()
             try:
-                sock.sendall(struct.pack('>II', key_id, len(payload)) + payload)
+                if blob is None:
+                    break
+                sock.sendall(blob)
             except Exception as exc:
-                # Leaves task_done() uncalled -> sq.join() below will hang; that is
-                # the pre-existing behaviour, we only make it visible.
-                log_fn(f'[dbg] sender_fn died on sendall: {exc!r}\n')
-                raise
-            sq.task_done()
+                log_fn(f'sender thread died on sendall: {exc!r}\n')
+                return
+            finally:
+                # Always mark done, even on failure — an uncalled task_done()
+                # made the sq.join() in teardown hang forever.
+                sq.task_done()
 
     sender_thread = threading.Thread(target=sender_fn, daemon=True)
     sender_thread.start()
 
     events_since_flush = 0
+    last_flush         = time.time()
     start = time.time()
 
     try:
@@ -211,7 +232,6 @@ def run(sock: socket.socket,
             # lSPAD's own TCP command protocol — see LSPAD_CLI.md for the full command set.
             spad_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             spad_sock.settimeout(LSPAD_HANDSHAKE_S)
-            log_fn(f'[dbg] connecting to lSPAD {SPAD_HOST}:{SPAD_PORT} …\n')
             spad_sock.connect((SPAD_HOST, SPAD_PORT))
             # Clear any acquisition still running from a previous session before
             # touching the command protocol. lSPAD streams to every connected
@@ -222,14 +242,12 @@ def run(sock: socket.socket,
             # sparse-cal window.
             spad_sock.sendall(b'STOP\n')
             preamble = drain_lspad(spad_sock, quiet_for=0.4, cap=STOP_CONFIRM_S)
-            log_fn(f'[dbg] preamble ({len(preamble)} B): {preamble[:120]!r}\n')
             if len(preamble) > 256:
-                log_fn(f'[dbg] pre-START STOP: discarded {len(preamble)} B of '
+                log_fn(f'pre-START STOP: discarded {len(preamble)} B of '
                        f'leftover stream before lSPAD went quiet\n')
 
             spad_sock.sendall(b'T,v,1\n')
             tdc_reply = drain_lspad(spad_sock, quiet_for=0.2, cap=LSPAD_HANDSHAKE_S)
-            log_fn(f'[dbg] T,v,1 reply ({len(tdc_reply)} B): {tdc_reply[:120]!r}\n')
             if not is_text_reply(tdc_reply):
                 raise RuntimeError(
                     f'lSPAD is still streaming: T,v,1 returned {len(tdc_reply)} bytes '
@@ -243,7 +261,6 @@ def run(sock: socket.socket,
 
             spad_sock.settimeout(None)   # stream loop drives its own select()
             spad_sock.sendall(f'SB,{int(duration * 1000)}\n'.encode('utf8'))
-            log_fn(f'[dbg] SB,{int(duration * 1000)} sent\n')
 
             reset_m     = 0
             reset_s     = 0
@@ -252,25 +269,48 @@ def run(sock: socket.socket,
             total_bytes = 0
             t_stream    = time.time()
 
+            stopping      = False
+            stop_deadline = 0.0
+
             try:
-                while not stop_event.is_set():
+                while True:
+                    # On abort, send STOP but keep parsing: whatever lSPAD has
+                    # already buffered is real photon data, and discarding it
+                    # (as a drain-to-silence does) throws away everything the
+                    # parser had not yet caught up on. Exit when lSPAD goes
+                    # quiet, which is also the proof that STOP took effect.
+                    if stop_event.is_set() and not stopping:
+                        log_fn('Aborted — sending STOP to lSPAD.\n')
+                        try:
+                            spad_sock.sendall(b'STOP\n')
+                        except OSError as exc:
+                            log_fn(f'STOP failed: {exc!r}\n')
+                        stopping      = True
+                        stop_deadline = time.time() + STOP_DRAIN_S
+
                     r, _, _ = select.select([spad_sock], [], [], 0.5)
                     if not r:
+                        if stopping:
+                            break        # quiet: acquisition has really ended
                         continue
+                    if stopping and time.time() > stop_deadline:
+                        lost = drain_lspad(spad_sock, quiet_for=0.5, cap=2.0)
+                        log_fn(f'WARNING: lSPAD still streaming {STOP_DRAIN_S:.0f} s '
+                               f'after STOP — {len(lost)} B discarded unparsed\n')
+                        break
                     data = spad_sock.recv(57344)
                     if not data:
-                        log_fn('[dbg] lSPAD closed the stream socket (EOF)\n')
+                        log_fn('lSPAD closed the stream socket (EOF)\n')
                         break
                     if first_chunk:
                         first_chunk = False
-                        log_fn(f'[dbg] first lSPAD data chunk: {len(data)} B\n')
 
                     total_bytes += len(data)
 
                     done  = data[-4:] == b'DONE'
                     error = data[-5:] == b'ERROR'
                     if error:
-                        log_fn(f'[dbg] ERROR trailer after {total_bytes} B / '
+                        log_fn(f'lSPAD ERROR trailer after {total_bytes} B / '
                                f'{time.time() - t_stream:.1f} s\n')
                         log_fn(data[-160:].decode('utf8', errors='replace'))
                         break
@@ -279,7 +319,7 @@ def run(sock: socket.socket,
                         # record-aligned; a chance 'DONE' inside binary counter
                         # data does not. aligned=False means false positive.
                         payload_len = len(carry) + len(data) - 4
-                        log_fn(f'[dbg] DONE trailer after {total_bytes} B / '
+                        log_fn(f'lSPAD DONE trailer after {total_bytes} B / '
                                f'{time.time() - t_stream:.1f} s, chunk={len(data)} B, '
                                f'carry={len(carry)} B, aligned='
                                f'{payload_len % 7 == 0}, tail={data[-24:]!r}\n')
@@ -341,51 +381,42 @@ def run(sock: socket.socket,
                                 if name == 'dwell':
                                     dwell_seen = True
 
-                    if dwell_seen or events_since_flush >= FLUSH_EVERY:
+                    # Markers go out immediately — calibration needs them promptly
+                    # and there are only a handful per second. Pixel buffers are
+                    # flushed on a size OR time bound, so a high rate produces few
+                    # large frames instead of hundreds of tiny ones, while a low
+                    # rate still reaches the correlator within FLUSH_INTERVAL_S.
+                    if dwell_seen:
+                        flush(MARKER_BUF_KEYS)
+                    now = time.time()
+                    if (events_since_flush >= FLUSH_EVERY
+                            or now - last_flush >= FLUSH_INTERVAL_S):
                         flush()
                         events_since_flush = 0
+                        last_flush = now
 
                     if done:
                         break
 
-                if stop_event.is_set():
-                    log_fn('Aborted — sending STOP to lSPAD.\n')
-                    try:
-                        spad_sock.sendall(b'STOP\n')
-                        # Do not close until lSPAD has actually gone quiet:
-                        # closing on a still-running acquisition leaves it
-                        # streaming, and the next session inherits it.
-                        tail = drain_lspad(spad_sock, quiet_for=0.5,
-                                           cap=STOP_CONFIRM_S)
-                        log_fn(f'[dbg] STOP sent; lSPAD quiet after draining '
-                               f'{len(tail)} B\n')
-                    except OSError as exc:
-                        log_fn(f'[dbg] STOP failed: {exc!r}\n')
-                else:
-                    log_fn(f'[dbg] stream loop ended WITHOUT abort after '
+                if not stop_event.is_set():
+                    log_fn(f'WARNING: stream ended without an abort after '
                            f'{total_bytes} B / {time.time() - t_stream:.1f} s '
                            f'— lSPAD ended an indefinite (SB,0) acquisition\n')
             finally:
                 spad_sock.close()
-                log_fn('[dbg] spad_sock closed\n')
 
     finally:
-        log_fn('[dbg] teardown: flushing …\n')
         flush()
-        log_fn(f'[dbg] teardown: flush done, sq qsize={sq.qsize()}; joining queue …\n')
         sq.join()
-        log_fn('[dbg] teardown: sq.join returned; sending sentinel …\n')
         sq.put(None)
-        sender_thread.join()
-        log_fn('[dbg] teardown: sender_thread joined; sending KEY_END …\n')
+        sender_thread.join(timeout=10)
         # Signal end of session; receiver loops back to await the next KEY_SETUP.
         try:
             sock.sendall(struct.pack('>II', KEY_END, 0))
-            log_fn('[dbg] teardown: KEY_END sent\n')
         except OSError as exc:
             # Never let this mask an exception already propagating out of the
             # try block — that one is the real diagnosis.
-            log_fn(f'[dbg] teardown: KEY_END failed: {exc!r}\n')
+            log_fn(f'KEY_END failed: {exc!r}\n')
             if sys.exc_info()[0] is None:
                 raise
 
@@ -421,7 +452,7 @@ def run_command_server(cmd_port: int = DEFAULT_CMD_PORT,
         conn.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 30_000, 5_000))  # 30 s idle, probe every 5 s
         status_fn({'event': 'ctrl_connected', 'addr': addr[0]})
         _send_ctrl_msg(conn, threading.Lock(),
-                       {'status': 'log', 'msg': f'[dbg] sender build {_build_id()}\n'})
+                       {'status': 'log', 'msg': f'sender build {_build_id()}\n'})
         _handle_controller(conn, status_fn)
         status_fn({'event': 'ctrl_disconnected'})
 
@@ -488,11 +519,10 @@ def _handle_controller(conn: socket.socket, status_fn) -> None:
                         age = time.time() - acq_started
                         send({'status': 'busy'})
                         send({'status': 'log',
-                              'msg': f'[dbg] START refused: {acq_thread.name} still '
+                              'msg': f'START refused: {acq_thread.name} still '
                                      f'alive after {age:.1f} s '
                                      f'(stop_event set={stop_event.is_set()})\n'})
                         continue
-                    send({'status': 'log', 'msg': '[dbg] START accepted\n'})
                     stop_event  = threading.Event()
                     acq_started = time.time()
                     acq_thread = threading.Thread(
@@ -502,9 +532,6 @@ def _handle_controller(conn: socket.socket, status_fn) -> None:
                     )
                     acq_thread.start()
                 elif cmd == 'abort':
-                    send({'status': 'log',
-                          'msg': f'[dbg] ABORT received (acq alive='
-                                 f'{bool(acq_thread and acq_thread.is_alive())})\n'})
                     if stop_event is not None:
                         stop_event.set()
     except OSError:
@@ -525,11 +552,8 @@ def _run_acquisition_cmd(params: dict, stop_event: threading.Event,
         test_mode  = bool(params.get('test', False))
 
         send_ctrl({'status': 'connecting'})
-        send_ctrl({'status': 'log',
-                   'msg': f'[dbg] connecting to receiver {recv_host}:{recv_port} …\n'})
         sock = connect_receiver(recv_host, recv_port)
         send_ctrl({'status': 'streaming'})
-        send_ctrl({'status': 'log', 'msg': '[dbg] data socket connected\n'})
         status_fn({'event': 'streaming'})
 
         try:
@@ -537,13 +561,12 @@ def _run_acquisition_cmd(params: dict, stop_event: threading.Event,
                 log_fn=lambda msg: send_ctrl({'status': 'log', 'msg': msg}))
         finally:
             sock.close()
-            send_ctrl({'status': 'log', 'msg': '[dbg] data socket closed\n'})
 
         send_ctrl({'status': 'done'})
     except Exception as exc:
         send_ctrl({'status': 'error', 'msg': f'{type(exc).__name__}: {exc}'})
         send_ctrl({'status': 'log',
-                   'msg': f'[dbg] acquisition traceback:\n{traceback.format_exc()}\n'})
+                   'msg': f'acquisition traceback:\n{traceback.format_exc()}\n'})
     finally:
         status_fn({'event': 'idle'})
 

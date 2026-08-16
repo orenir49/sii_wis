@@ -343,7 +343,7 @@ class NodePanel:
             except Exception:
                 # Never let the accept loop die — otherwise the next START connects
                 # to a socket nobody ever reads.
-                self.log_fn(f'[N{self.node_id}] [dbg] session loop crashed:\n'
+                self.log_fn(f'[N{self.node_id}] session loop crashed:\n'
                             f'{traceback.format_exc()}\n')
             finally:
                 try:
@@ -351,8 +351,6 @@ class NodePanel:
                 except OSError:
                     pass
                 self._data_conn = None
-                self.log_fn(f'[N{self.node_id}] [dbg] session loop returned — '
-                            f'back to accept()\n')
 
     @staticmethod
     def _drain(q: queue.Queue) -> np.ndarray:
@@ -733,10 +731,7 @@ class ReceiverGUI:
         if self._monitor_abort is not None:
             self._monitor_abort.set()
         for node in (self.node1, self.node2):
-            ready = node.is_ready()
-            self._enqueue_log(f'[dbg] node{node.node_id}: is_ready={ready}, '
-                              f'abort {"sent" if ready else "SKIPPED"}\n')
-            if ready:
+            if node.is_ready():
                 node.send_abort()
         self._run_id += 1          # invalidates pending progress/timer/sparse-cal callbacks
         self._cal_waiting.clear()
