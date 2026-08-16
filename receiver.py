@@ -34,10 +34,11 @@ import ssh_launcher
 
 HEALTH_CHECK_MS = 2_000
 SPARSE_CAL_WAVEFORM_S = 4.194304  # RIGOL sparse-pulse RAF waveform: 2**23 pts @ 2 MSa/s
-# Dwell-collection window. Longer than one waveform period: measured capture runs
-# well below the ~50 pulses a period contains, so the extra time buys matched
-# pairs for the fit. Raise it if calibration still fails.
-SPARSE_CAL_DURATION_S = 6.0
+# Dwell-collection window: exactly one waveform period. Measured capture with a
+# single-pixel mask is 9.6-15 dwell events/s across the whole window, i.e. the
+# ~50 pulses a period contains. A wider window is only needed if the parser
+# cannot keep up (many active pixels), which starves the window instead.
+SPARSE_CAL_DURATION_S = SPARSE_CAL_WAVEFORM_S
 CAL_ARM_TIMEOUT_MS = 20_000       # give up waiting for a node's first chunk
 
 
