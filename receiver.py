@@ -20,6 +20,7 @@ import socket
 import sys
 import threading
 import time
+import traceback
 import tkinter as tk
 from tkinter import ttk, scrolledtext, simpledialog, messagebox
 
@@ -321,16 +322,28 @@ class NodePanel:
             hooks[320] = self._master_dwell_q  # master_dwell — offset diagnostics
             hooks[323] = self._dwell_q         # slave_dwell — needed for clock-offset calibration
 
-            run_session_loop(
-                conn,
-                log_fn=lambda m: self.log_fn(
-                    f'[N{self.node_id}] {m}' if m.endswith('\n') else f'[N{self.node_id}] {m}\n'
-                ),
-                pixel_hooks=hooks,
-                event_accum=self._event_accum,
-            )
-
-            self._data_conn = None
+            try:
+                run_session_loop(
+                    conn,
+                    log_fn=lambda m: self.log_fn(
+                        f'[N{self.node_id}] {m}' if m.endswith('\n') else f'[N{self.node_id}] {m}\n'
+                    ),
+                    pixel_hooks=hooks,
+                    event_accum=self._event_accum,
+                )
+            except Exception:
+                # Never let the accept loop die — otherwise the next START connects
+                # to a socket nobody ever reads.
+                self.log_fn(f'[N{self.node_id}] [dbg] session loop crashed:\n'
+                            f'{traceback.format_exc()}\n')
+            finally:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+                self._data_conn = None
+                self.log_fn(f'[N{self.node_id}] [dbg] session loop returned — '
+                            f'back to accept()\n')
 
     @staticmethod
     def _drain(q: queue.Queue) -> np.ndarray:
@@ -708,7 +721,10 @@ class ReceiverGUI:
         if self._monitor_abort is not None:
             self._monitor_abort.set()
         for node in (self.node1, self.node2):
-            if node.is_ready():
+            ready = node.is_ready()
+            self._enqueue_log(f'[dbg] node{node.node_id}: is_ready={ready}, '
+                              f'abort {"sent" if ready else "SKIPPED"}\n')
+            if ready:
                 node.send_abort()
         self._run_id += 1
         self._show_progress_bar()

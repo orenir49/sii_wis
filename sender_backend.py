@@ -142,7 +142,13 @@ def run(sock: socket.socket,
                 sq.task_done()
                 break
             key_id, payload = item
-            sock.sendall(struct.pack('>II', key_id, len(payload)) + payload)
+            try:
+                sock.sendall(struct.pack('>II', key_id, len(payload)) + payload)
+            except Exception as exc:
+                # Leaves task_done() uncalled -> sq.join() below will hang; that is
+                # the pre-existing behaviour, we only make it visible.
+                log_fn(f'[dbg] sender_fn died on sendall: {exc!r}\n')
+                raise
             sq.task_done()
 
     sender_thread = threading.Thread(target=sender_fn, daemon=True)
@@ -166,19 +172,27 @@ def run(sock: socket.socket,
         else:
             # lSPAD's own TCP command protocol — see LSPAD_CLI.md for the full command set.
             spad_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            log_fn(f'[dbg] connecting to lSPAD {SPAD_HOST}:{SPAD_PORT} …\n')
             spad_sock.connect((SPAD_HOST, SPAD_PORT))
-            log_fn(spad_sock.recv(8192).decode('utf8'))
+            log_fn('[dbg] lSPAD connected, awaiting banner …\n')
+            banner = spad_sock.recv(8192)
+            log_fn(f'[dbg] banner ({len(banner)} B): {banner[:120]!r}\n')
+            log_fn(banner.decode('utf8', errors='replace'))
 
             spad_sock.send(b'T,v,1\n')
-            if spad_sock.recv(8192).decode('utf8') == 'TDC calibration is invalid':
+            tdc_reply = spad_sock.recv(8192)
+            log_fn(f'[dbg] T,v,1 reply ({len(tdc_reply)} B): {tdc_reply[:120]!r}\n')
+            if tdc_reply.decode('utf8', errors='replace') == 'TDC calibration is invalid':
                 spad_sock.send(b'T,c,1\n')
-                log_fn(spad_sock.recv(8192).decode('utf8'))
+                log_fn(spad_sock.recv(8192).decode('utf8', errors='replace'))
 
             spad_sock.send(f'SB,{int(duration * 1000)}\n'.encode('utf8'))
+            log_fn(f'[dbg] SB,{int(duration * 1000)} sent\n')
 
-            reset_m = 0
-            reset_s = 0
-            carry   = b''
+            reset_m     = 0
+            reset_s     = 0
+            carry       = b''
+            first_chunk = True
 
             try:
                 while not stop_event.is_set():
@@ -187,7 +201,11 @@ def run(sock: socket.socket,
                         continue
                     data = spad_sock.recv(57344)
                     if not data:
+                        log_fn('[dbg] lSPAD closed the stream socket (EOF)\n')
                         break
+                    if first_chunk:
+                        first_chunk = False
+                        log_fn(f'[dbg] first lSPAD data chunk: {len(data)} B\n')
 
                     done  = data[-4:] == b'DONE'
                     error = data[-5:] == b'ERROR'
@@ -262,17 +280,24 @@ def run(sock: socket.socket,
 
                 if stop_event.is_set():
                     log_fn('Aborted — sending STOP to lSPAD.\n')
-                    spad_sock.send(b'STOP\n')
+                    n = spad_sock.send(b'STOP\n')
+                    log_fn(f'[dbg] STOP written ({n}/5 B)\n')
             finally:
                 spad_sock.close()
+                log_fn('[dbg] spad_sock closed\n')
 
     finally:
+        log_fn('[dbg] teardown: flushing …\n')
         flush()
+        log_fn(f'[dbg] teardown: flush done, sq qsize={sq.qsize()}; joining queue …\n')
         sq.join()
+        log_fn('[dbg] teardown: sq.join returned; sending sentinel …\n')
         sq.put(None)
         sender_thread.join()
+        log_fn('[dbg] teardown: sender_thread joined; sending KEY_END …\n')
         # Signal end of session; receiver loops back to await the next KEY_SETUP.
         sock.sendall(struct.pack('>II', KEY_END, 0))
+        log_fn('[dbg] teardown: KEY_END sent\n')
 
     log_fn(f'Done. Elapsed: {time.time() - start:.1f} s')
 
@@ -320,9 +345,10 @@ def _send_ctrl_msg(conn: socket.socket, lock: threading.Lock,
 
 
 def _handle_controller(conn: socket.socket, status_fn) -> None:
-    lock       = threading.Lock()
+    lock        = threading.Lock()
     stop_event: threading.Event | None = None
     acq_thread: threading.Thread | None = None
+    acq_started = 0.0
 
     def send(msg: dict) -> None:
         _send_ctrl_msg(conn, lock, msg)
@@ -347,9 +373,16 @@ def _handle_controller(conn: socket.socket, status_fn) -> None:
                 cmd = msg.get('cmd')
                 if cmd == 'start':
                     if acq_thread and acq_thread.is_alive():
+                        age = time.time() - acq_started
                         send({'status': 'busy'})
+                        send({'status': 'log',
+                              'msg': f'[dbg] START refused: {acq_thread.name} still '
+                                     f'alive after {age:.1f} s '
+                                     f'(stop_event set={stop_event.is_set()})\n'})
                         continue
-                    stop_event = threading.Event()
+                    send({'status': 'log', 'msg': '[dbg] START accepted\n'})
+                    stop_event  = threading.Event()
+                    acq_started = time.time()
                     acq_thread = threading.Thread(
                         target=_run_acquisition_cmd,
                         args=(msg, stop_event, send, status_fn),
@@ -357,6 +390,9 @@ def _handle_controller(conn: socket.socket, status_fn) -> None:
                     )
                     acq_thread.start()
                 elif cmd == 'abort':
+                    send({'status': 'log',
+                          'msg': f'[dbg] ABORT received (acq alive='
+                                 f'{bool(acq_thread and acq_thread.is_alive())})\n'})
                     if stop_event is not None:
                         stop_event.set()
     except OSError:
@@ -377,8 +413,11 @@ def _run_acquisition_cmd(params: dict, stop_event: threading.Event,
         test_mode  = bool(params.get('test', False))
 
         send_ctrl({'status': 'connecting'})
+        send_ctrl({'status': 'log',
+                   'msg': f'[dbg] connecting to receiver {recv_host}:{recv_port} …\n'})
         sock = connect_receiver(recv_host, recv_port)
         send_ctrl({'status': 'streaming'})
+        send_ctrl({'status': 'log', 'msg': '[dbg] data socket connected\n'})
         status_fn({'event': 'streaming'})
 
         try:
@@ -386,6 +425,7 @@ def _run_acquisition_cmd(params: dict, stop_event: threading.Event,
                 log_fn=lambda msg: send_ctrl({'status': 'log', 'msg': msg}))
         finally:
             sock.close()
+            send_ctrl({'status': 'log', 'msg': '[dbg] data socket closed\n'})
 
         send_ctrl({'status': 'done'})
     except Exception as exc:
