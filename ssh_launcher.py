@@ -290,6 +290,25 @@ def shutdown_lspad(host: str, username: str, password: str) -> None:
         client.close()
 
 
+def kill_sender(client: paramiko.SSHClient) -> str:
+    """
+    Kill any detached sender.py still running on the node. Returns the killed
+    PIDs as text (empty if none).
+
+    Launch leaves the previous sender.py alive, and the command server binds
+    with SO_REUSEADDR — on Windows a second process may bind an already-listening
+    port, so a stale sender can keep answering the receiver with old code even
+    after a successful git pull.
+    """
+    out, _ = run_ps(client, (
+        "Get-CimInstance Win32_Process -Filter "
+        "\"Name='pythonw.exe' or Name='python.exe'\" | "
+        "Where-Object { $_.CommandLine -like '*sender.py*' } | "
+        "ForEach-Object { Stop-Process -Id $_.ProcessId -Force; $_.ProcessId }"
+    ))
+    return out.strip()
+
+
 def launch_node(host: str, username: str, password: str,
                 mask_filename: str, log_fn,
                 lspad_port: int = SPAD_PORT,
@@ -378,7 +397,12 @@ def launch_node(host: str, username: str, password: str,
         # 7. Fetch + pull repo (aborts if uncommitted changes present)
         git_update(client, sii_dir, log_fn)
 
-        # 8. Start sender.py using venv pythonw.exe (window visible on remote desktop)
+        # 8. Kill any stale sender.py, then start a fresh one using venv pythonw.exe
+        #    (window visible on remote desktop). Without the kill, the old process
+        #    keeps the command port and the receiver talks to pre-pull code.
+        killed = kill_sender(client)
+        if killed:
+            log_fn(f'Killed stale sender.py (pid {killed.replace(chr(10), ", ")}).\n')
         pythonw = sii_dir + r'\.venv\Scripts\pythonw.exe'
         sender  = sii_dir + r'\sender.py'
         start_detached(client, pythonw, sender, sii_dir)

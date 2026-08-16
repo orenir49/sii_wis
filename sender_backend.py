@@ -11,6 +11,7 @@ Or run standalone:
 
 import argparse
 import json
+import os
 import select
 import socket
 import struct
@@ -330,8 +331,30 @@ def run_command_server(cmd_port: int = DEFAULT_CMD_PORT,
         conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         conn.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 30_000, 5_000))  # 30 s idle, probe every 5 s
         status_fn({'event': 'ctrl_connected', 'addr': addr[0]})
+        _send_ctrl_msg(conn, threading.Lock(),
+                       {'status': 'log', 'msg': f'[dbg] sender build {_build_id()}\n'})
         _handle_controller(conn, status_fn)
         status_fn({'event': 'ctrl_disconnected'})
+
+
+def _build_id() -> str:
+    """Identify the running code: git HEAD + pid.
+
+    A stale sender.py can keep the command port after a git pull, so the
+    receiver needs to see which build is actually answering.
+    """
+    sha = '?'
+    try:
+        import subprocess
+        sha = subprocess.run(
+            ['git', 'rev-parse', '--short', 'HEAD'],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            capture_output=True, text=True, timeout=5,
+            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+        ).stdout.strip() or '?'
+    except Exception:
+        pass
+    return f'{sha} pid {os.getpid()}'
 
 
 def _send_ctrl_msg(conn: socket.socket, lock: threading.Lock,
