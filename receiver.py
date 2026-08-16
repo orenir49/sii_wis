@@ -72,7 +72,7 @@ class NodePanel:
         self._dwell_q: queue.Queue = queue.Queue()         # slave_dwell (key 323)
         self._master_dwell_q: queue.Queue = queue.Queue()  # master_dwell (key 320)
         self._output_dir: str | None = None
-        self._flush_active = False   # periodic post-calibration dwell-to-disk flush
+        self._drain_active = False   # periodic discard of the post-calibration dwell tap
         self._ssh_creds: tuple | None = None       # (host, user, password) set after Launch
         self._shutdown_thread: threading.Thread | None = None
         self._dwell_freq: float | None = None      # dwell clock Hz from last Launch R command
@@ -195,8 +195,7 @@ class NodePanel:
         threading.Thread(target=self._accept_data_thread, daemon=True).start()
 
     def _disconnect(self) -> None:
-        self.stop_dwell_flush()
-        self.dump_dwell_bins(self.get_all_dwell_ps(), self.get_all_master_dwell_ps())
+        self.stop_dwell_drain()
         if self._ctrl_sock:
             try:
                 self._ctrl_sock.close()
@@ -294,15 +293,13 @@ class NodePanel:
             self._gui(lambda: self._set_data_status('streaming'))
         elif s == 'done':
             self._gui(lambda: self._set_data_status('idle'))
-            self.stop_dwell_flush()
-            self.dump_dwell_bins(self.get_all_dwell_ps(), self.get_all_master_dwell_ps())
+            self.stop_dwell_drain()
         elif s == 'log':
             self.log_fn(f'[N{self.node_id}] {msg.get("msg", "")}\n')
         elif s == 'error':
             self.log_fn(f'[N{self.node_id}] Error: {msg.get("msg")}\n')
             self._gui(lambda: self._set_data_status('error'))
-            self.stop_dwell_flush()
-            self.dump_dwell_bins(self.get_all_dwell_ps(), self.get_all_master_dwell_ps())
+            self.stop_dwell_drain()
         elif s == 'busy':
             self.log_fn(f'[N{self.node_id}] Sender busy — START ignored.\n')
 
@@ -317,8 +314,9 @@ class NodePanel:
             self._data_conn = conn
             self.log_fn(f'[N{self.node_id}] Data connection from {addr[0]}\n')
 
-            # Stop any leftover flush loop and clear stale dwell data from a previous session
-            self.stop_dwell_flush()
+            # Drop the previous session's dwell tap. Safe to discard: run_session_loop
+            # persists keys 320/323 itself, so these queues hold nothing unique.
+            self.stop_dwell_drain()
             for q in (self._dwell_q, self._master_dwell_q):
                 while not q.empty():
                     try:
@@ -377,38 +375,27 @@ class NodePanel:
         """Drain the master_dwell queue and return all timestamps as an int64 array."""
         return self._drain(self._master_dwell_q)
 
-    def dump_dwell_bins(self, slave_arr: np.ndarray, master_arr: np.ndarray) -> None:
-        """Append newly drained dwell arrays to this node's session dwell .bin
-        files (run_session_loop truncates them to empty at session start, then
-        routes keys 320/323 into queues instead of writing them directly, so
-        every drain — calibration or periodic flush — must append, not overwrite)."""
-        if not self._output_dir or (slave_arr.size == 0 and master_arr.size == 0):
-            return
-        os.makedirs(self._output_dir, exist_ok=True)
-        if slave_arr.size:
-            with open(os.path.join(self._output_dir, 'slave_dwell.bin'), 'ab') as f:
-                f.write(slave_arr.tobytes())
-        if master_arr.size:
-            with open(os.path.join(self._output_dir, 'master_dwell.bin'), 'ab') as f:
-                f.write(master_arr.tobytes())
+    def start_dwell_drain(self, interval_ms: int = 2000) -> None:
+        """Begin periodically discarding dwell events the calibration no longer needs.
 
-    def start_dwell_flush(self, interval_ms: int = 2000) -> None:
-        """Begin periodically appending newly arrived dwell events to disk.
-        Call once calibration has consumed what it needs from the queues —
-        starting earlier would race calibration for the same events."""
-        if self._flush_active:
+        run_session_loop writes keys 320/323 to disk itself, so these queues are
+        a read tap only — nothing here persists anything. Left undrained they
+        would grow for the length of the run.
+        """
+        if self._drain_active:
             return
-        self._flush_active = True
-        self._schedule_dwell_flush(interval_ms)
+        self._drain_active = True
+        self._schedule_dwell_drain(interval_ms)
 
-    def stop_dwell_flush(self) -> None:
-        self._flush_active = False
+    def stop_dwell_drain(self) -> None:
+        self._drain_active = False
 
-    def _schedule_dwell_flush(self, interval_ms: int) -> None:
-        if not self._flush_active:
+    def _schedule_dwell_drain(self, interval_ms: int) -> None:
+        if not self._drain_active:
             return
-        self.dump_dwell_bins(self.get_all_dwell_ps(), self.get_all_master_dwell_ps())
-        self.root.after(interval_ms, lambda: self._schedule_dwell_flush(interval_ms))
+        self._drain(self._dwell_q)
+        self._drain(self._master_dwell_q)
+        self.root.after(interval_ms, lambda: self._schedule_dwell_drain(interval_ms))
 
     # ------------------------------------------------------------------
     # Remote launch via SSH
@@ -970,8 +957,6 @@ class ReceiverGUI:
 
         # Dwell keys are intercepted into queues instead of being written to
         # disk by run_session_loop — dump them to the usual dwell .bin files now.
-        self.node1.dump_dwell_bins(t1, m1)
-        self.node2.dump_dwell_bins(t2, m2)
 
         MIN_EVENTS = 5
         if t1.size < MIN_EVENTS or t2.size < MIN_EVENTS:
@@ -983,8 +968,8 @@ class ReceiverGUI:
                 f'● Calibration failed ({t1.size}/{t2.size} events) — offset = 0',
                 color='#cc3333')
             self._correlate_win.start_with_offset(0)
-            self.node1.start_dwell_flush()
-            self.node2.start_dwell_flush()
+            self.node1.start_dwell_drain()
+            self.node2.start_dwell_drain()
             return
 
         # Capture diagnostics: a span well short of the window means dwell data
@@ -1034,8 +1019,8 @@ class ReceiverGUI:
             f'● Calibrated — offset {slave_offset:+,} ps, acquisition running',
             color='#228822')
         self._correlate_win.start_with_offset(slave_offset)
-        self.node1.start_dwell_flush()
-        self.node2.start_dwell_flush()
+        self.node1.start_dwell_drain()
+        self.node2.start_dwell_drain()
 
     # ------------------------------------------------------------------
     # Health check

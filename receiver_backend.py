@@ -116,25 +116,42 @@ def run_session_loop(conn: socket.socket, log_fn=print,
             for kid, fname in SPECIAL_KEY_TO_FILENAME.items():
                 handles[kid] = open(os.path.join(output_dir, fname), 'wb')
 
-            chunks = 0
-            while True:
-                header          = recvall(conn, 8)
-                key_id, n_bytes = struct.unpack('>II', header)
-                if key_id == KEY_END:
-                    break
-                payload = recvall(conn, n_bytes)
-                if chunks == 0 and on_first_chunk is not None:
-                    on_first_chunk()
-                if pixel_hooks and key_id in pixel_hooks:
-                    pixel_hooks[key_id].put(payload)
-                else:
-                    handles[key_id].write(payload)
-                chunks += 1
-                if event_accum is not None and key_id < 320:
-                    event_accum[0] += n_bytes // 8
+            chunks  = 0
+            unknown = 0
+            try:
+                while True:
+                    header          = recvall(conn, 8)
+                    key_id, n_bytes = struct.unpack('>II', header)
+                    if key_id == KEY_END:
+                        break
+                    payload = recvall(conn, n_bytes)
+                    if chunks == 0 and on_first_chunk is not None:
+                        on_first_chunk()
 
-            for h in handles.values():
-                h.close()
+                    # Tee, never divert: every payload is persisted whether or not
+                    # a live consumer is also watching this key. Hooks are read
+                    # taps, not a substitute for the on-disk record — diverting
+                    # meant the correlated pixels were the only ones with no file.
+                    handle = handles.get(key_id)
+                    if handle is not None:
+                        handle.write(payload)
+                    else:
+                        unknown += 1
+                    if pixel_hooks and key_id in pixel_hooks:
+                        pixel_hooks[key_id].put(payload)
+
+                    chunks += 1
+                    if event_accum is not None and key_id < 320:
+                        event_accum[0] += n_bytes // 8
+            finally:
+                # Always close, so a mid-session disconnect cannot strand
+                # buffered writes in unflushed file objects.
+                for h in handles.values():
+                    h.close()
+
+            if unknown:
+                log_fn(f'[session {session}] WARNING: {unknown} chunk(s) with an '
+                       f'unrecognised key_id were not written')
             log_fn(f'[session {session}] Done — {chunks} chunks written to {output_dir}')
 
     except ConnectionError:

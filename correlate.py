@@ -351,26 +351,55 @@ class CorrelateWindow(tk.Toplevel):
     # ------------------------------------------------------------------
 
     def _launch_correlation(self) -> None:
+        """Correlate every t1 event whose full ±tmax partner window has arrived.
+
+        Splitting the stream into disjoint batches would drop any coincidence
+        straddling a boundary. Instead a t1 event is held back until t2 has
+        advanced past t1 + tmax, and the t2 tail still reachable by the next
+        pending t1 is retained. Each pair is then counted exactly once and none
+        is lost at a boundary. The held-back tail is only tmax wide (sub-µs),
+        so this costs nothing in memory.
+        """
+        try:
+            _, _, bw, tmax, nshift = self._get_params()
+        except Exception:
+            return          # entry box mid-edit; retry on the next poll
+        if self._t1.size == 0 or self._t2.size == 0:
+            return
+
+        offset  = self._offset if self._offset is not None else 0
+        t2_corr = self._t2 - offset
+
+        cut = int(np.searchsorted(self._t1, t2_corr[-1] - tmax, side='right'))
+        if cut == 0:
+            return          # t2 has not caught up; every t1 still has a partial window
+
+        t1_batch = self._t1[:cut]
+        self._t1 = self._t1[cut:]
+
+        # Retain the t2 events a future t1 could still pair with.
+        next_t1  = self._t1[0] if self._t1.size else t1_batch[-1]
+        keep     = int(np.searchsorted(t2_corr, next_t1 - tmax, side='left'))
+        self._t2 = self._t2[keep:]
+
         self._correlating  = True
         self._has_new_data = False
-        t1, t2   = self._t1, self._t2           # grab references (no copy)
-        self._t1 = np.empty(0, dtype=np.int64)  # clear staging buffers immediately
-        self._t2 = np.empty(0, dtype=np.int64)  # _poll_data fills fresh arrays from here
         threading.Thread(
             target=self._correlate_bg,
-            args=(t1, t2),
+            args=(t1_batch, t2_corr, bw, tmax, nshift),
             daemon=True,
         ).start()
 
-    def _correlate_bg(self, t1: np.ndarray, t2: np.ndarray) -> None:
+    def _correlate_bg(self, t1: np.ndarray, t2_corr: np.ndarray,
+                      bw: float, tmax: float, nshift: int) -> None:
+        # Parameters and the offset are resolved by the caller, so a mid-flight
+        # recalibration cannot bin this batch against a different offset.
         try:
-            _, _, bw, tmax, nshift = self._get_params()
-            t2_corr = t2 - (self._offset if self._offset is not None else 0)
             bins  = np.arange(-tmax - bw / 2, tmax + 3 * bw / 2, bw)
             nbins = len(bins) - 1
             idx   = np.searchsorted(t2_corr, t1)
             hist  = _multistart_multistop(t1, t2_corr, idx, bw, tmax, nbins, nshift)
-            self._result_q.put(('ok', hist, bins, len(t1), len(t2)))
+            self._result_q.put(('ok', hist, bins, len(t1), len(t2_corr)))
         except Exception as exc:
             self._result_q.put(('err', str(exc)))
         finally:
