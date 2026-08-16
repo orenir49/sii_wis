@@ -1,0 +1,45 @@
+---
+name: spectral-align
+description: Use when the user wants to align or compare two SPAD arc/emission spectra and fit the pixel mapping between them — e.g. "align these two arc references", "fit the pixel mapping between sii1 and sii2", "which pixels match between the two detectors", "compare sii1_arc_ref.txt with sii2_arc_59deg_35min.txt".
+---
+
+# Arc-line spectral alignment
+
+## Format
+
+Input is two classical photon counting `.txt` files as written by lSPAD: 3 header
+lines, then rows interleaving two pixels each (`px, count, px2, count2`), comma
+separated with tab padding. The first file is the **reference**; the second is
+mapped onto it.
+
+The analysis lives in `align_arc.py` next to this file. It detects emission lines
+with `scipy.signal.find_peaks` (prominence defaults to 10% of each trace's
+`max - median`), refines each peak to sub-pixel by parabolic interpolation, seeds
+an integer offset by normalized cross-correlation, then iteratively matches lines
+nearest-neighbour and refits, annealing the matching tolerance from 10 px to
+1.5 px.
+
+Output is the affine mapping `ref_px = a * other_px + b` plus two PNGs written to
+`figs/`: `<ref>_vs_<other>_traces.png` (both traces with matched and unmatched
+detections marked) and `<ref>_vs_<other>_fit.png` (fitted line and residuals).
+
+## Steps
+
+1. Resolve the two input paths from the user's prompt — reference first. Ask only
+   if which file is the reference is genuinely ambiguous.
+2. Run the script with the venv python from the repo root:
+   `.venv\Scripts\python.exe .claude\skills\spectral-align\align_arc.py REF.txt OTHER.txt`
+3. Pass through any non-default settings the user asked for (see Tuning below);
+   add `--outdir` only if they want the figures somewhere other than `figs/`.
+4. Relay the script's output: `a`, `b`, the number of matched lines, the RMS, and
+   the top-5 best-matching lines table.
+5. Tell the user where the two figures were written.
+
+## Tuning
+
+Raise `--rel-prominence` (or set an absolute `--prominence`) if noise peaks are
+being detected and matched; lower it if real lines are being missed. If the two
+spectra are offset by more than ~15 px, raise `--max-shift` so the correlation
+seed can find the offset, and `--tol-start` so the first matching pass still pairs
+lines. `--tol-final` sets how close a line must land to count as matched, and
+`--top` changes how many rows the table prints.

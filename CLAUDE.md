@@ -25,6 +25,9 @@ python receiver_backend.py [--port 50007]
 
 # Offline analysis
 jupyter notebook spad_new.ipynb
+
+# Arc-line spectral alignment between two detectors
+python .claude/skills/spectral-align/align_arc.py REF.txt OTHER.txt --outdir figs
 ```
 
 ## Architecture
@@ -54,6 +57,7 @@ Minimal GUI that starts a command server thread on launch. Receives JSON command
 | `setup_node.ps1` | One-shot sender node setup: OpenSSH, firewall, git clone, venv |
 | `spad_new.ipynb` | Offline g² analysis notebook |
 | `LSPAD_CLI.md` | Reference for `lSPAD.exe`'s own TCP command protocol (port 9999) |
+| `.claude/skills/spectral-align/align_arc.py` | Arc-line peak matching + affine pixel-mapping fit between two SPAD spectra |
 
 ### Wire protocol
 
