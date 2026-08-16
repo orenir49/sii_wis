@@ -196,6 +196,8 @@ def run(sock: socket.socket,
             reset_s     = 0
             carry       = b''
             first_chunk = True
+            total_bytes = 0
+            t_stream    = time.time()
 
             try:
                 while not stop_event.is_set():
@@ -210,12 +212,24 @@ def run(sock: socket.socket,
                         first_chunk = False
                         log_fn(f'[dbg] first lSPAD data chunk: {len(data)} B\n')
 
+                    total_bytes += len(data)
+
                     done  = data[-4:] == b'DONE'
                     error = data[-5:] == b'ERROR'
                     if error:
+                        log_fn(f'[dbg] ERROR trailer after {total_bytes} B / '
+                               f'{time.time() - t_stream:.1f} s\n')
                         log_fn(data[-160:].decode('utf8', errors='replace'))
                         break
                     if done:
+                        # A genuine trailer leaves the preceding stream
+                        # record-aligned; a chance 'DONE' inside binary counter
+                        # data does not. aligned=False means false positive.
+                        payload_len = len(carry) + len(data) - 4
+                        log_fn(f'[dbg] DONE trailer after {total_bytes} B / '
+                               f'{time.time() - t_stream:.1f} s, chunk={len(data)} B, '
+                               f'carry={len(carry)} B, aligned='
+                               f'{payload_len % 7 == 0}, tail={data[-24:]!r}\n')
                         data = data[:-4]
 
                     data       = carry + data
@@ -285,6 +299,10 @@ def run(sock: socket.socket,
                     log_fn('Aborted — sending STOP to lSPAD.\n')
                     n = spad_sock.send(b'STOP\n')
                     log_fn(f'[dbg] STOP written ({n}/5 B)\n')
+                else:
+                    log_fn(f'[dbg] stream loop ended WITHOUT abort after '
+                           f'{total_bytes} B / {time.time() - t_stream:.1f} s '
+                           f'— lSPAD ended an indefinite (SB,0) acquisition\n')
             finally:
                 spad_sock.close()
                 log_fn('[dbg] spad_sock closed\n')
