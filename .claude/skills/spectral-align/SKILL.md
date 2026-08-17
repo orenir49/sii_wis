@@ -19,9 +19,21 @@ an integer offset by normalized cross-correlation, then iteratively matches line
 nearest-neighbour and refits, annealing the matching tolerance from 10 px to
 1.5 px.
 
-Output is the affine mapping `ref_px = a * other_px + b` plus two PNGs written to
-`figs/`: `<ref>_vs_<other>_traces.png` (both traces with matched and unmatched
-detections marked) and `<ref>_vs_<other>_fit.png` (fitted line and residuals).
+The fit is run **twice**: once over the full detector (0–319), and once
+restricted to `--active-range` (default 118–216, the span `/gen_mask`'s default
+sparse mask actually samples — see its skill for why only that range matters for
+a real sparse-masked acquisition). The range-restricted pass independently
+re-detects peaks, re-seeds the shift, and refits from scratch within that window
+— it does not just filter the full-detector fit's matches — so it tells you
+whether the mapping actually derived from the pixels you'll really use agrees
+with the whole-detector one.
+
+Output is two affine mappings (`ref_px = a * other_px + b`, full and
+active-range) plus two PNGs written to `figs/`:
+`<ref>_vs_<other>_traces.png` (both traces, with the active-range band shaded and
+full-detector/active-range/unmatched detections marked separately) and
+`<ref>_vs_<other>_fit.png` (fitted line + residuals, full-detector and
+active-range side by side).
 
 ## Steps
 
@@ -30,9 +42,12 @@ detections marked) and `<ref>_vs_<other>_fit.png` (fitted line and residuals).
 2. Run the script with the venv python from the repo root:
    `.venv\Scripts\python.exe .claude\skills\spectral-align\align_arc.py REF.txt OTHER.txt`
 3. Pass through any non-default settings the user asked for (see Tuning below);
-   add `--outdir` only if they want the figures somewhere other than `figs/`.
-4. Relay the script's output: `a`, `b`, the number of matched lines, the RMS, and
-   the top-5 best-matching lines table.
+   add `--outdir` only if they want the figures somewhere other than `figs/`, or
+   `--active-range LO HI` if the mask's active-pixel span isn't the default
+   118–216 (e.g. after regenerating the mask with `/gen_mask`).
+4. Relay the script's output for **both** passes: `a`, `b`, the number of matched
+   lines, the RMS, and the top-5 best-matching lines table for the full detector,
+   then the same for the active range.
 5. Tell the user where the two figures were written.
 
 ## Tuning
@@ -42,4 +57,7 @@ being detected and matched; lower it if real lines are being missed. If the two
 spectra are offset by more than ~15 px, raise `--max-shift` so the correlation
 seed can find the offset, and `--tol-start` so the first matching pass still pairs
 lines. `--tol-final` sets how close a line must land to count as matched, and
-`--top` changes how many rows the table prints.
+`--top` changes how many rows the table prints. If the active-range pass warns
+that it found too few peaks or matches, that range genuinely doesn't have enough
+lines in it — widen `--active-range` or lower `--rel-prominence` for that pass
+(applies to both passes; there's no separate knob).

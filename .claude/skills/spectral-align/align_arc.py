@@ -22,6 +22,7 @@ TOL_FINAL = 1.5
 N_ITER = 10
 N_TOP = 5
 HEADER_ROWS = 3
+ACTIVE_RANGE = (118, 216)  # pixel span covered by /gen_mask's default sparse mask
 
 
 def load_trace(path):
@@ -53,6 +54,22 @@ def default_prominence(arr, frac):
 def find_trace_peaks(arr, prominence):
     peaks, _ = find_peaks(arr, prominence=prominence)
     return peaks
+
+
+def find_lines(arr, lo, hi, prom_frac, prom_abs):
+    """Detect + sub-pixel refine peaks within arr[lo:hi], in absolute pixel coords.
+
+    Prominence is computed from the windowed slice, not the full trace, so a
+    range restricted to a small span isn't held to a threshold set by
+    dynamic range it doesn't contain.
+    """
+    lo     = max(lo, 0)
+    hi     = min(hi, len(arr) - 1)
+    window = arr[lo:hi + 1]
+    prom   = prom_abs if prom_abs is not None else default_prominence(window, prom_frac)
+    pk     = find_trace_peaks(window, prom)
+    sub    = np.array([subpixel_peak(window, i) for i in pk])
+    return pk + lo, sub + lo, prom, len(window)
 
 
 def subpixel_peak(arr, idx):
@@ -126,8 +143,64 @@ def residual_table(x1, x2, a, b, top):
     return [(x1[i], x2[i], a * x2[i] + b, resid[i]) for i in order]
 
 
-def plot_traces(t1, t2, pk1, pk2, sub1, sub2, m1, m2, labels, name1, name2, path):
-    """Both traces with matched (circles) and unmatched (grey x) detections."""
+def analyze(t1, t2, lo, hi, label, args):
+    """One full detect -> match -> affine-fit pass, restricted to pixels [lo, hi].
+
+    Passing lo=0, hi=huge reduces to the unrestricted full-detector analysis
+    (find_lines clips hi to each trace's own length). Returns a results dict,
+    or None if too few peaks were found or too few lines matched — printing
+    why either way.
+    """
+    pk1, sub1, prom1, n1 = find_lines(t1, lo, hi, args.rel_prominence, args.prominence)
+    pk2, sub2, prom2, n2 = find_lines(t2, lo, hi, args.rel_prominence, args.prominence)
+
+    print(f'--- {label} (pixels {lo}-{min(hi, len(t1) - 1, len(t2) - 1)}) ---')
+    print(f'ref   : {n1} px, {len(pk1)} peaks, prominence {prom1:.0f}')
+    print(f'other : {n2} px, {len(pk2)} peaks, prominence {prom2:.0f}')
+
+    if len(pk1) < 2 or len(pk2) < 2:
+        print('  skipped: need at least 2 peaks in each trace; lower --rel-prominence '
+              'or pass an explicit --prominence\n')
+        return None
+
+    shift = seed_shift(t1[lo:hi + 1], t2[lo:hi + 1], args.max_shift)
+    print(f'  seed shift: {shift:+d} px')
+
+    a, b, m1, m2 = icp_affine_fit(sub1, sub2, 1.0, float(shift),
+                                  args.tol_start, args.tol_final, args.iters)
+    if len(m1) < 2:
+        print(f'  skipped: only {len(m1)} lines matched within {args.tol_final} px; '
+              'raise --tol-final or --max-shift, or check the two files are the same setup\n')
+        return None
+
+    x1, x2 = sub1[m1], sub2[m2]
+    rms = float(np.sqrt(np.mean((x1 - (a * x2 + b)) ** 2)))
+
+    print('  fit: ref_px = a * other_px + b')
+    print(f'    a = {a:.6f}')
+    print(f'    b = {b:.3f}')
+    print(f'    matched lines: {len(x1)}     RMS = {rms:.3f} px')
+    print(f'  top {min(args.top, len(x1))} best-matching lines (smallest |residual|):')
+    print(f'    {"rank":>4}  {"ref px":>9}  {"other px":>9}  {"predicted":>10}  {"residual":>9}')
+    for rank, (r, o, pred, res) in enumerate(residual_table(x1, x2, a, b, args.top), 1):
+        print(f'    {rank:>4}  {r:>9.2f}  {o:>9.2f}  {pred:>10.2f}  {res:>+9.3f}')
+    print()
+
+    return dict(pk1=pk1, pk2=pk2, sub1=sub1, sub2=sub2, m1=m1, m2=m2,
+                a=a, b=b, x1=x1, x2=x2, rms=rms)
+
+
+def plot_traces(t1, t2, full, rng, active_range, labels, name1, name2, path):
+    """Both traces with matched/unmatched detections, plus the active-mask range.
+
+    Circles mark lines used by the full-detector fit; triangles (if `rng` is
+    not None) mark lines additionally used by the range-restricted fit — a
+    subset that should fall inside the shaded active-mask band.
+    """
+    lo, hi = active_range
+    pk1, pk2   = full['pk1'], full['pk2']
+    sub1, sub2 = full['sub1'], full['sub2']
+    m1, m2     = full['m1'], full['m2']
     un1 = np.setdiff1d(np.arange(len(pk1)), m1)
     un2 = np.setdiff1d(np.arange(len(pk2)), m2)
 
@@ -135,9 +208,11 @@ def plot_traces(t1, t2, pk1, pk2, sub1, sub2, m1, m2, labels, name1, name2, path
     for ax, t, pk, sub, m, un, color, title in (
             (ax1, t1, pk1, sub1, m1, un1, 'k', f'{name1} (reference)'),
             (ax2, t2, pk2, sub2, m2, un2, 'tab:blue', name2)):
+        ax.axvspan(lo, hi, color='tab:orange', alpha=0.12,
+                   label=f'active mask range ({lo}-{hi})')
         ax.plot(np.arange(len(t)), t, color=color, lw=0.8, label=title)
         ax.plot(pk[m], t[pk[m]], 'o', color='tab:red', ms=6, mfc='none', mew=1.3,
-                label=f'used peaks (n={len(m)})')
+                label=f'full-detector fit (n={len(m)})')
         if len(un):
             ax.plot(pk[un], t[pk[un]], 'x', color='gray', ms=6,
                     label=f'unmatched (n={len(un)})')
@@ -148,6 +223,14 @@ def plot_traces(t1, t2, pk1, pk2, sub1, sub2, m1, m2, labels, name1, name2, path
                             fontsize=7, color='tab:red')
         ax.set_ylabel('Counts')
         ax.set_title(title)
+
+    if rng is not None:
+        for ax, t, pk_key, m_key in ((ax1, t1, 'pk1', 'm1'), (ax2, t2, 'pk2', 'm2')):
+            pk_r, m_r = rng[pk_key], rng[m_key]
+            ax.plot(pk_r[m_r], t[pk_r[m_r]], '^', color='tab:green', ms=7, mfc='none',
+                    mew=1.3, label=f'active-range fit (n={len(m_r)})')
+
+    for ax in (ax1, ax2):
         ax.legend(fontsize=8, frameon=False, loc='upper right')
     ax2.set_xlabel('Pixel')
 
@@ -156,23 +239,37 @@ def plot_traces(t1, t2, pk1, pk2, sub1, sub2, m1, m2, labels, name1, name2, path
     plt.close(fig)
 
 
-def plot_fit(x1, x2, a, b, rms, name1, name2, path):
-    """Matched line positions with the fitted mapping, plus residuals."""
-    fig, (ax_fit, ax_res) = plt.subplots(2, 1, figsize=(9, 8), dpi=150, sharex=True,
-                                         gridspec_kw={'height_ratios': [2, 1]})
-    xx = np.linspace(x2.min() - 5, x2.max() + 5, 100)
-    ax_fit.plot(x2, x1, 'o', color='tab:blue', ms=6, label='matched lines')
-    ax_fit.plot(xx, a * xx + b, 'r-', lw=1.2, label=f'fit: y = {a:.4f}x + {b:.2f}')
-    ax_fit.set_ylabel(f'{name1} pixel')
-    ax_fit.set_title(f'Linear fit to matched line positions (RMS={rms:.3f} px)')
-    ax_fit.legend(fontsize=9, frameon=False)
+def plot_fit(full, rng, active_range, name1, name2, path):
+    """Matched line positions with the fitted mapping, plus residuals.
 
-    ax_res.axhline(0, color='gray', lw=0.8, ls='--')
-    ax_res.plot(x2, x1 - (a * x2 + b), 'o', color='tab:red', ms=6)
-    ax_res.set_xlabel(f'{name2} pixel')
-    ax_res.set_ylabel('Residual (px)')
-    ax_res.set_title('Fit residuals')
+    One column for the full-detector fit; a second column for the
+    active-mask-range fit if it converged, so the two are compared side by
+    side rather than in separate files.
+    """
+    cols = [(f'Full detector', full)]
+    if rng is not None:
+        cols.append((f'Active mask range ({active_range[0]}-{active_range[1]})', rng))
 
+    fig, axes = plt.subplots(2, len(cols), figsize=(5.0 * len(cols), 8), dpi=150,
+                             squeeze=False, gridspec_kw={'height_ratios': [2, 1]})
+
+    for col, (label, res) in enumerate(cols):
+        ax_fit, ax_res = axes[0][col], axes[1][col]
+        x1, x2, a, b, rms = res['x1'], res['x2'], res['a'], res['b'], res['rms']
+        xx = np.linspace(x2.min() - 5, x2.max() + 5, 100)
+        ax_fit.plot(x2, x1, 'o', color='tab:blue', ms=6, label='matched lines')
+        ax_fit.plot(xx, a * xx + b, 'r-', lw=1.2, label=f'fit: y = {a:.4f}x + {b:.2f}')
+        ax_fit.set_ylabel(f'{name1} pixel')
+        ax_fit.set_title(f'{label}\nRMS={rms:.3f} px, n={len(x1)}')
+        ax_fit.legend(fontsize=9, frameon=False)
+
+        ax_res.axhline(0, color='gray', lw=0.8, ls='--')
+        ax_res.plot(x2, x1 - (a * x2 + b), 'o', color='tab:red', ms=6)
+        ax_res.set_xlabel(f'{name2} pixel')
+        ax_res.set_ylabel('Residual (px)')
+        ax_res.set_title('Fit residuals')
+
+    fig.suptitle('Linear fit to matched line positions: ref_px = a * other_px + b')
     fig.tight_layout()
     fig.savefig(path)
     plt.close(fig)
@@ -201,64 +298,41 @@ def main():
                     help=f'rows in the best-match table (default {N_TOP})')
     ap.add_argument('--no-labels', action='store_true',
                     help='suppress per-peak pixel annotations on the traces figure')
+    ap.add_argument('--active-range', type=int, nargs=2, metavar=('LO', 'HI'),
+                    default=list(ACTIVE_RANGE),
+                    help='pixel span to additionally fit in isolation, e.g. the sparse '
+                         f'mask\'s active-pixel range (default {ACTIVE_RANGE[0]} {ACTIVE_RANGE[1]})')
     args = ap.parse_args()
 
     name1 = os.path.splitext(os.path.basename(args.ref))[0]
     name2 = os.path.splitext(os.path.basename(args.other))[0]
     prefix = args.prefix or f'{name1}_vs_{name2}'
+    lo, hi = args.active_range
 
     t1 = load_trace(args.ref)
     t2 = load_trace(args.other)
-
-    prom1 = args.prominence if args.prominence is not None else default_prominence(t1, args.rel_prominence)
-    prom2 = args.prominence if args.prominence is not None else default_prominence(t2, args.rel_prominence)
-    pk1 = find_trace_peaks(t1, prom1)
-    pk2 = find_trace_peaks(t2, prom2)
-
-    print(f'ref   : {os.path.basename(args.ref)}   '
-          f'({len(t1)} px, {len(pk1)} peaks, prominence {prom1:.0f})')
-    print(f'other : {os.path.basename(args.other)}   '
-          f'({len(t2)} px, {len(pk2)} peaks, prominence {prom2:.0f})')
-
-    if len(pk1) < 2 or len(pk2) < 2:
-        sys.exit('error: need at least 2 peaks in each trace; lower --rel-prominence '
-                 'or pass an explicit --prominence')
-
-    sub1 = np.array([subpixel_peak(t1, i) for i in pk1])
-    sub2 = np.array([subpixel_peak(t2, i) for i in pk2])
-
-    shift = seed_shift(t1, t2, args.max_shift)
-    print(f'seed shift: {shift:+d} px')
-
-    a, b, m1, m2 = icp_affine_fit(sub1, sub2, 1.0, float(shift),
-                                  args.tol_start, args.tol_final, args.iters)
-    if len(m1) < 2:
-        sys.exit(f'error: only {len(m1)} lines matched within {args.tol_final} px; '
-                 'raise --tol-final or --max-shift, or check the two files are the same setup')
-
-    x1 = sub1[m1]
-    x2 = sub2[m2]
-    resid = x1 - (a * x2 + b)
-    rms = float(np.sqrt(np.mean(resid ** 2)))
-
+    print(f'ref   : {os.path.basename(args.ref)}   ({len(t1)} px)')
+    print(f'other : {os.path.basename(args.other)}   ({len(t2)} px)')
     print()
-    print('fit: ref_px = a * other_px + b')
-    print(f'  a = {a:.6f}')
-    print(f'  b = {b:.3f}')
-    print(f'  matched lines: {len(x1)}     RMS = {rms:.3f} px')
-    print()
-    print(f'Top {min(args.top, len(x1))} best-matching lines (smallest |residual|):')
-    print(f'  {"rank":>4}  {"ref px":>9}  {"other px":>9}  {"predicted":>10}  {"residual":>9}')
-    for rank, (r, o, pred, res) in enumerate(residual_table(x1, x2, a, b, args.top), 1):
-        print(f'  {rank:>4}  {r:>9.2f}  {o:>9.2f}  {pred:>10.2f}  {res:>+9.3f}')
-    print()
+
+    # Full detector first — it's the primary result, so a failure here is fatal.
+    full = analyze(t1, t2, 0, max(len(t1), len(t2)) - 1, 'Full detector', args)
+    if full is None:
+        sys.exit('error: full-detector fit failed — see the message above')
+
+    # Active-mask range second — independently re-detects, re-seeds, and refits
+    # using only the pixels the sparse mask actually samples, rather than
+    # filtering the full-detector fit's matches down to that span.
+    rng = analyze(t1, t2, lo, hi, f'Active mask range', args)
+    if rng is None:
+        print(f'warning: active-range ({lo}-{hi}) fit did not converge — plotting '
+              'the full-detector fit only\n', file=sys.stderr)
 
     os.makedirs(args.outdir, exist_ok=True)
     traces_path = os.path.join(args.outdir, f'{prefix}_traces.png')
     fit_path = os.path.join(args.outdir, f'{prefix}_fit.png')
-    plot_traces(t1, t2, pk1, pk2, sub1, sub2, m1, m2, not args.no_labels,
-                name1, name2, traces_path)
-    plot_fit(x1, x2, a, b, rms, name1, name2, fit_path)
+    plot_traces(t1, t2, full, rng, (lo, hi), not args.no_labels, name1, name2, traces_path)
+    plot_fit(full, rng, (lo, hi), name1, name2, fit_path)
     print(f'wrote {traces_path}')
     print(f'wrote {fit_path}')
 
