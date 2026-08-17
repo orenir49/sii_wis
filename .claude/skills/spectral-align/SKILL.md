@@ -38,9 +38,14 @@ extrapolation far outside the data.
 Three files are written to `figs/`: `<ref>_vs_<other>_traces.png` (both
 traces, with the active-range band shaded and full-detector/active-range/
 unmatched detections marked separately), `<ref>_vs_<other>_fit.png` (fitted
-line + residuals, full-detector and active-range side by side), and
-`<ref>_vs_<other>_active_range_matches.txt` (every matched line pair within
-the active range, plain three-column text: `pix1,pix2,diff`).
+line + residuals, full-detector and active-range side by side; legend uses
+`y' = a*x' + b` with `x'`/`y'` spelled out once in the figure title), and
+`<ref>_vs_<other>_active_range_matches.txt` — the 5 best-matching lines
+within the active range (smallest `|pix1-pix2|`), plain three-column text:
+`pix1,pix2,diff`, where pix1/pix2 are rounded to the nearest *integer* pixel
+(what a real, non-interpolated acquisition would read) and diff is
+`|(pix1-160) - (a*(pix2-160)+b)|` — how far the rounded reference pixel
+lands from what the fit predicts from the rounded other pixel.
 
 ## Steps
 

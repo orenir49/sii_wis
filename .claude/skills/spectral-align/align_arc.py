@@ -145,12 +145,24 @@ def residual_table(x1, x2, a, b, top):
     return [(x1[i], x2[i], a * x2[i] + b, resid[i]) for i in order]
 
 
-def write_matches_table(x1, x2, path):
-    """Write every matched line pair as plain three-column text: pix1,pix2,diff."""
+def write_matches_table(x1, x2, a, b_centered, path, top=5):
+    """Write the `top` best-matching (smallest |x1-x2|) lines as plain
+    three-column text: pix1, pix2 — sub-pixel positions rounded to the
+    nearest *integer* pixel (what a real, non-interpolated acquisition would
+    actually read) — and diff, the residual between the rounded reference
+    pixel and what the fit predicts from the rounded other pixel:
+    diff = |(pix1 - 160) - (a*(pix2 - 160) + b)|, matching the fit's own
+    ref-from-other direction.
+    """
+    order = np.argsort(np.abs(x1 - x2))[:top]
     with open(path, 'w') as f:
         f.write('pix1,pix2,diff\n')
-        for p1, p2 in zip(x1, x2):
-            f.write(f'{p1:.3f},{p2:.3f},{p1 - p2:.3f}\n')
+        for i in order:
+            p1 = int(np.round(x1[i]))
+            p2 = int(np.round(x2[i]))
+            y_pred = a * (p2 - FIT_CENTER) + b_centered
+            diff   = abs((p1 - FIT_CENTER) - y_pred)
+            f.write(f'{p1},{p2},{diff:.3f}\n')
 
 
 def analyze(t1, t2, lo, hi, label, args):
@@ -274,7 +286,7 @@ def plot_fit(full, rng, active_range, name1, name2, path):
         xx = np.linspace(x2.min() - 5, x2.max() + 5, 100)
         ax_fit.plot(x2, x1, 'o', color='tab:blue', ms=6, label='matched lines')
         ax_fit.plot(xx, a * xx + b, 'r-', lw=1.2,
-                   label=f'fit: y-{FIT_CENTER} = {a:.4f}(x-{FIT_CENTER}) + {b_c:.2f}')
+                   label=f"fit: y' = {a:.4f}x' + {b_c:.2f}")
         ax_fit.set_ylabel(f'{name1} pixel')
         ax_fit.set_title(f'{label}\nRMS={rms:.3f} px, n={len(x1)}')
         ax_fit.legend(fontsize=9, frameon=False)
@@ -285,8 +297,8 @@ def plot_fit(full, rng, active_range, name1, name2, path):
         ax_res.set_ylabel('Residual (px)')
         ax_res.set_title('Fit residuals')
 
-    fig.suptitle(f'Linear fit to matched line positions: '
-                f'(ref_px - {FIT_CENTER}) = a * (other_px - {FIT_CENTER}) + b')
+    fig.suptitle("Linear fit to matched line positions: y' = a * x' + b   "
+                f"(x' = other_px - {FIT_CENTER}, y' = ref_px - {FIT_CENTER})")
     fig.tight_layout()
     fig.savefig(path)
     plt.close(fig)
@@ -355,7 +367,7 @@ def main():
 
     if rng is not None:
         matches_path = os.path.join(args.outdir, f'{prefix}_active_range_matches.txt')
-        write_matches_table(rng['x1'], rng['x2'], matches_path)
+        write_matches_table(rng['x1'], rng['x2'], rng['a'], rng['b_centered'], matches_path)
         print(f'wrote {matches_path}')
 
 
