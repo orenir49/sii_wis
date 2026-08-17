@@ -25,8 +25,9 @@ DEFAULT_OUTPUT_DIR = './spad_data'
 # ---------------------------------------------------------------------------
 # Wire protocol keys  (must match spad_sender.py)
 # ---------------------------------------------------------------------------
-KEY_SETUP = 0xFFFFFFFF
-KEY_END   = 0xFFFFFFFE
+KEY_SETUP     = 0xFFFFFFFF
+KEY_END       = 0xFFFFFFFE
+KEY_INTENSITY = 326   # payload: utf-8 header + raw lSPAD `I` reply — see run_intensity_session()
 
 SPECIAL_KEY_TO_FILENAME = {
     320: 'master_dwell.bin',
@@ -35,7 +36,6 @@ SPECIAL_KEY_TO_FILENAME = {
     323: 'slave_dwell.bin',
     324: 'slave_line.bin',
     325: 'slave_frame.bin',
-    326: 'intensity.txt',
 }
 
 # ---------------------------------------------------------------------------
@@ -184,6 +184,51 @@ def run_session_loop(conn: socket.socket, log_fn=print,
                    f'({write_s:.1f} s in write'
                    + (f', {written / 1e6 / write_s:.0f} MB/s)' if write_s > 0.05 else ')'))
 
+    except ConnectionError:
+        log_fn('Sender disconnected.')
+    finally:
+        try:
+            stream.close()
+        except OSError:
+            pass
+
+
+def run_intensity_session(conn: socket.socket, filename: str, log_fn=print) -> None:
+    """
+    Handle one intensity-measurement session on an accepted connection.
+    Protocol: KEY_SETUP -> one KEY_INTENSITY chunk -> KEY_END.
+
+    Unlike run_session_loop(), this writes exactly one file (`filename`, under
+    the KEY_SETUP output dir) — an intensity measurement carries no per-pixel
+    stream, so there's no need for the 320 px_*.bin + sync-file bookkeeping.
+    """
+    stream = conn.makefile('rb', buffering=1 << 20)
+    try:
+        header          = readall(stream, 8)
+        key_id, n_bytes = struct.unpack('>II', header)
+        if key_id != KEY_SETUP:
+            raise RuntimeError(f'Expected KEY_SETUP, got 0x{key_id:08X}')
+
+        output_dir = readall(stream, n_bytes).decode('utf-8')
+        log_fn(f'[intensity] Output: {output_dir}')
+        os.makedirs(output_dir, exist_ok=True)
+        path = os.path.join(output_dir, filename)
+
+        written = 0
+        while True:
+            header          = readall(stream, 8)
+            key_id, n_bytes = struct.unpack('>II', header)
+            if key_id == KEY_END:
+                break
+            payload = readall(stream, n_bytes)
+            if key_id == KEY_INTENSITY:
+                with open(path, 'wb') as f:
+                    f.write(payload)
+                written = n_bytes
+            else:
+                log_fn(f'[intensity] WARNING: unexpected key_id 0x{key_id:08X} ignored')
+
+        log_fn(f'[intensity] Done — {written} bytes to {path}')
     except ConnectionError:
         log_fn('Sender disconnected.')
     finally:

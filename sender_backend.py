@@ -642,9 +642,10 @@ def run_intensity(sock: socket.socket, output_dir: str, duration: float,
     4-column rows), so a 3-line header is prepended rather than reformatting
     the data itself.
 
-    Sends KEY_SETUP, one chunk (header + raw reply), then KEY_END — same
-    session framing as run(), so run_session_loop() on the receiver handles
-    it with no special-casing beyond the key_id -> filename mapping.
+    Sends KEY_SETUP, one chunk (header + raw reply), then KEY_END — the
+    receiver's run_intensity_session() expects exactly this framing and
+    writes the chunk to a single file, with none of run_session_loop()'s
+    per-pixel bookkeeping (an intensity measurement carries no pixel stream).
 
     Returns the number of data lines written.
     """

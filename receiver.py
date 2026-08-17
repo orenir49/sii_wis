@@ -27,7 +27,7 @@ from tkinter import ttk, scrolledtext, messagebox
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from receiver_backend import start_server, check_connection, run_session_loop
+from receiver_backend import start_server, check_connection, run_session_loop, run_intensity_session
 from correlate import CorrelateWindow
 from offset_tools import estimate_offset
 import ssh_launcher
@@ -77,6 +77,7 @@ class NodePanel:
         self._event_accum: list = [0]              # [int] — incremented by data thread, read by GUI
         self._data_streaming = False
         self._session_active = False   # START sent, 'done'/'error' not yet received
+        self._pending_mode = 'timestamp'   # which receive loop the next accepted connection needs
 
         self._build_ui(parent, default_sender_ip, default_cmd_port, default_data_port, default_ssh_user)
         self._schedule_rate_update()
@@ -227,6 +228,7 @@ class NodePanel:
         if self._ctrl_sock is None or self._state == 'idle':
             return
         self._session_active = True
+        self._pending_mode = 'timestamp'
         recv_host  = self._ctrl_sock.getsockname()[0]
         recv_port  = int(self.data_port_var.get())
         output_dir = f'./spad_data/node{self.node_id}'
@@ -244,9 +246,10 @@ class NodePanel:
         if self._ctrl_sock is None or self._state == 'idle':
             return
         self._session_active = True
+        self._pending_mode = 'intensity'
         recv_host  = self._ctrl_sock.getsockname()[0]
         recv_port  = int(self.data_port_var.get())
-        output_dir = f'./spad_data/node{self.node_id}'
+        output_dir = './spad_data/intensity'
         self._output_dir = output_dir
         self._send_ctrl({
             'cmd':        'intensity',
@@ -338,7 +341,7 @@ class NodePanel:
             self._gui(lambda: self._set_data_status('idle'))
             n = msg.get('lines', 0)
             self.log_fn(f'[N{self.node_id}] Intensity measurement done — '
-                        f'{n} line(s) written to {self._output_dir}/intensity.txt\n')
+                        f'{n} line(s) written to {self._output_dir}/node{self.node_id}.txt\n')
         elif s == 'log':
             self.log_fn(f'[N{self.node_id}] {msg.get("msg", "")}\n')
         elif s == 'error':
@@ -428,18 +431,21 @@ class NodePanel:
             hooks[320] = self._master_dwell_q  # master_dwell — offset diagnostics
             hooks[323] = self._dwell_q         # slave_dwell — needed for clock-offset calibration
 
+            log_fn = lambda m: self.log_fn(
+                f'[N{self.node_id}] {m}' if m.endswith('\n') else f'[N{self.node_id}] {m}\n')
             try:
-                run_session_loop(
-                    conn,
-                    log_fn=lambda m: self.log_fn(
-                        f'[N{self.node_id}] {m}' if m.endswith('\n') else f'[N{self.node_id}] {m}\n'
-                    ),
-                    pixel_hooks=hooks,
-                    event_accum=self._event_accum,
-                    on_first_chunk=(
-                        (lambda: self._on_first_data_fn(self.node_id))
-                        if self._on_first_data_fn else None),
-                )
+                if self._pending_mode == 'intensity':
+                    run_intensity_session(conn, filename=f'node{self.node_id}.txt', log_fn=log_fn)
+                else:
+                    run_session_loop(
+                        conn,
+                        log_fn=log_fn,
+                        pixel_hooks=hooks,
+                        event_accum=self._event_accum,
+                        on_first_chunk=(
+                            (lambda: self._on_first_data_fn(self.node_id))
+                            if self._on_first_data_fn else None),
+                    )
             except Exception:
                 # Never let the accept loop die — otherwise the next START connects
                 # to a socket nobody ever reads.
