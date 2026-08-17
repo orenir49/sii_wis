@@ -1,7 +1,8 @@
 """Arc-line spectral alignment between two SPAD spectra.
 
 Detects emission lines in two classical-counting traces, matches them, fits the
-affine pixel mapping ref_px = a * other_px + b, and writes two figures.
+affine pixel mapping (ref_px - 160) = a * (other_px - 160) + b, and writes two
+figures plus a matched-lines table.
 """
 
 import argparse
@@ -23,6 +24,7 @@ N_ITER = 10
 N_TOP = 5
 HEADER_ROWS = 3
 ACTIVE_RANGE = (118, 216)  # pixel span covered by /gen_mask's default sparse mask
+FIT_CENTER = 160  # same center /gen_mask picks pixels closest to; keeps b near 0
 
 
 def load_trace(path):
@@ -143,6 +145,14 @@ def residual_table(x1, x2, a, b, top):
     return [(x1[i], x2[i], a * x2[i] + b, resid[i]) for i in order]
 
 
+def write_matches_table(x1, x2, path):
+    """Write every matched line pair as plain three-column text: pix1,pix2,diff."""
+    with open(path, 'w') as f:
+        f.write('pix1,pix2,diff\n')
+        for p1, p2 in zip(x1, x2):
+            f.write(f'{p1:.3f},{p2:.3f},{p1 - p2:.3f}\n')
+
+
 def analyze(t1, t2, lo, hi, label, args):
     """One full detect -> match -> affine-fit pass, restricted to pixels [lo, hi].
 
@@ -175,10 +185,14 @@ def analyze(t1, t2, lo, hi, label, args):
 
     x1, x2 = sub1[m1], sub2[m2]
     rms = float(np.sqrt(np.mean((x1 - (a * x2 + b)) ** 2)))
+    # b in the (ref = a*other + b) parameterization is the offset extrapolated
+    # back to other_px=0, far outside the data — re-centering on FIT_CENTER (a
+    # constant shift, same a) reports the offset where the lines actually are.
+    b_centered = b + FIT_CENTER * (a - 1)
 
-    print('  fit: ref_px = a * other_px + b')
+    print(f'  fit: (ref_px - {FIT_CENTER}) = a * (other_px - {FIT_CENTER}) + b')
     print(f'    a = {a:.6f}')
-    print(f'    b = {b:.3f}')
+    print(f'    b = {b_centered:.3f}')
     print(f'    matched lines: {len(x1)}     RMS = {rms:.3f} px')
     print(f'  top {min(args.top, len(x1))} best-matching lines (smallest |residual|):')
     print(f'    {"rank":>4}  {"ref px":>9}  {"other px":>9}  {"predicted":>10}  {"residual":>9}')
@@ -187,7 +201,7 @@ def analyze(t1, t2, lo, hi, label, args):
     print()
 
     return dict(pk1=pk1, pk2=pk2, sub1=sub1, sub2=sub2, m1=m1, m2=m2,
-                a=a, b=b, x1=x1, x2=x2, rms=rms)
+                a=a, b=b, b_centered=b_centered, x1=x1, x2=x2, rms=rms)
 
 
 def plot_traces(t1, t2, full, rng, active_range, labels, name1, name2, path):
@@ -255,10 +269,12 @@ def plot_fit(full, rng, active_range, name1, name2, path):
 
     for col, (label, res) in enumerate(cols):
         ax_fit, ax_res = axes[0][col], axes[1][col]
-        x1, x2, a, b, rms = res['x1'], res['x2'], res['a'], res['b'], res['rms']
+        x1, x2, a, b   = res['x1'], res['x2'], res['a'], res['b']
+        b_c, rms       = res['b_centered'], res['rms']
         xx = np.linspace(x2.min() - 5, x2.max() + 5, 100)
         ax_fit.plot(x2, x1, 'o', color='tab:blue', ms=6, label='matched lines')
-        ax_fit.plot(xx, a * xx + b, 'r-', lw=1.2, label=f'fit: y = {a:.4f}x + {b:.2f}')
+        ax_fit.plot(xx, a * xx + b, 'r-', lw=1.2,
+                   label=f'fit: y-{FIT_CENTER} = {a:.4f}(x-{FIT_CENTER}) + {b_c:.2f}')
         ax_fit.set_ylabel(f'{name1} pixel')
         ax_fit.set_title(f'{label}\nRMS={rms:.3f} px, n={len(x1)}')
         ax_fit.legend(fontsize=9, frameon=False)
@@ -269,7 +285,8 @@ def plot_fit(full, rng, active_range, name1, name2, path):
         ax_res.set_ylabel('Residual (px)')
         ax_res.set_title('Fit residuals')
 
-    fig.suptitle('Linear fit to matched line positions: ref_px = a * other_px + b')
+    fig.suptitle(f'Linear fit to matched line positions: '
+                f'(ref_px - {FIT_CENTER}) = a * (other_px - {FIT_CENTER}) + b')
     fig.tight_layout()
     fig.savefig(path)
     plt.close(fig)
@@ -335,6 +352,11 @@ def main():
     plot_fit(full, rng, (lo, hi), name1, name2, fit_path)
     print(f'wrote {traces_path}')
     print(f'wrote {fit_path}')
+
+    if rng is not None:
+        matches_path = os.path.join(args.outdir, f'{prefix}_active_range_matches.txt')
+        write_matches_table(rng['x1'], rng['x2'], matches_path)
+        print(f'wrote {matches_path}')
 
 
 if __name__ == '__main__':

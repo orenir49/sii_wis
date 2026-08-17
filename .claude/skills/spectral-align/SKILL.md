@@ -28,12 +28,19 @@ re-detects peaks, re-seeds the shift, and refits from scratch within that window
 whether the mapping actually derived from the pixels you'll really use agrees
 with the whole-detector one.
 
-Output is two affine mappings (`ref_px = a * other_px + b`, full and
-active-range) plus two PNGs written to `figs/`:
-`<ref>_vs_<other>_traces.png` (both traces, with the active-range band shaded and
-full-detector/active-range/unmatched detections marked separately) and
-`<ref>_vs_<other>_fit.png` (fitted line + residuals, full-detector and
-active-range side by side).
+Output is two affine mappings — `(ref_px - 160) = a * (other_px - 160) + b`,
+full and active-range. Centering the fit on pixel 160 (the same center
+`/gen_mask` picks pixels closest to) instead of reporting the raw
+other_px=0 intercept keeps `b` a small number that reads directly as the
+offset where the lines actually are, rather than a slope-amplified
+extrapolation far outside the data.
+
+Three files are written to `figs/`: `<ref>_vs_<other>_traces.png` (both
+traces, with the active-range band shaded and full-detector/active-range/
+unmatched detections marked separately), `<ref>_vs_<other>_fit.png` (fitted
+line + residuals, full-detector and active-range side by side), and
+`<ref>_vs_<other>_active_range_matches.txt` (every matched line pair within
+the active range, plain three-column text: `pix1,pix2,diff`).
 
 ## Steps
 
@@ -42,13 +49,13 @@ active-range side by side).
 2. Run the script with the venv python from the repo root:
    `.venv\Scripts\python.exe .claude\skills\spectral-align\align_arc.py REF.txt OTHER.txt`
 3. Pass through any non-default settings the user asked for (see Tuning below);
-   add `--outdir` only if they want the figures somewhere other than `figs/`, or
+   add `--outdir` only if they want the outputs somewhere other than `figs/`, or
    `--active-range LO HI` if the mask's active-pixel span isn't the default
    118–216 (e.g. after regenerating the mask with `/gen_mask`).
 4. Relay the script's output for **both** passes: `a`, `b`, the number of matched
    lines, the RMS, and the top-5 best-matching lines table for the full detector,
    then the same for the active range.
-5. Tell the user where the two figures were written.
+5. Tell the user where the two figures and the matches table were written.
 
 ## Tuning
 
