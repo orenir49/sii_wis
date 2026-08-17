@@ -3,7 +3,7 @@ Remote node launcher via SSH (paramiko).
 
 Sequence per node:
   1. SSH in (public-key auth, see ssh_key_path())
-  2. Find lSPAD.exe under C:\\Program Files (x86)\\SPADlambda
+  2. Find lSPAD.exe under C:\\Program Files (x86)\\SPADlambda\\lSPAD_standalone_win64
   3. Start lSPAD.exe GUI on remote desktop (detached)
   4. Wait for lSPAD TCP port (default 9999) to open
   5. Apply pixel mask via direct-tcpip tunnel  → M,<path>
@@ -26,6 +26,7 @@ class UncommittedChangesError(RuntimeError):
 
 DEFAULT_SSH_KEY   = r'~\.ssh\sii_wis_nodes'   # override with SII_WIS_SSH_KEY
 LSPAD_SEARCH_ROOT = r'C:\Program Files (x86)\SPADlambda'
+LSPAD_SUBDIR      = 'lSPAD_standalone_win64'
 LSPAD_EXE         = 'lSPAD.exe'
 SPAD_PORT         = 9999
 
@@ -76,9 +77,16 @@ def run_ps(client: paramiko.SSHClient, script: str) -> tuple[str, str]:
 
 
 def find_lspad_dir(client: paramiko.SSHClient) -> str | None:
-    """Return the directory containing lSPAD.exe, or None if not found."""
+    """Return the directory containing lSPAD.exe, or None if not found.
+
+    Only looks inside SPADlambda\\lSPAD_standalone_win64. Outdated lSPAD
+    versions also live directly under SPADlambda, in sibling subdirectories
+    with other names — searching all of SPADlambda would risk picking one of
+    those up instead.
+    """
+    target = f'{LSPAD_SEARCH_ROOT}\\{LSPAD_SUBDIR}'
     script = (
-        f"Get-ChildItem '{LSPAD_SEARCH_ROOT}' -Filter {LSPAD_EXE} "
+        f"Get-ChildItem '{target}' -Filter {LSPAD_EXE} "
         f"-Recurse -ErrorAction SilentlyContinue -Force | "
         f"Select-Object -First 1 -ExpandProperty DirectoryName"
     )
@@ -272,7 +280,8 @@ def ensure_lspad_running(host: str, username: str, log_fn,
 
         lspad_dir = find_lspad_dir(client)
         if not lspad_dir:
-            raise RuntimeError(f'lSPAD.exe not found under {LSPAD_SEARCH_ROOT!r}')
+            raise RuntimeError(
+                f'lSPAD.exe not found under {LSPAD_SEARCH_ROOT}\\{LSPAD_SUBDIR}')
         start_detached(client, lspad_dir + '\\' + LSPAD_EXE, 'GUI', lspad_dir)
         log_fn('lSPAD.exe started — waiting for TCP port …\n')
         if not wait_for_port(client, lspad_port, timeout=40):
@@ -362,7 +371,7 @@ def launch_node(host: str, username: str,
         lspad_dir = find_lspad_dir(client)
         if not lspad_dir:
             raise RuntimeError(
-                f'lSPAD.exe not found under {LSPAD_SEARCH_ROOT!r}')
+                f'lSPAD.exe not found under {LSPAD_SEARCH_ROOT}\\{LSPAD_SUBDIR}')
         log_fn(f'lSPAD found: {lspad_dir}\n')
 
         # 2. Start lSPAD.exe with GUI on remote desktop
