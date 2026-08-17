@@ -240,6 +240,22 @@ class NodePanel:
             'test':       test,
         })
 
+    def send_intensity(self, duration: float) -> None:
+        if self._ctrl_sock is None or self._state == 'idle':
+            return
+        self._session_active = True
+        recv_host  = self._ctrl_sock.getsockname()[0]
+        recv_port  = int(self.data_port_var.get())
+        output_dir = f'./spad_data/node{self.node_id}'
+        self._output_dir = output_dir
+        self._send_ctrl({
+            'cmd':        'intensity',
+            'recv_host':  recv_host,
+            'recv_port':  recv_port,
+            'output_dir': output_dir,
+            'duration':   duration,
+        })
+
     def is_finishing(self) -> bool:
         """True while a previous run is still being torn down.
 
@@ -310,11 +326,19 @@ class NodePanel:
             self.log_fn(f'[N{self.node_id}] Sender connecting to data port …\n')
         elif s == 'streaming':
             self._gui(lambda: self._set_data_status('streaming'))
+        elif s == 'measuring':
+            self._gui(lambda: self._set_data_status('measuring'))
         elif s == 'done':
             self._session_active = False
             self._gui(lambda: self._set_data_status('idle'))
             self.stop_dwell_drain()
             self._record_session_stats(msg.get('stats') or {})
+        elif s == 'intensity_done':
+            self._session_active = False
+            self._gui(lambda: self._set_data_status('idle'))
+            n = msg.get('lines', 0)
+            self.log_fn(f'[N{self.node_id}] Intensity measurement done — '
+                        f'{n} line(s) written to {self._output_dir}/intensity.txt\n')
         elif s == 'log':
             self.log_fn(f'[N{self.node_id}] {msg.get("msg", "")}\n')
         elif s == 'error':
@@ -600,6 +624,9 @@ class NodePanel:
         if state == 'streaming':
             self.data_status_var.set('  Data: ● Streaming')
             self._data_lbl.config(fg='#33aa33')
+        elif state == 'measuring':
+            self.data_status_var.set('  Data: ● Measuring intensity')
+            self._data_lbl.config(fg='#33aa33')
         elif state == 'stopping':
             self.data_status_var.set('  Data: ● Aborting — discarding what will not drain')
             self._data_lbl.config(fg='#cc8800')
@@ -693,11 +720,11 @@ class ReceiverGUI:
         acq.grid(row=1, column=0, padx=10, pady=6, sticky='ew')
 
         ttk.Label(acq, text='Mode:').grid(row=0, column=0, sticky='w', padx=8, pady=6)
-        self.test_var = tk.BooleanVar(value=False)
-        ttk.Radiobutton(acq, text='Real', variable=self.test_var,
-                        value=False).grid(row=0, column=1, sticky='w')
-        ttk.Radiobutton(acq, text='Monitor', variable=self.test_var,
-                        value=True).grid(row=0, column=2, sticky='w', padx=(0, 16))
+        self.mode_var = tk.StringVar(value='Timestamp')
+        ttk.Combobox(acq, textvariable=self.mode_var,
+                    values=['Timestamp', 'Intensity', 'Monitor'],
+                    state='readonly', width=10).grid(
+            row=0, column=1, columnspan=2, sticky='w', padx=(0, 16))
 
         ttk.Label(acq, text=f'Sparse waveform calibration (auto {SPARSE_CAL_WAVEFORM_S:.2f} s)',
                   ).grid(row=1, column=0, columnspan=5, sticky='w', padx=8, pady=(0, 6))
@@ -764,8 +791,15 @@ class ReceiverGUI:
             self._enqueue_log('Error: duration must be a non-negative number (0 = indefinite).\n')
             return
 
-        if self.test_var.get():
+        mode = self.mode_var.get()
+        if mode == 'Monitor':
             self._start_monitor(duration)
+            return
+        if mode == 'Intensity':
+            if duration <= 0:
+                self._enqueue_log('Error: Intensity measurement requires a duration > 0.\n')
+                return
+            self._start_intensity(duration)
             return
 
         busy = [n.node_id for n in (self.node1, self.node2)
@@ -851,6 +885,36 @@ class ReceiverGUI:
         else:
             self._set_cal_status('● Aborted — not calibrated', color='#cc8800')
             self._enqueue_log('ABORT sent to all connected nodes.\n')
+
+    # ------------------------------------------------------------------
+    # Intensity mode  (lSPAD classical intensity measurement)
+    # ------------------------------------------------------------------
+
+    def _start_intensity(self, duration: float) -> None:
+        busy = [n.node_id for n in (self.node1, self.node2)
+                if n.is_ready() and n.is_finishing()]
+        if busy:
+            self._enqueue_log(
+                f'Node(s) {busy} are still finishing the previous run — wait for\n'
+                f'  Data: Idle before starting again.\n')
+            return
+
+        sent = 0
+        for node in (self.node1, self.node2):
+            if node.is_ready():
+                node.send_intensity(duration)
+                sent += 1
+
+        if sent == 0:
+            self._enqueue_log('No nodes connected — nothing started.\n')
+            return
+
+        self._run_id += 1
+        self._enqueue_log(f'Intensity measurement sent to {sent} node(s) ({duration} s).\n')
+        self._show_progress_bar()
+        self._set_progress(0)
+        step_ms = max(1, int(duration / 10 * 1000))
+        self._schedule_progress(step_ms, 1, self._run_id)
 
     # ------------------------------------------------------------------
     # Monitor mode  (environmental polling via SSH R command)

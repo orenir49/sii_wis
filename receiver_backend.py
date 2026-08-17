@@ -35,6 +35,7 @@ SPECIAL_KEY_TO_FILENAME = {
     323: 'slave_dwell.bin',
     324: 'slave_line.bin',
     325: 'slave_frame.bin',
+    326: 'intensity.txt',
 }
 
 # ---------------------------------------------------------------------------

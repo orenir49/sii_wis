@@ -71,6 +71,9 @@ class SpadSenderGUI:
         elif e == 'streaming':
             self.data_var.set('● Acquiring')
             self._data_lbl.config(fg='#33aa33')
+        elif e == 'measuring':
+            self.data_var.set('● Measuring intensity')
+            self._data_lbl.config(fg='#33aa33')
         elif e == 'idle':
             self.data_var.set('● Standing by')
             self._data_lbl.config(fg='#888888')

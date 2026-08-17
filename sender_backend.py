@@ -96,8 +96,9 @@ SPECIAL_KEY = {
     ('slave',  'line'):  324,
     ('slave',  'frame'): 325,
 }
-KEY_SETUP = 0xFFFFFFFF   # payload: utf-8 output directory
-KEY_END   = 0xFFFFFFFE   # payload: empty — signals end of one session
+KEY_SETUP     = 0xFFFFFFFF   # payload: utf-8 output directory
+KEY_END       = 0xFFFFFFFE   # payload: empty — signals end of one session
+KEY_INTENSITY = 326          # payload: utf-8 header + raw lSPAD `I` reply (px,count,px2,count2)
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -629,6 +630,85 @@ def run(sock: socket.socket,
     return stats
 
 
+def run_intensity(sock: socket.socket, output_dir: str, duration: float,
+                   log_fn=print) -> int:
+    """
+    Run one classical intensity measurement (lSPAD's `I` command) and relay
+    the raw reply to the receiver as a single KEY_INTENSITY chunk.
+
+    lSPAD's reply (160 lines of `px,count,px2,count2`) is passed through
+    unmodified — this is the same layout the spectral-align skill's
+    align_arc.py expects (comma-separated, HEADER_ROWS header lines then
+    4-column rows), so a 3-line header is prepended rather than reformatting
+    the data itself.
+
+    Sends KEY_SETUP, one chunk (header + raw reply), then KEY_END — same
+    session framing as run(), so run_session_loop() on the receiver handles
+    it with no special-casing beyond the key_id -> filename mapping.
+
+    Returns the number of data lines written.
+    """
+    outdir_bytes = output_dir.encode('utf-8')
+    sock.sendall(struct.pack('>II', KEY_SETUP, len(outdir_bytes)) + outdir_bytes)
+
+    try:
+        spad_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        spad_sock.settimeout(LSPAD_HANDSHAKE_S)
+        spad_sock.connect((SPAD_HOST, SPAD_PORT))
+        try:
+            # Clear any leftover acquisition before issuing I — same reasoning
+            # as run()'s pre-START STOP: lSPAD streams to every connected
+            # client, so a stale backlog would otherwise be read as part of
+            # the I reply.
+            spad_sock.sendall(b'STOP\n')
+            drain_lspad(spad_sock, quiet_for=0.4, cap=PRESTART_DRAIN_S)
+
+            ms = int(duration * 1000)
+            spad_sock.sendall(f'I,{ms}\n'.encode('utf8'))
+
+            # lSPAD blocks silently for the whole measurement before replying
+            # at all, so drain_lspad's "read until quiet" can't wait for the
+            # first byte — it would see silence immediately (nothing has been
+            # sent yet) and return empty well before the measurement is done.
+            # Block for the reply explicitly, then mop up any trailing bytes.
+            wait_s = duration + LSPAD_HANDSHAKE_S
+            spad_sock.settimeout(wait_s)
+            try:
+                first = spad_sock.recv(1 << 16)
+            except socket.timeout:
+                raise RuntimeError(
+                    f'lSPAD did not reply to I,{ms} within {wait_s:.0f} s '
+                    '(measurement time + handshake margin) — check lSPAD is running.')
+            if not first:
+                raise RuntimeError(f'lSPAD closed the connection with no reply to I,{ms}')
+            more, more_n = drain_lspad(spad_sock, quiet_for=0.3, cap=2.0, keep=1 << 16)
+            reply   = first + more
+            n_bytes = len(first) + more_n
+            if not is_text_reply(reply):
+                raise RuntimeError(
+                    f'lSPAD is still streaming: I,{ms} returned {n_bytes:,} '
+                    'bytes of binary data instead of an intensity reply. A '
+                    'previous acquisition was not stopped.')
+
+            n_lines = reply.count(b'\n')
+            header = (f'# Classical intensity measurement (lSPAD `I` command)\n'
+                      f'# duration_ms={ms}\n'
+                      f'# pixel,counts,pixel,counts\n').encode('utf8')
+            payload = header + reply
+            sock.sendall(struct.pack('>II', KEY_INTENSITY, len(payload)) + payload)
+            log_fn(f'Intensity measurement done — {n_lines} line(s).\n')
+            return n_lines
+        finally:
+            spad_sock.close()
+    finally:
+        try:
+            sock.sendall(struct.pack('>II', KEY_END, 0))
+        except OSError as exc:
+            log_fn(f'KEY_END failed: {exc!r}\n')
+            if sys.exc_info()[0] is None:
+                raise
+
+
 # ---------------------------------------------------------------------------
 # Command server  (receiver GUI drives acquisitions remotely)
 # ---------------------------------------------------------------------------
@@ -739,6 +819,24 @@ def _handle_controller(conn: socket.socket, status_fn) -> None:
                         daemon=True,
                     )
                     acq_thread.start()
+                elif cmd == 'intensity':
+                    if acq_thread and acq_thread.is_alive():
+                        age = time.time() - acq_started
+                        send({'status': 'busy'})
+                        send({'status': 'log',
+                              'msg': f'INTENSITY refused: {acq_thread.name} still '
+                                     f'alive after {age:.1f} s '
+                                     f'(stop_event set={stop_event.is_set()})\n'})
+                        continue
+                    stop_event  = threading.Event()
+                    soft_event  = threading.Event()
+                    acq_started = time.time()
+                    acq_thread = threading.Thread(
+                        target=_run_intensity_cmd,
+                        args=(msg, send, status_fn),
+                        daemon=True,
+                    )
+                    acq_thread.start()
                 elif cmd == 'stop' and msg.get('mode') == 'soft':
                     # Drain everything lSPAD has buffered; discard nothing.
                     if stop_event is not None:
@@ -787,6 +885,33 @@ def _run_acquisition_cmd(params: dict, stop_event: threading.Event,
         send_ctrl({'status': 'error', 'msg': f'{type(exc).__name__}: {exc}'})
         send_ctrl({'status': 'log',
                    'msg': f'acquisition traceback:\n{traceback.format_exc()}\n'})
+
+
+def _run_intensity_cmd(params: dict, send_ctrl, status_fn) -> None:
+    try:
+        recv_host  = params['recv_host']
+        recv_port  = int(params['recv_port'])
+        output_dir = params['output_dir']
+        duration   = float(params['duration'])
+
+        send_ctrl({'status': 'connecting'})
+        sock = connect_receiver(recv_host, recv_port)
+        send_ctrl({'status': 'measuring'})
+        status_fn({'event': 'measuring'})
+
+        n_lines = 0
+        try:
+            n_lines = run_intensity(
+                sock, output_dir, duration,
+                log_fn=lambda msg: send_ctrl({'status': 'log', 'msg': msg}))
+        finally:
+            sock.close()
+
+        send_ctrl({'status': 'intensity_done', 'lines': n_lines})
+    except Exception as exc:
+        send_ctrl({'status': 'error', 'msg': f'{type(exc).__name__}: {exc}'})
+        send_ctrl({'status': 'log',
+                   'msg': f'intensity measurement traceback:\n{traceback.format_exc()}\n'})
     finally:
         status_fn({'event': 'idle'})
 
