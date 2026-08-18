@@ -531,7 +531,7 @@ class CorrelateWindow(tk.Toplevel):
         if self.mode_var.get() == 'distribution':
             self._draw_distribution(hist)
         else:
-            self.ax.stairs(plot_data, bins / scale, fill=True, color='steelblue', linewidth=0)
+            self.ax.step(centers / scale, plot_data, where='mid', color='steelblue', linewidth=1)
             self.ax.set_xlabel(f'τ ({unit})')
             self.ax.set_ylabel(ylabel)
             self.ax.set_title(title)
