@@ -138,6 +138,34 @@ def icp_affine_fit(px1, px2, a0, b0, tol_start, tol_final, n_iter):
     return float(a), float(b), np.array(m1, dtype=int), np.array(m2, dtype=int)
 
 
+def robust_refit(x1, x2, tol, min_keep=4):
+    """Drop the single worst-residual pair and refit, repeating while the
+    worst residual still exceeds `tol` (and enough pairs remain to trust a
+    refit). Returns (a, b, keep_mask).
+
+    icp_affine_fit's matching is one-directional nearest-neighbour with no
+    exclusivity: an "extra" peak on one side that has no true counterpart
+    (different peak counts between traces are normal — a line can be too
+    faint to clear one trace's threshold) still gets force-paired to
+    whatever's nearest at the loose early tolerance, and that wrong pair
+    then counts equally in the least-squares refit. A handful of genuine
+    matches easily outvotes one bad pair on the full detector's ~20 points;
+    on the active range's ~13 it can visibly tilt the line. This is plain
+    sigma-clipping: iteratively remove the worst offender and refit.
+    """
+    keep = np.ones(len(x1), dtype=bool)
+    while keep.sum() > min_keep:
+        idx   = np.nonzero(keep)[0]
+        a, b  = np.polyfit(x2[idx], x1[idx], 1)
+        resid = x1[idx] - (a * x2[idx] + b)
+        worst = int(np.argmax(np.abs(resid)))
+        if abs(resid[worst]) <= tol:
+            break
+        keep[idx[worst]] = False
+    a, b = np.polyfit(x2[keep], x1[keep], 1)
+    return float(a), float(b), keep
+
+
 def residual_table(x1, x2, a, b, top):
     """Matched lines sorted by |residual|, best `top` first."""
     resid = x1 - (a * x2 + b)
@@ -165,16 +193,27 @@ def write_matches_table(x1, x2, a, b_centered, path, top=5):
             f.write(f'{p1},{p2},{diff:.3f}\n')
 
 
-def analyze(t1, t2, lo, hi, label, args):
+def analyze(t1, t2, lo, hi, label, args, prom_override=(None, None)):
     """One full detect -> match -> affine-fit pass, restricted to pixels [lo, hi].
 
     Passing lo=0, hi=huge reduces to the unrestricted full-detector analysis
     (find_lines clips hi to each trace's own length). Returns a results dict,
     or None if too few peaks were found or too few lines matched — printing
     why either way.
+
+    prom_override: optional (prom1, prom2) absolute prominences to use instead
+    of recomputing from the windowed slice's own median/max. A narrower window
+    can have a lower local dynamic range than the full trace, so recomputing
+    can pick up a peak the full-detector pass correctly ignored as noise —
+    desynchronising the nearest-neighbour matching for every line past it.
+    Passing the full-detector pass's own prominences keeps "is this a real
+    line" consistent between the two passes.
     """
-    pk1, sub1, prom1, n1 = find_lines(t1, lo, hi, args.rel_prominence, args.prominence)
-    pk2, sub2, prom2, n2 = find_lines(t2, lo, hi, args.rel_prominence, args.prominence)
+    prom1_ov, prom2_ov = prom_override
+    prom1_abs = prom1_ov if prom1_ov is not None else args.prominence
+    prom2_abs = prom2_ov if prom2_ov is not None else args.prominence
+    pk1, sub1, prom1, n1 = find_lines(t1, lo, hi, args.rel_prominence, prom1_abs)
+    pk2, sub2, prom2, n2 = find_lines(t2, lo, hi, args.rel_prominence, prom2_abs)
 
     print(f'--- {label} (pixels {lo}-{min(hi, len(t1) - 1, len(t2) - 1)}) ---')
     print(f'ref   : {n1} px, {len(pk1)} peaks, prominence {prom1:.0f}')
@@ -196,6 +235,17 @@ def analyze(t1, t2, lo, hi, label, args):
         return None
 
     x1, x2 = sub1[m1], sub2[m2]
+    a, b, keep = robust_refit(x1, x2, args.tol_final)
+    n_dropped = int((~keep).sum())
+    if n_dropped:
+        print(f'  dropped {n_dropped} outlier pair(s) still exceeding '
+              f'{args.tol_final} px after refit - an unmatched extra peak on '
+              f'one side was likely force-paired during matching')
+    x1, x2, m1, m2 = x1[keep], x2[keep], m1[keep], m2[keep]
+    if len(x1) < 2:
+        print('  skipped: fewer than 2 pairs survived outlier rejection\n')
+        return None
+
     rms = float(np.sqrt(np.mean((x1 - (a * x2 + b)) ** 2)))
     # b in the (ref = a*other + b) parameterization is the offset extrapolated
     # back to other_px=0, far outside the data — re-centering on FIT_CENTER (a
@@ -213,7 +263,8 @@ def analyze(t1, t2, lo, hi, label, args):
     print()
 
     return dict(pk1=pk1, pk2=pk2, sub1=sub1, sub2=sub2, m1=m1, m2=m2,
-                a=a, b=b, b_centered=b_centered, x1=x1, x2=x2, rms=rms)
+                a=a, b=b, b_centered=b_centered, x1=x1, x2=x2, rms=rms,
+                prom1=prom1, prom2=prom2)
 
 
 def plot_traces(t1, t2, full, rng, active_range, labels, name1, name2, path):
@@ -351,8 +402,11 @@ def main():
 
     # Active-mask range second — independently re-detects, re-seeds, and refits
     # using only the pixels the sparse mask actually samples, rather than
-    # filtering the full-detector fit's matches down to that span.
-    rng = analyze(t1, t2, lo, hi, f'Active mask range', args)
+    # filtering the full-detector fit's matches down to that span. Reuses the
+    # full-detector pass's own prominences (see analyze()'s docstring) so a
+    # narrower window doesn't invent a peak the full pass calls noise.
+    rng = analyze(t1, t2, lo, hi, 'Active mask range', args,
+                 prom_override=(full['prom1'], full['prom2']))
     if rng is None:
         print(f'warning: active-range ({lo}-{hi}) fit did not converge — plotting '
               'the full-detector fit only\n', file=sys.stderr)

@@ -26,7 +26,15 @@ a real sparse-masked acquisition). The range-restricted pass independently
 re-detects peaks, re-seeds the shift, and refits from scratch within that window
 — it does not just filter the full-detector fit's matches — so it tells you
 whether the mapping actually derived from the pixels you'll really use agrees
-with the whole-detector one.
+with the whole-detector one. It reuses the full-detector pass's own
+prominences rather than recomputing from the narrower window (a smaller
+window can have a lower local dynamic range and invent a peak the full pass
+correctly calls noise), and after ICP converges it sigma-clips: an "extra"
+peak with no true counterpart (normal — a line can be too faint for one
+trace's threshold) still gets force-paired to its nearest candidate at the
+loose early-iteration tolerance, and on the active range's small sample that
+one bad pair can visibly tilt the whole line, so the worst-residual pair is
+dropped and refit repeats until nothing exceeds `--tol-final`.
 
 Output is two affine mappings — `(ref_px - 160) = a * (other_px - 160) + b`,
 full and active-range. Centering the fit on pixel 160 (the same center
@@ -59,7 +67,9 @@ lands from what the fit predicts from the rounded other pixel.
    118–216 (e.g. after regenerating the mask with `/gen_mask`).
 4. Relay the script's output for **both** passes: `a`, `b`, the number of matched
    lines, the RMS, and the top-5 best-matching lines table for the full detector,
-   then the same for the active range.
+   then the same for the active range. Mention it if a pass reports dropping an
+   outlier pair — that's the sigma-clip catching a mismatched line, not a
+   silent failure.
 5. Tell the user where the two figures and the matches table were written.
 
 ## Tuning
