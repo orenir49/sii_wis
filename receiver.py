@@ -28,7 +28,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from receiver_backend import start_server, check_connection, run_session_loop, run_intensity_session
-from correlate import CorrelateWindow
+from correlate import CorrelateWindow, QuadCorrelateWindow
 from offset_tools import estimate_offset
 import ssh_launcher
 
@@ -686,6 +686,12 @@ class ReceiverGUI:
         self._cal_deadline = 0.0
 
         self._correlate_win = CorrelateWindow(root)
+        # Separate tool for a 2-pixel-per-node mask (e.g. mask_two.txt) --
+        # not unified with the single-pair correlator above. If both are
+        # enabled with an overlapping (node, pixel-loc), the hooks merge
+        # below lets whichever is spread second in the dict win; the other
+        # silently gets no data for that pixel.
+        self._quad_correlate_win = QuadCorrelateWindow(root)
         self._monitor_abort: threading.Event | None = None
         self._build_ui()
         self._poll_log()
@@ -707,7 +713,8 @@ class ReceiverGUI:
                                default_data_port=50007,
                                default_ssh_user='labcomp1',
                                log_fn=self._enqueue_log,
-                               get_hooks_fn=lambda: self._correlate_win.hooks_node1,
+                               get_hooks_fn=lambda: {**self._correlate_win.hooks_node1,
+                                                     **self._quad_correlate_win.hooks_node1},
                                set_correlate_pixel_fn=lambda pix: self._correlate_win.px1_var.set(str(pix)),
                                on_first_data_fn=self._on_node_first_data)
         self.node2 = NodePanel(nodes_frame, self.root,
@@ -717,7 +724,8 @@ class ReceiverGUI:
                                default_data_port=50008,
                                default_ssh_user='oreni',
                                log_fn=self._enqueue_log,
-                               get_hooks_fn=lambda: self._correlate_win.hooks_node2,
+                               get_hooks_fn=lambda: {**self._correlate_win.hooks_node2,
+                                                     **self._quad_correlate_win.hooks_node2},
                                set_correlate_pixel_fn=lambda pix: self._correlate_win.px2_var.set(str(pix)),
                                on_first_data_fn=self._on_node_first_data)
 
@@ -839,7 +847,7 @@ class ReceiverGUI:
             step_ms = max(1, int(duration / 10 * 1000))
             self._schedule_progress(step_ms, 1, self._run_id)
 
-        if self._correlate_win.is_enabled:
+        if self._correlate_win.is_enabled or self._quad_correlate_win.is_enabled:
             # Wait for data to actually flow before opening the calibration
             # window. Between START and the first timestamp the sender still has
             # to reach the receiver and negotiate with lSPAD (STOP, drain,
@@ -1188,6 +1196,7 @@ class ReceiverGUI:
                 f'● Calibration failed ({t1.size}/{t2.size} events) — offset = 0',
                 color='#cc3333')
             self._correlate_win.start_with_offset(0)
+            self._quad_correlate_win.start_with_offset(0)
             self.node1.start_dwell_drain()
             self.node2.start_dwell_drain()
             return
@@ -1239,6 +1248,7 @@ class ReceiverGUI:
             f'● Calibrated — offset {slave_offset:+,} ps, acquisition running',
             color='#228822')
         self._correlate_win.start_with_offset(slave_offset)
+        self._quad_correlate_win.start_with_offset(slave_offset)
         self.node1.start_dwell_drain()
         self.node2.start_dwell_drain()
 

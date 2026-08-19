@@ -24,6 +24,6 @@ or remapping involved.
 3. Write a text file listing every integer in 0-319 that is *not* in the
    active set, one per line, ascii, trailing newline (same format as
    `generate_mask_content()`).
-4. Save it under `masks/<descriptive-name>.txt` in the repo root (create
-   the directory if it doesn't exist).
+4. Save it under `.claude/masks/<descriptive-name>.txt` (create the
+   directory if it doesn't exist).
 5. Tell the user which pixels are active and where the file was written.

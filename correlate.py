@@ -11,7 +11,9 @@ No event is ever dropped to keep up. If the correlator falls behind the detector
 the backlog simply grows, and the status line reports how far behind it is.
 """
 
+import os
 import queue
+import sys
 import threading
 import tkinter as tk
 from tkinter import ttk
@@ -23,6 +25,9 @@ import matplotlib
 matplotlib.use('TkAgg')
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tools'))
+from sii_calculator import SIICalculatorWindow
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +176,10 @@ class CorrelateWindow(tk.Toplevel):
             row=5, column=2, sticky='w', padx=(2, 6))
         self.expected_var.trace_add('write', self._on_display_change)
 
+        ttk.Button(cfg, text='Compute R…', width=12,
+                   command=self._open_r_calculator).grid(
+            row=5, column=3, padx=(2, 6), sticky='w')
+
         btn_row = ttk.Frame(cfg)
         btn_row.grid(row=6, column=2, columnspan=2, padx=8, pady=4)
         ttk.Button(btn_row, text='Enable',     width=8,
@@ -233,6 +242,10 @@ class CorrelateWindow(tk.Toplevel):
         if bw <= 0 or tmax <= 0 or nshift <= 0:
             raise ValueError('bin_width, tmax, n_shift must be positive')
         return px1, px2, bw, tmax, nshift
+
+    def _open_r_calculator(self) -> None:
+        SIICalculatorWindow(self, initial_td_ps=self.bw_var.get(),
+                            on_apply=lambda r: self.expected_var.set(r))
 
     # ------------------------------------------------------------------
     # Enable / disable / reset
@@ -588,6 +601,501 @@ class CorrelateWindow(tk.Toplevel):
             px1, px2, _, _, _ = self._get_params()
         except Exception:
             return
+        suffix = self.suffix_var.get().strip()
+        name   = f'{px1}_{px2}_{suffix}' if suffix else f'{px1}_{px2}'
+        path   = f'.\\spad_data\\{name}.txt'
+        try:
+            with open(path, 'w') as f:
+                f.write('tau_ps\tcounts\n')
+                for tau, count in zip(centers, hist):
+                    f.write(f'{tau:.6f}\t{count}\n')
+        except OSError as exc:
+            self.status_var.set(f'Write error: {exc}')
+
+
+# ---------------------------------------------------------------------------
+# QuadCorrelateWindow — 2 pixels/node, 4 pairwise cross-correlations
+# ---------------------------------------------------------------------------
+
+class _Channel:
+    """One physical (node, pixel) tap: queue + pending chunks + accumulated array."""
+
+    def __init__(self) -> None:
+        self.q: queue.Queue = queue.Queue()
+        self.pending: list = []
+        self.arr = np.empty(0, dtype=np.int64)
+
+    def reset(self) -> None:
+        self.pending = []
+        self.arr = np.empty(0, dtype=np.int64)
+        while not self.q.empty():
+            try:
+                self.q.get_nowait()
+            except queue.Empty:
+                break
+
+    def drain(self, accumulating: bool) -> bool:
+        """Move queued chunks into `pending`. Returns True if new data arrived."""
+        new_data = False
+        while True:
+            try:
+                raw = self.q.get_nowait()
+                if accumulating:
+                    self.pending.append(np.frombuffer(raw, dtype=np.int64).copy())
+                    new_data = True
+            except queue.Empty:
+                break
+        return new_data
+
+    def merge(self) -> None:
+        if self.pending:
+            self.arr = np.concatenate([self.arr] + self.pending)
+            self.pending = []
+
+
+class QuadCorrelateWindow(tk.Toplevel):
+    """Live g² correlator for exactly 2 pixels per node (4 pairwise pairs).
+
+    Purpose-built for a 2-active-pixel mask (e.g. mask_two.txt) — not a
+    general N-pixel correlator. For a single active pixel per node, use
+    CorrelateWindow instead; the two tools are independent, not unified.
+
+    Each node only has 2 physical pixel streams here, so there are only 4
+    queues to tap in total, but each stream feeds 2 of the 4 pairs (e.g.
+    node1's pixel A is the t1-side of both 'aa' and 'ab'). A stream shared
+    by 2 pairs can only be trimmed as far as the more conservative of the
+    two pairs' release points — see _launch_correlation.
+    """
+
+    PAIR_KEYS = ('aa', 'ab', 'ba', 'bb')
+
+    def __init__(self, parent: tk.Tk) -> None:
+        super().__init__(parent)
+        self.title('Live g² Correlator — 4 pairs')
+        self.resizable(True, True)
+        self.geometry('+60+60')
+
+        self._ch1a = _Channel()
+        self._ch1b = _Channel()
+        self._ch2a = _Channel()
+        self._ch2b = _Channel()
+
+        self._active       = False
+        self._accumulating = False
+        self._offset: int | None = None
+        self._correlating  = False
+        self._has_new_data = False
+        self._result_q: queue.Queue = queue.Queue()
+
+        self._hist = {k: None for k in self.PAIR_KEYS}
+        self._bins = {k: None for k in self.PAIR_KEYS}
+
+        self._build_ui()
+
+        self.status_var.set('Compiling correlation kernel …')
+        threading.Thread(target=self._prewarm_thread, daemon=True).start()
+
+        self._poll_data()
+        self._poll_results()
+
+    # ------------------------------------------------------------------
+    # UI
+    # ------------------------------------------------------------------
+
+    def _build_ui(self) -> None:
+        cfg = ttk.LabelFrame(self, text='Parameters (shared across all 4 pairs)')
+        cfg.grid(row=0, column=0, padx=10, pady=8, sticky='ew')
+
+        ttk.Label(cfg, text='Node 1 pixel A (loc):').grid(
+            row=0, column=0, padx=6, pady=4, sticky='w')
+        self.px1a_var = tk.StringVar(value='147')
+        ttk.Entry(cfg, textvariable=self.px1a_var, width=6).grid(
+            row=0, column=1, sticky='w')
+
+        ttk.Label(cfg, text='Node 1 pixel B (loc):').grid(
+            row=0, column=2, padx=(16, 6), sticky='w')
+        self.px1b_var = tk.StringVar(value='168')
+        ttk.Entry(cfg, textvariable=self.px1b_var, width=6).grid(
+            row=0, column=3, sticky='w')
+
+        ttk.Label(cfg, text='Node 2 pixel A (loc):').grid(
+            row=1, column=0, padx=6, pady=4, sticky='w')
+        self.px2a_var = tk.StringVar(value='147')
+        ttk.Entry(cfg, textvariable=self.px2a_var, width=6).grid(
+            row=1, column=1, sticky='w')
+
+        ttk.Label(cfg, text='Node 2 pixel B (loc):').grid(
+            row=1, column=2, padx=(16, 6), sticky='w')
+        self.px2b_var = tk.StringVar(value='168')
+        ttk.Entry(cfg, textvariable=self.px2b_var, width=6).grid(
+            row=1, column=3, sticky='w')
+
+        ttk.Label(cfg, text='Bin width (ps):').grid(
+            row=2, column=0, padx=6, pady=4, sticky='w')
+        self.bw_var = tk.StringVar(value='200')
+        ttk.Entry(cfg, textvariable=self.bw_var, width=10).grid(
+            row=2, column=1, sticky='w')
+
+        ttk.Label(cfg, text='tmax (ps):').grid(
+            row=2, column=2, padx=(16, 6), sticky='w')
+        self.tmax_var = tk.StringVar(value='500000')
+        ttk.Entry(cfg, textvariable=self.tmax_var, width=10).grid(
+            row=2, column=3, sticky='w')
+
+        ttk.Label(cfg, text='n_shift:').grid(
+            row=3, column=0, padx=6, pady=4, sticky='w')
+        self.nshift_var = tk.StringVar(value='20')
+        ttk.Entry(cfg, textvariable=self.nshift_var, width=6).grid(
+            row=3, column=1, sticky='w')
+
+        ttk.Label(cfg, text='Update interval (s):').grid(
+            row=3, column=2, padx=(16, 6), sticky='w')
+        self.interval_var = tk.StringVar(value='0.5')
+        ttk.Entry(cfg, textvariable=self.interval_var, width=8).grid(
+            row=3, column=3, sticky='w')
+
+        ttk.Label(cfg, text='Suffix:').grid(
+            row=4, column=0, padx=6, pady=4, sticky='w')
+        self.suffix_var = tk.StringVar(value='g2')
+        ttk.Entry(cfg, textvariable=self.suffix_var, width=32).grid(
+            row=4, column=1, columnspan=3, sticky='w')
+
+        btn_row = ttk.Frame(cfg)
+        btn_row.grid(row=5, column=2, columnspan=2, padx=8, pady=4)
+        ttk.Button(btn_row, text='Enable',     width=8,
+                   command=self._enable).grid(row=0, column=0, padx=3)
+        ttk.Button(btn_row, text='Disable',    width=8,
+                   command=self._disable).grid(row=0, column=1, padx=3)
+        ttk.Button(btn_row, text='Reset data', width=10,
+                   command=self._reset).grid(row=0, column=2, padx=3)
+
+        self.status_var = tk.StringVar(value='Disabled.')
+        ttk.Label(cfg, textvariable=self.status_var, anchor='w').grid(
+            row=6, column=0, columnspan=4, sticky='w', padx=6, pady=(2, 4))
+
+        fig_frame = ttk.LabelFrame(self, text='g² Histograms')
+        fig_frame.grid(row=1, column=0, padx=10, pady=(0, 10), sticky='nsew')
+
+        self.fig = Figure(figsize=(9, 7))
+        axes = self.fig.subplots(2, 2)
+        self.ax = {'aa': axes[0][0], 'ab': axes[0][1],
+                   'ba': axes[1][0], 'bb': axes[1][1]}
+        for key, ax in self.ax.items():
+            ax.set_xlabel('τ (ps)')
+            ax.set_ylabel('Counts')
+            ax.set_title(f'{key} — waiting for data')
+        self.fig.tight_layout()
+
+        self.canvas = FigureCanvasTkAgg(self.fig, master=fig_frame)
+        self.canvas.get_tk_widget().pack(padx=6, pady=6, fill='both', expand=True)
+
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(1, weight=1)
+
+    @property
+    def is_enabled(self) -> bool:
+        return self._active
+
+    def _prewarm_thread(self) -> None:
+        _prewarm()
+        self.after(0, lambda: self.status_var.set(
+            'Ready. Click Enable to start intercepting data.'))
+
+    # ------------------------------------------------------------------
+    # Parameter parsing
+    # ------------------------------------------------------------------
+
+    def _get_params(self) -> tuple:
+        px1a   = int(self.px1a_var.get())
+        px1b   = int(self.px1b_var.get())
+        px2a   = int(self.px2a_var.get())
+        px2b   = int(self.px2b_var.get())
+        bw     = float(self.bw_var.get())
+        tmax   = float(self.tmax_var.get())
+        nshift = int(self.nshift_var.get())
+        for px in (px1a, px1b, px2a, px2b):
+            if not (0 <= px <= 319):
+                raise ValueError('pixel locations must be 0–319')
+        if px1a == px1b:
+            raise ValueError('node 1 pixel A and B must differ')
+        if px2a == px2b:
+            raise ValueError('node 2 pixel A and B must differ')
+        if bw <= 0 or tmax <= 0 or nshift <= 0:
+            raise ValueError('bin_width, tmax, n_shift must be positive')
+        return px1a, px1b, px2a, px2b, bw, tmax, nshift
+
+    def _pair_pixels(self, key: str, px1a, px1b, px2a, px2b) -> tuple:
+        px1 = px1a if key[0] == 'a' else px1b
+        px2 = px2a if key[1] == 'a' else px2b
+        return px1, px2
+
+    # ------------------------------------------------------------------
+    # Enable / disable / reset
+    # ------------------------------------------------------------------
+
+    def _enable(self) -> None:
+        try:
+            self._get_params()
+        except Exception as exc:
+            self.status_var.set(f'Error: {exc}')
+            return
+        self._active       = True
+        self._accumulating = False
+        self.status_var.set('Enabled — waiting for DWELL calibration …')
+
+    def _disable(self) -> None:
+        self._active       = False
+        self._accumulating = False
+        self.status_var.set('Disabled.')
+
+    def _reset(self) -> None:
+        for ch in (self._ch1a, self._ch1b, self._ch2a, self._ch2b):
+            ch.reset()
+        self._hist         = {k: None for k in self.PAIR_KEYS}
+        self._bins         = {k: None for k in self.PAIR_KEYS}
+        self._offset       = None
+        self._accumulating = False
+        for key, ax in self.ax.items():
+            ax.clear()
+            ax.set_xlabel('τ (ps)')
+            ax.set_ylabel('Counts')
+            ax.set_title(f'{key} — data cleared')
+        self.canvas.draw_idle()
+        self.status_var.set(
+            'Data cleared. ' + (
+                'Enabled — waiting for DWELL.' if self._active else 'Disabled.'))
+
+    # ------------------------------------------------------------------
+    # Hooks exposed to receiver nodes
+    # (read at session start — enable correlator before clicking START ALL)
+    # ------------------------------------------------------------------
+
+    @property
+    def hooks_node1(self) -> dict:
+        if not self._active:
+            return {}
+        try:
+            px1a, px1b, _, _, _, _, _ = self._get_params()
+            return {px1a: self._ch1a.q, px1b: self._ch1b.q}
+        except Exception:
+            return {}
+
+    @property
+    def hooks_node2(self) -> dict:
+        if not self._active:
+            return {}
+        try:
+            _, _, px2a, px2b, _, _, _ = self._get_params()
+            return {px2a: self._ch2a.q, px2b: self._ch2b.q}
+        except Exception:
+            return {}
+
+    # ------------------------------------------------------------------
+    # Dwell calibration — called by ReceiverGUI after user clicks OK
+    # ------------------------------------------------------------------
+
+    def start_with_offset(self, offset: int) -> None:
+        if not self._active:
+            return
+        for ch in (self._ch1a, self._ch1b, self._ch2a, self._ch2b):
+            ch.reset()
+        self._hist         = {k: None for k in self.PAIR_KEYS}
+        self._bins         = {k: None for k in self.PAIR_KEYS}
+        self._offset       = offset
+        self._accumulating = True
+        self.status_var.set(f'Accumulating — offset {offset:+,} ps')
+
+    # ------------------------------------------------------------------
+    # Data polling  (main thread, every `interval_var` seconds)
+    # ------------------------------------------------------------------
+
+    def _poll_data(self) -> None:
+        new_data = False
+        for ch in (self._ch1a, self._ch1b, self._ch2a, self._ch2b):
+            if ch.drain(self._accumulating):
+                new_data = True
+
+        t1_has_data = any(ch.arr.size or ch.pending for ch in (self._ch1a, self._ch1b))
+        t2_has_data = any(ch.arr.size or ch.pending for ch in (self._ch2a, self._ch2b))
+
+        if new_data and t1_has_data and t2_has_data:
+            if not self._correlating:
+                self._launch_correlation()
+            else:
+                self._has_new_data = True
+
+        try:
+            interval_ms = max(100, int(float(self.interval_var.get()) * 1000))
+        except ValueError:
+            interval_ms = 500
+        self.after(interval_ms, self._poll_data)
+
+    # ------------------------------------------------------------------
+    # Correlation  (background thread)
+    # ------------------------------------------------------------------
+
+    def _launch_correlation(self) -> None:
+        """Same batching idea as CorrelateWindow, generalized to 4 pairs
+        sharing 4 channels: a t1-channel used by 2 pairs can only release
+        events once BOTH of its partner t2-channels have caught up, so its
+        cut point is the min of both pairs' proposed cuts (never the more
+        eager one alone, which would drop events the other pair still
+        needs); symmetrically, a t2-channel's retained tail is the min of
+        both pairs' proposed keep-points (never discard what either partner
+        still needs).
+        """
+        try:
+            _, _, _, _, bw, tmax, nshift = self._get_params()
+        except Exception:
+            return          # entry box mid-edit; retry on the next poll
+
+        for ch in (self._ch1a, self._ch1b, self._ch2a, self._ch2b):
+            ch.merge()
+
+        if (self._ch1a.arr.size == 0 and self._ch1b.arr.size == 0):
+            return
+        if (self._ch2a.arr.size == 0 and self._ch2b.arr.size == 0):
+            return
+
+        offset   = self._offset if self._offset is not None else 0
+        t2a_corr = self._ch2a.arr - offset
+        t2b_corr = self._ch2b.arr - offset
+
+        def cut_for(t1_arr, partner_corrs):
+            # A partner channel with no data at all yet (e.g. a pixel with far
+            # sparser counts, or briefly not-yet-arrived) is simply excluded
+            # from the min rather than blocking release altogether — this
+            # trades a small, bounded amount of that partner's earliest
+            # coincidences (if it only starts receiving data slightly later)
+            # for never letting one sparse/silent channel stall every pair.
+            if t1_arr.size == 0:
+                return 0
+            cuts = [int(np.searchsorted(t1_arr, t2_corr[-1] - tmax, side='right'))
+                    for t2_corr in partner_corrs if t2_corr.size]
+            return min(cuts) if cuts else 0
+
+        cut_1a = cut_for(self._ch1a.arr, (t2a_corr, t2b_corr))
+        cut_1b = cut_for(self._ch1b.arr, (t2a_corr, t2b_corr))
+
+        t1a_batch, self._ch1a.arr = self._ch1a.arr[:cut_1a], self._ch1a.arr[cut_1a:]
+        t1b_batch, self._ch1b.arr = self._ch1b.arr[:cut_1b], self._ch1b.arr[cut_1b:]
+
+        if t1a_batch.size == 0 and t1b_batch.size == 0:
+            return          # neither t2 side has caught up yet
+
+        next_1a = self._ch1a.arr[0] if self._ch1a.arr.size else (
+            t1a_batch[-1] if t1a_batch.size else None)
+        next_1b = self._ch1b.arr[0] if self._ch1b.arr.size else (
+            t1b_batch[-1] if t1b_batch.size else None)
+
+        def keep_for(t2_corr, partners_next):
+            if t2_corr.size == 0:
+                return 0
+            keeps = [int(np.searchsorted(t2_corr, nxt - tmax, side='left'))
+                    for nxt in partners_next if nxt is not None]
+            return min(keeps) if keeps else 0
+
+        keep_2a = keep_for(t2a_corr, (next_1a, next_1b))
+        keep_2b = keep_for(t2b_corr, (next_1a, next_1b))
+        self._ch2a.arr = self._ch2a.arr[keep_2a:]
+        self._ch2b.arr = self._ch2b.arr[keep_2b:]
+
+        pairs = {}
+        if t1a_batch.size and t2a_corr.size:
+            pairs['aa'] = (t1a_batch, t2a_corr)
+        if t1a_batch.size and t2b_corr.size:
+            pairs['ab'] = (t1a_batch, t2b_corr)
+        if t1b_batch.size and t2a_corr.size:
+            pairs['ba'] = (t1b_batch, t2a_corr)
+        if t1b_batch.size and t2b_corr.size:
+            pairs['bb'] = (t1b_batch, t2b_corr)
+        if not pairs:
+            return
+
+        self._correlating  = True
+        self._has_new_data = False
+        threading.Thread(
+            target=self._correlate_bg,
+            args=(pairs, bw, tmax, nshift),
+            daemon=True,
+        ).start()
+
+    def _correlate_bg(self, pairs: dict, bw: float, tmax: float, nshift: int) -> None:
+        try:
+            bins  = np.arange(-tmax - bw / 2, tmax + 3 * bw / 2, bw)
+            nbins = len(bins) - 1
+            results = {}
+            for key, (t1, t2_corr) in pairs.items():
+                idx  = np.searchsorted(t2_corr, t1)
+                hist = _multistart_multistop(t1, t2_corr, idx, bw, tmax, nbins, nshift)
+                results[key] = (hist, bins, len(t1), len(t2_corr))
+            self._result_q.put(('ok', results))
+        except Exception as exc:
+            self._result_q.put(('err', str(exc)))
+        finally:
+            self._correlating = False
+
+    # ------------------------------------------------------------------
+    # Result polling + plot  (main thread, every 200 ms)
+    # ------------------------------------------------------------------
+
+    def _poll_results(self) -> None:
+        try:
+            result = self._result_q.get_nowait()
+            if result[0] == 'ok':
+                _, results = result
+                for key, (partial_hist, bins, n1, n2) in results.items():
+                    if self._hist[key] is None or len(partial_hist) != len(self._hist[key]):
+                        self._hist[key] = partial_hist
+                        self._bins[key] = bins
+                    else:
+                        self._hist[key] = self._hist[key] + partial_hist
+                    self._update_plot(key, self._hist[key], self._bins[key])
+                off_s = f'  offset {self._offset:+,} ps' if self._offset is not None else ''
+                busy  = '  (correlating …)' if self._correlating else ''
+                self.status_var.set(
+                    f'Accumulating{off_s} — {len(results)} pair(s) updated{busy}')
+                if self._has_new_data:
+                    self._launch_correlation()
+            else:
+                self.status_var.set(f'Correlation error: {result[1]}')
+        except queue.Empty:
+            pass
+        self.after(200, self._poll_results)
+
+    def _update_plot(self, key: str, hist: np.ndarray, bins: np.ndarray) -> None:
+        centers = (bins[:-1] + bins[1:]) / 2
+        try:
+            _, _, _, _, _, tmax, _ = self._get_params()
+            unit, scale = CorrelateWindow._pick_unit(tmax)
+        except Exception:
+            unit, scale = 'ps', 1.0
+
+        ax = self.ax[key]
+        ax.clear()
+        ax.step(centers / scale, hist.astype(float), where='mid',
+                color='steelblue', linewidth=1)
+        ax.set_xlabel(f'τ ({unit})')
+        ax.set_ylabel('Counts')
+        ax.set_title(self._pair_title(key))
+        self.fig.tight_layout()
+        self.canvas.draw_idle()
+        self._write_histogram(key, centers, hist)
+
+    def _pair_title(self, key: str) -> str:
+        try:
+            px1a, px1b, px2a, px2b, _, _, _ = self._get_params()
+        except Exception:
+            return key
+        px1, px2 = self._pair_pixels(key, px1a, px1b, px2a, px2b)
+        return f'{px1}₁ × {px2}₂'
+
+    def _write_histogram(self, key: str, centers: np.ndarray, hist: np.ndarray) -> None:
+        try:
+            px1a, px1b, px2a, px2b, _, _, _ = self._get_params()
+        except Exception:
+            return
+        px1, px2 = self._pair_pixels(key, px1a, px1b, px2a, px2b)
         suffix = self.suffix_var.get().strip()
         name   = f'{px1}_{px2}_{suffix}' if suffix else f'{px1}_{px2}'
         path   = f'.\\spad_data\\{name}.txt'

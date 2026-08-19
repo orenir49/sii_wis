@@ -28,6 +28,12 @@ jupyter notebook spad_new.ipynb
 
 # Arc-line spectral alignment between two detectors
 python .claude/skills/spectral-align/align_arc.py REF.txt OTHER.txt --outdir figs
+
+# SII bunching-excess / integration-time calculator
+python tools\sii_calculator.py
+
+# Peak-annotated g2 histogram + count-distribution figures from a saved correlate.py result
+python tools\plot_g2_result.py spad_data\147_147_resolve_peak.txt --outdir figs\<DD-M-YY>
 ```
 
 ## Architecture
@@ -52,7 +58,10 @@ Minimal GUI that starts a command server thread on launch. Receives JSON command
 | `receiver_backend.py` | TCP data server: `start_server()`, `run_session_loop()`, `check_connection()` |
 | `sender.py` | Sender GUI shell; starts command server thread |
 | `sender_backend.py` | Command server + lSPAD TCP client; contains `PIXMAP` (320-pixel array mapping) |
-| `correlate.py` | `CorrelateWindow` — live g² histogram with Numba JIT kernel |
+| `correlate.py` | `CorrelateWindow` (single-pair) + `QuadCorrelateWindow` (2 pixels/node, 4 pairwise g² histograms — e.g. mask_two.txt) live correlators, Numba JIT kernel; "Compute R…" button opens `tools/sii_calculator.py` |
+| `tools/sii_calculator_backend.py` | Pure formulas: `<\|V\|^2>`, coherence time, bunching-excess `R`, required integration time |
+| `tools/sii_calculator.py` | `SIICalculatorWindow` — interactive bunching-excess / integration-time calculator |
+| `tools/plot_g2_result.py` | Peak-annotated g² histogram + count-distribution PNGs from a saved `{px1}_{px2}_{suffix}.txt` |
 | `ssh_launcher.py` | Paramiko-based remote automation for launching sender nodes |
 | `setup_node.ps1` | One-shot sender node setup: OpenSSH, firewall, git clone, venv |
 | `spad_new.ipynb` | Offline g² analysis notebook |
