@@ -53,12 +53,14 @@ class NodePanel:
                  default_ssh_user: str = 'user',
                  log_fn=None,
                  get_hooks_fn=None,
+                 get_write_hooked_fn=None,
                  set_correlate_pixel_fn=None,
                  on_first_data_fn=None) -> None:
         self.root          = root
         self.node_id       = node_id
         self.log_fn        = log_fn
         self._get_hooks_fn = get_hooks_fn
+        self._get_write_hooked_fn = get_write_hooked_fn
         self._set_correlate_pixel_fn = set_correlate_pixel_fn
         self._on_first_data_fn = on_first_data_fn
 
@@ -439,6 +441,11 @@ class NodePanel:
             hooks[320] = self._master_dwell_q  # master_dwell — offset diagnostics
             hooks[323] = self._dwell_q         # slave_dwell — needed for clock-offset calibration
 
+            # Read once per session, not per chunk: toggling the checkbox
+            # mid-run must not leave half a pixel's timestamps on disk.
+            write_hooked = (self._get_write_hooked_fn()
+                            if self._get_write_hooked_fn else True)
+
             log_fn = lambda m: self.log_fn(
                 f'[N{self.node_id}] {m}' if m.endswith('\n') else f'[N{self.node_id}] {m}\n')
             try:
@@ -453,6 +460,7 @@ class NodePanel:
                         on_first_chunk=(
                             (lambda: self._on_first_data_fn(self.node_id))
                             if self._on_first_data_fn else None),
+                        write_hooked=write_hooked,
                     )
             except Exception:
                 # Never let the accept loop die — otherwise the next START connects
@@ -711,6 +719,11 @@ class ReceiverGUI:
     # ------------------------------------------------------------------
 
     def _build_ui(self) -> None:
+        # Defined before the NodePanels, which close over it for their
+        # get_write_hooked_fn. On by default: keeping the data is the safe
+        # default, and not keeping it has to be a deliberate click.
+        self.write_disk_var = tk.BooleanVar(value=True)
+
         nodes_frame = ttk.Frame(self.root)
         nodes_frame.grid(row=0, column=0, sticky='ew')
 
@@ -723,6 +736,7 @@ class ReceiverGUI:
                                log_fn=self._enqueue_log,
                                get_hooks_fn=lambda: {**self._correlate_win.hooks_node1,
                                                      **self._quad_correlate_win.hooks_node1},
+                               get_write_hooked_fn=lambda: self.write_disk_var.get(),
                                set_correlate_pixel_fn=lambda pix: self._correlate_win.px1_var.set(str(pix)),
                                on_first_data_fn=self._on_node_first_data)
         self.node2 = NodePanel(nodes_frame, self.root,
@@ -734,6 +748,7 @@ class ReceiverGUI:
                                log_fn=self._enqueue_log,
                                get_hooks_fn=lambda: {**self._correlate_win.hooks_node2,
                                                      **self._quad_correlate_win.hooks_node2},
+                               get_write_hooked_fn=lambda: self.write_disk_var.get(),
                                set_correlate_pixel_fn=lambda pix: self._correlate_win.px2_var.set(str(pix)),
                                on_first_data_fn=self._on_node_first_data)
 
@@ -754,6 +769,11 @@ class ReceiverGUI:
         self._cal_status_var = tk.StringVar(value='')
         self._cal_status_lbl = tk.Label(acq, textvariable=self._cal_status_var, anchor='w')
         self._cal_status_lbl.grid(row=2, column=0, columnspan=5, sticky='w', padx=8, pady=(0, 6))
+
+        ttk.Checkbutton(
+            acq, text='Write timestamps to disk (uncheck: live correlation only)',
+            variable=self.write_disk_var, command=self._on_write_disk_toggle).grid(
+            row=3, column=0, columnspan=6, sticky='w', padx=8, pady=(0, 6))
 
         ttk.Label(acq, text='Duration (s):').grid(row=0, column=3, sticky='w', padx=(12, 4))
         self.duration_var = tk.StringVar(value='1')
@@ -803,6 +823,21 @@ class ReceiverGUI:
     # ------------------------------------------------------------------
     # Acquisition control
     # ------------------------------------------------------------------
+
+    def _on_write_disk_toggle(self) -> None:
+        """Log the choice, and say when it takes effect.
+
+        run_session_loop decides which files to open at session start, so a
+        toggle during a run applies from the next data connection — saying so
+        beats leaving someone to wonder why px_*.bin kept growing.
+        """
+        if self.write_disk_var.get():
+            self._enqueue_log('Write to disk ON — every pixel is persisted as usual.\n')
+        else:
+            self._enqueue_log(
+                'Write to disk OFF — live-correlated pixels will be fed to the '
+                'correlator only, with no px_*.bin. Sync markers are still '
+                'written. Applies from the next START.\n')
 
     def _start_all(self) -> None:
         try:

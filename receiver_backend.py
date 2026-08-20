@@ -95,7 +95,8 @@ def check_connection(sock: socket.socket) -> bool:
 def run_session_loop(conn: socket.socket, log_fn=print,
                      pixel_hooks: dict | None = None,
                      event_accum: list | None = None,
-                     on_first_chunk=None) -> None:
+                     on_first_chunk=None,
+                     write_hooked: bool = True) -> None:
     """
     Handle back-to-back acquisition sessions on an accepted connection.
     Blocks until the sender disconnects (ConnectionError).
@@ -112,7 +113,25 @@ def run_session_loop(conn: socket.socket, log_fn=print,
                   data chunk arrives. Marks the moment acquisition is genuinely
                   under way — several seconds after START, since the sender
                   still has to reach the receiver and negotiate with lSPAD.
+    write_hooked: when False, hooked PIXEL keys are fed to their queue only and
+                  never written — live correlation without keeping the
+                  timestamps. Their px_*.bin is not even created, so an absent
+                  file means "deliberately not recorded" rather than an empty
+                  one that reads as "pixel saw nothing".
+
+                  Only keys < 320 are ever suppressed. Keys 320–325 carry the
+                  dwell/line/frame markers, which are hooked on every run for
+                  clock calibration and are what the offline offset estimate
+                  needs afterwards; dropping those would make a run
+                  unanalysable rather than merely unrecorded.
     """
+    # Fixed for the life of the connection: pixel_hooks is resolved by the
+    # caller before this loop starts, so every back-to-back session suppresses
+    # the same keys.
+    skipped_keys: set = set()
+    if not write_hooked and pixel_hooks:
+        skipped_keys = {k for k in pixel_hooks if k < 320}
+
     session = 0
     stream  = conn.makefile('rb', buffering=1 << 20)
     try:
@@ -130,13 +149,23 @@ def run_session_loop(conn: socket.socket, log_fn=print,
             os.makedirs(output_dir, exist_ok=True)
             handles: dict = {}
             for loc in range(320):
+                if loc in skipped_keys:
+                    continue
                 handles[loc] = open(os.path.join(output_dir, f'px_{loc:03d}.bin'), 'wb')
             for kid, fname in SPECIAL_KEY_TO_FILENAME.items():
                 handles[kid] = open(os.path.join(output_dir, fname), 'wb')
 
+            if skipped_keys:
+                # Say it once per session, up front: a run whose correlated
+                # pixels were never recorded must not look like a normal one.
+                log_fn(f'[session {session}] Write to disk OFF for live-correlated '
+                       f'pixel(s) {sorted(skipped_keys)} — timestamps go to the '
+                       f'correlator only, no px_*.bin for them')
+
             chunks    = 0
             unknown   = 0
             written   = 0      # bytes committed to disk this session
+            skipped   = 0      # bytes deliberately not written (write_hooked=False)
             write_s   = 0.0    # seconds spent inside handle.write
             try:
                 while True:
@@ -152,6 +181,8 @@ def run_session_loop(conn: socket.socket, log_fn=print,
                     # a live consumer is also watching this key. Hooks are read
                     # taps, not a substitute for the on-disk record — diverting
                     # meant the correlated pixels were the only ones with no file.
+                    # The single exception is an explicit write_hooked=False,
+                    # where not keeping the timestamps is what was asked for.
                     handle = handles.get(key_id)
                     if handle is not None:
                         # Timed: if the master's disk is the bottleneck, the
@@ -162,6 +193,8 @@ def run_session_loop(conn: socket.socket, log_fn=print,
                         handle.write(payload)
                         write_s += time.perf_counter() - t0
                         written += n_bytes
+                    elif key_id in skipped_keys:
+                        skipped += n_bytes
                     else:
                         unknown += 1
                     if pixel_hooks and key_id in pixel_hooks:
@@ -182,7 +215,9 @@ def run_session_loop(conn: socket.socket, log_fn=print,
             log_fn(f'[session {session}] Done — {chunks} chunks, '
                    f'{written / 1e6:.1f} MB to {output_dir} '
                    f'({write_s:.1f} s in write'
-                   + (f', {written / 1e6 / write_s:.0f} MB/s)' if write_s > 0.05 else ')'))
+                   + (f', {written / 1e6 / write_s:.0f} MB/s)' if write_s > 0.05 else ')')
+                   + (f'; {skipped / 1e6:.1f} MB correlated but NOT written '
+                      f'(write to disk off)' if skipped else ''))
 
     except ConnectionError:
         log_fn('Sender disconnected.')
