@@ -77,7 +77,20 @@ PIXMAP = np.array([
 SPECIAL = {225: 'dwell', 226: 'line', 228: 'frame'}
 RESET_ID          = 234      # coarse-counter reset marker
 OVERFLOW_ID       = 247      # detector FIFO overflow: photons already lost
+FILE_START_ID     = 239      # lSPAD file/stream-start marker
 KNOWN_MARKER_IDS  = np.array(sorted(SPECIAL) + [RESET_ID, OVERFLOW_ID])
+
+# Traffic a healthy stream is *made of*: photons, the coarse-counter reset, and
+# the dwell/line/frame sync markers. Every other id is abnormal and is reported
+# live by report_abnormal() — including OVERFLOW_ID, which is "known" only in the
+# sense that we know what it means.
+NORMAL_MARKER_IDS = np.array(sorted(SPECIAL) + [RESET_ID])
+MARKER_NAMES = {
+    OVERFLOW_ID:   'FIFO overflow, photons already lost',
+    FILE_START_ID: 'file-start marker',
+}
+ANOM_LOG_S     = 2.0   # min seconds between rollup lines for one (chip, id)
+ANOM_MAX_FIRST = 40    # cap on distinct first-sighting lines per session
 
 LAG_CHECK_S = 5.0      # how often to recompute parser lag
 LAG_WARN_S  = 2.0      # lag above this means data is queueing up
@@ -197,7 +210,7 @@ def run(sock: socket.socket,
     the blocking sq.put() stalled the parser — so the ceiling is ours, and the
     photons were lost downstream of the detector rather than by it.
     """
-    stats = {'records': 0, 'overflow': 0, 'unknown': 0,
+    stats = {'records': 0, 'overflow': 0, 'unknown': 0, 'abnormal': {},
              'lag_s': 0.0, 'lag_max_s': 0.0,
              'queue_max': 0, 'queue_blocks': 0,
              'recv_calls': 0, 'recv_mean_b': 0, 'discarded_b': 0,
@@ -255,6 +268,57 @@ def run(sock: socket.socket,
             except queue.Full:
                 stats['queue_blocks'] += 1
                 sq.put(blob)
+
+    # --- live abnormal-marker reporting -----------------------------------
+    # Photons, the coarse-counter reset and the dwell/line/frame markers are the
+    # normal traffic; anything else says something went wrong *now* — a FIFO
+    # overflow, a file-start marker in mid-stream, an id no pixel on that chip
+    # can emit (which usually means the 7-byte record framing has slipped).
+    # Report it while the run is still going instead of only in the totals.
+    #
+    # Throttled on purpose: log_fn writes to the control socket from the parser
+    # thread, so an unthrottled flood would stall the parser and cost real
+    # photons — the very failure it would be reporting.
+    anom: dict = {}          # 'chip:id' -> [total, pending, last_log_t]
+
+    def report_abnormal(mask, pixel_nr, is_mast, time_ps, rec0) -> None:
+        """Log abnormal ids in this chunk, at most one line per (chip, id) per
+        ANOM_LOG_S. `rec0` is the session record index of the chunk's first
+        record, so a marker's position in the stream is judgeable — a file-start
+        at record 0 is expected, one at record 4,000,000 is not."""
+        now  = time.time()
+        t0   = stats['first_ts'] if stats['first_ts'] is not None else 0
+        idx  = np.nonzero(mask)[0]
+        code = pixel_nr[idx].astype(np.int64) * 2 + is_mast[idx]
+        for c in np.unique(code):
+            sel  = idx[code == c]
+            pid  = int(c) >> 1
+            chip = 'master' if int(c) & 1 else 'slave'
+            key  = f'{chip}:{pid}'
+            name = MARKER_NAMES.get(pid, 'unknown pixel/marker id')
+            t_s  = (int(time_ps[sel[0]])  - t0) / 1e12
+            t_e  = (int(time_ps[sel[-1]]) - t0) / 1e12
+            ent  = anom.get(key)
+            if ent is None:
+                anom[key] = [int(sel.size), 0, now]
+                if len(anom) <= ANOM_MAX_FIRST:
+                    log_fn(f'ABNORMAL: {chip} id {pid} ({name}) x{sel.size:,} — '
+                           f'first at record {rec0 + int(sel[0]):,}, '
+                           f't=+{t_s:.6f} s\n')
+                elif len(anom) == ANOM_MAX_FIRST + 1:
+                    log_fn(f'ABNORMAL: over {ANOM_MAX_FIRST} distinct abnormal '
+                           f'ids — the record framing is probably desynchronised. '
+                           f'Further ids are counted in the session summary '
+                           f'only.\n')
+                continue
+            ent[0] += int(sel.size)
+            ent[1] += int(sel.size)
+            if now - ent[2] >= ANOM_LOG_S:
+                log_fn(f'ABNORMAL: {chip} id {pid} ({name}) x{ent[1]:,} more '
+                       f'(total {ent[0]:,}), latest at record '
+                       f'{rec0 + int(sel[-1]):,}, t=+{t_e:.6f} s\n')
+                ent[1] = 0
+                ent[2] = now
 
     def sender_fn() -> None:
         while True:
@@ -534,13 +598,18 @@ def run(sock: socket.socket,
                                    f'detector — data is queueing and photons will '
                                    f'be lost to FIFO overflow if this grows\n')
 
-                    # Anything that is neither a physical pixel nor a known
-                    # marker is discarded by the loop below; count it rather
-                    # than dropping it silently.
-                    recognised = ((is_mast & (pixel_nr < 150))
-                                  | (~is_mast & (pixel_nr < 170))
-                                  | np.isin(pixel_nr, KNOWN_MARKER_IDS))
-                    stats['unknown'] += int((~recognised).sum())
+                    # Anything that is neither a physical pixel for this chip nor
+                    # a normal marker is discarded by the loop below. Report it
+                    # live; 'unknown' keeps its narrower meaning (not even a
+                    # marker we have a name for) for the summary and JSON.
+                    phys_ok  = ((is_mast & (pixel_nr < 150))
+                                | (~is_mast & (pixel_nr < 170)))
+                    abnormal = ~(phys_ok | np.isin(pixel_nr, NORMAL_MARKER_IDS))
+                    if abnormal.any():
+                        stats['unknown'] += int(
+                            (abnormal & ~np.isin(pixel_nr, KNOWN_MARKER_IDS)).sum())
+                        report_abnormal(abnormal, pixel_nr, is_mast, time_ps,
+                                        stats['records'] - len(raw))
 
                     dwell_seen = False
                     for chip_flag, loc_map, n_phys, chip_name in (
@@ -612,6 +681,13 @@ def run(sock: socket.socket,
     stats['elapsed_s'] = round(elapsed, 1)
     if stats['recv_calls']:
         stats['recv_mean_b'] = int(total_bytes / stats['recv_calls'])
+    stats['abnormal'] = {k: v[0] for k, v in anom.items()}
+    if anom:
+        # Per-id totals, so a throttled live line is never the whole story.
+        log_fn('Abnormal ids this session: '
+               + ', '.join(f'{k} x{n:,}' for k, n in
+                           sorted(stats['abnormal'].items(), key=lambda kv: -kv[1]))
+               + '\n')
     if stats['overflow'] or stats['unknown']:
         log_fn(f'WARNING: {stats["overflow"]:,} FIFO overflow event(s) — those '
                f'photons were dropped by the detector and cannot be recovered; '
