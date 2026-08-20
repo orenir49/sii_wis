@@ -3,3 +3,5 @@
 __pycache__/
 *.pyc
 /figs
+# Figures referenced from docs/ are tracked; everything else under figs/ is not.
+!/docs/figs/
