@@ -60,6 +60,72 @@ def _prewarm():
 
 
 # ---------------------------------------------------------------------------
+# Marked-bin annotation
+# ---------------------------------------------------------------------------
+
+MARK_TAU_NS_DEFAULT = '14'   # expected bunching-peak delay for this setup
+
+
+def _parse_mark_tau_ps(var: tk.StringVar) -> float | None:
+    """Marked-bin τ in ps from a 'Mark τ (ns)' entry. None if blank or mid-edit."""
+    text = var.get().strip()
+    if not text:
+        return None
+    try:
+        return float(text) * 1_000.0
+    except ValueError:
+        return None
+
+
+def _mark_tau_bin(ax, centers: np.ndarray, hist: np.ndarray,
+                  mark_tau_ps: float | None, scale: float,
+                  bin_width_ps: float, fontsize: int = 8) -> bool:
+    """Mark the bin holding `mark_tau_ps` and annotate its height, excess and SNR.
+
+    Unlike tools/plot_g2_result.py, which annotates wherever the maximum happens
+    to land, this marks a τ the user names — so it reports the bin we expect the
+    bunching peak in even while it is still buried in noise, which is the whole
+    point of watching it live. Mean and σ are taken over the entire histogram,
+    marked bin included, so the numbers agree with the offline tool exactly
+    rather than nearly.
+
+    Returns True if a marker was drawn.
+    """
+    if mark_tau_ps is None or centers.size == 0:
+        return False
+    i = int(np.argmin(np.abs(centers - mark_tau_ps)))
+    if abs(centers[i] - mark_tau_ps) > bin_width_ps:
+        return False        # the requested τ lies outside ±tmax
+    counts = hist.astype(float)
+    mean   = counts.mean()
+    std    = counts.std()
+    if mean <= 0:
+        return False        # nothing accumulated yet — no baseline to compare to
+    height = counts[i]
+    excess = (height - mean) / mean * 100
+    snr    = f'{(height - mean) / std:.2f}' if std > 0 else 'n/a'
+
+    ax.plot(centers[i] / scale, height, marker='x', color='red',
+            markersize=12, markeredgewidth=2.5, linestyle='none', zorder=5)
+    ax.annotate(
+        f'τ = {centers[i] / 1_000.0:g} ns\n'
+        f'counts = {height:,.0f}\n'
+        f'excess = {excess:.3f}% of mean\n'
+        f'SNR = {snr}\n'
+        f'mean = {mean:.1f} ± {std:.1f}',
+        xy=(centers[i] / scale, height), xycoords='data',
+        # Right-aligned inside the axes rather than at a fixed left edge: the box
+        # is as wide as its longest number, and the live figure gets resized.
+        xytext=(0.99, 0.98), textcoords='axes fraction',
+        fontsize=fontsize, verticalalignment='top', horizontalalignment='right',
+        multialignment='left',   # box anchored right, text inside still ragged-right
+        bbox=dict(boxstyle='round', edgecolor='red', facecolor='white', alpha=0.85),
+        arrowprops=dict(arrowstyle='->', color='red'),
+    )
+    return True
+
+
+# ---------------------------------------------------------------------------
 # CorrelateWindow
 # ---------------------------------------------------------------------------
 
@@ -180,6 +246,13 @@ class CorrelateWindow(tk.Toplevel):
                    command=self._open_r_calculator).grid(
             row=5, column=3, padx=(2, 6), sticky='w')
 
+        ttk.Label(cfg, text='Mark τ (ns):').grid(
+            row=6, column=0, padx=6, pady=4, sticky='w')
+        self.mark_var = tk.StringVar(value=MARK_TAU_NS_DEFAULT)
+        ttk.Entry(cfg, textvariable=self.mark_var, width=8).grid(
+            row=6, column=1, sticky='w')
+        self.mark_var.trace_add('write', self._on_display_change)
+
         btn_row = ttk.Frame(cfg)
         btn_row.grid(row=6, column=2, columnspan=2, padx=8, pady=4)
         ttk.Button(btn_row, text='Enable',     width=8,
@@ -292,8 +365,10 @@ class CorrelateWindow(tk.Toplevel):
                 'Enabled — waiting for DWELL.' if self._active else 'Disabled.'))
 
     def _on_display_change(self, *_) -> None:
+        # write=False: the histogram data is unchanged, and these traces fire on
+        # every keystroke in the entry boxes — no reason to rewrite the file.
         if self._hist is not None and self._bins is not None:
-            self._update_plot(self._hist, self._bins)
+            self._update_plot(self._hist, self._bins, write=False)
 
     # ------------------------------------------------------------------
     # Hooks exposed to receiver nodes
@@ -527,15 +602,17 @@ class CorrelateWindow(tk.Toplevel):
         else:
             return 'ms', 1_000_000_000.0
 
-    def _update_plot(self, hist: np.ndarray, bins: np.ndarray) -> None:
+    def _update_plot(self, hist: np.ndarray, bins: np.ndarray,
+                     write: bool = True) -> None:
         """Draw histogram."""
         centers   = (bins[:-1] + bins[1:]) / 2
         plot_data = hist.astype(float)
         ylabel    = 'Counts'
         title     = 'g² — live'
 
+        bw = None
         try:
-            _, _, _, tmax, _ = self._get_params()
+            _, _, bw, tmax, _ = self._get_params()
             unit, scale = self._pick_unit(tmax)
         except Exception:
             unit, scale = 'ps', 1.0
@@ -548,9 +625,13 @@ class CorrelateWindow(tk.Toplevel):
             self.ax.set_xlabel(f'τ ({unit})')
             self.ax.set_ylabel(ylabel)
             self.ax.set_title(title)
+            if bw:
+                _mark_tau_bin(self.ax, centers, hist,
+                              _parse_mark_tau_ps(self.mark_var), scale, bw)
         self.fig.tight_layout()
         self.canvas.draw_idle()
-        self._write_histogram(centers, hist)  # always save raw d(t) in ps
+        if write:
+            self._write_histogram(centers, hist)  # always save raw d(t) in ps
 
     def _draw_distribution(self, hist: np.ndarray) -> None:
         counts   = hist.astype(float)
@@ -759,6 +840,13 @@ class QuadCorrelateWindow(tk.Toplevel):
         self.suffix_var = tk.StringVar(value='g2')
         ttk.Entry(cfg, textvariable=self.suffix_var, width=32).grid(
             row=4, column=1, columnspan=3, sticky='w')
+
+        ttk.Label(cfg, text='Mark τ (ns):').grid(
+            row=5, column=0, padx=6, pady=4, sticky='w')
+        self.mark_var = tk.StringVar(value=MARK_TAU_NS_DEFAULT)
+        ttk.Entry(cfg, textvariable=self.mark_var, width=8).grid(
+            row=5, column=1, sticky='w')
+        self.mark_var.trace_add('write', self._on_display_change)
 
         btn_row = ttk.Frame(cfg)
         btn_row.grid(row=5, column=2, columnspan=2, padx=8, pady=4)
@@ -1063,10 +1151,23 @@ class QuadCorrelateWindow(tk.Toplevel):
             pass
         self.after(200, self._poll_results)
 
-    def _update_plot(self, key: str, hist: np.ndarray, bins: np.ndarray) -> None:
+    def _on_display_change(self, *_) -> None:
+        """Re-render every pair from the stored histograms (marked τ changed).
+
+        write=False: the data is unchanged and this fires on every keystroke —
+        four file rewrites per character typed would be pure churn.
+        """
+        for key in self.PAIR_KEYS:
+            if self._hist[key] is not None and self._bins[key] is not None:
+                self._update_plot(key, self._hist[key], self._bins[key],
+                                  write=False)
+
+    def _update_plot(self, key: str, hist: np.ndarray, bins: np.ndarray,
+                     write: bool = True) -> None:
         centers = (bins[:-1] + bins[1:]) / 2
+        bw = None
         try:
-            _, _, _, _, _, tmax, _ = self._get_params()
+            _, _, _, _, bw, tmax, _ = self._get_params()
             unit, scale = CorrelateWindow._pick_unit(tmax)
         except Exception:
             unit, scale = 'ps', 1.0
@@ -1078,9 +1179,14 @@ class QuadCorrelateWindow(tk.Toplevel):
         ax.set_xlabel(f'τ ({unit})')
         ax.set_ylabel('Counts')
         ax.set_title(self._pair_title(key))
+        if bw:
+            # Four subplots share one figure, so the box has to be smaller here.
+            _mark_tau_bin(ax, centers, hist, _parse_mark_tau_ps(self.mark_var),
+                          scale, bw, fontsize=7)
         self.fig.tight_layout()
         self.canvas.draw_idle()
-        self._write_histogram(key, centers, hist)
+        if write:
+            self._write_histogram(key, centers, hist)
 
     def _pair_title(self, key: str) -> str:
         try:
