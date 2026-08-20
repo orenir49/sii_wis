@@ -385,6 +385,14 @@ class NodePanel:
                 f'detector. Nothing was lost this run, but the data arrived long '
                 f'after it was taken, and an abort at this rate would have '
                 f'discarded whatever was still buffered.\n')
+        # The sender logs these live as they occur; repeat the per-id totals here
+        # so they also land in the run directory via session_stats.json.
+        abnormal = stats.get('abnormal') or {}
+        if abnormal:
+            self.log_fn(
+                f'[N{self.node_id}] Abnormal ids: '
+                + ', '.join(f'{k} x{n:,}' for k, n in
+                            sorted(abnormal.items(), key=lambda kv: -kv[1])) + '\n')
         # lag peak and queue depth are what say whether overflow came from the
         # detector's own readout limit or from us stalling the parser.
         self.log_fn(
