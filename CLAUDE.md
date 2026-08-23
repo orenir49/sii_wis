@@ -29,6 +29,13 @@ jupyter notebook spad_new.ipynb
 # Arc-line spectral alignment between two detectors
 python .claude/skills/spectral-align/align_arc.py REF.txt OTHER.txt --outdir figs
 
+# ...and emit the pixel-pair list that fit implies, for the multi-pair correlator
+python .claude/skills/spectral-align/align_arc.py REF.txt OTHER.txt --emit-pairs 120 200
+
+# Preview a pair list without running a fit (identity / affine / grid / file)
+python tools\pair_map.py --mode affine --lo 120 --hi 200 -a 1.037 -b -2.4
+python tools\pair_map.py --selftest
+
 # SII bunching-excess / integration-time calculator
 python tools\sii_calculator.py
 
@@ -67,6 +74,7 @@ Minimal GUI that starts a command server thread on launch. Receives JSON command
 | `tools/sii_calculator.py` | `SIICalculatorWindow` — interactive bunching-excess / integration-time calculator |
 | `tools/plot_g2_result.py` | Peak-annotated g² histogram + count-distribution PNGs from a saved `{px1}_{px2}_{suffix}.txt` |
 | `tools/analyze_g2_pairs_offline.py` | Offline g² for arbitrary pixel pairs with the robust slave-dwell clock offset (matches the live correlator) |
+| `tools/pair_map.py` | Pure (node-1, node-2) pair derivation for the multi-pair correlator — identity / affine / grid / file modes, mask cross-check, `--selftest` |
 | `ssh_launcher.py` | Paramiko-based remote automation for launching sender nodes |
 | `setup_node.ps1` | One-shot sender node setup: OpenSSH, firewall, git clone, venv |
 | `spad_new.ipynb` | Offline g² analysis notebook |
