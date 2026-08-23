@@ -1,28 +1,124 @@
 # Scale-up to 80-pair diagonal live correlations
 
-> **Status: Stage 1 done (1a landed 2026-08-23, 1b partly); Stage 3 landed 2026-08-23 and passes
-> end-to-end against a synthetic pulsed source; Stage 2 not implemented.** Stage 2 is
-> deliberately deferred behind Stage 3 — it is a pure sender-throughput optimization with no
-> correctness dependency on the correlator, and it only binds at ~80 pixels x 1 MHz. Validating the
-> multi-pair engine against a pulsed laser at 8-16 pairs does not need it.
->
-> Written 2026-08-20, re-anchored
-> against commit `8ec3c10` the same day. Line numbers below refer to that tree, **not** to `ee4c18e`
-> as originally drafted. Three pre-existing bugs are identified below that affect *current*
-> results — see "Three pre-existing bugs found along the way".
->
-> **What landed since the first draft** (all on `main`, none of it from this plan except 1b):
+> Written 2026-08-20 against `ee4c18e`, re-anchored the same day against `8ec3c10`. **Line numbers
+> in the body refer to the `8ec3c10` tree and are now stale wherever a stage has landed** — trust the
+> per-stage status blocks and the code, not the line numbers.
+
+---
+
+## STATUS — 2026-08-23
+
+**Branch `feat/multipair-correlation`, 5 commits ahead of `main`. `main` is untouched and remains
+the stable 1v1 fallback.** Nothing here has been pushed.
+
+| stage | state |
+|---|---|
+| **1a** tap fan-out | **DONE** — `d049f36` |
+| **1b** write-to-disk checkbox | **PARTIAL** — shipped in `8ec3c10`; 3 deviations still open, one of which is a Stage 3 prerequisite |
+| **2** sender throughput | **NOT STARTED** — deliberately deferred, see below |
+| **3** multi-pair correlator | **DONE in software** — `ab9a8c2`, `2507d7e`, `6476c68`, `ed842df`. **Not yet validated on hardware**, and Quad not yet deleted |
+
+```
+ed842df  Stage 3: multi-pair live correlator with a synthetic pulsed-laser source
+6476c68  Add the pair-parallel g2 kernel, proved equal to the reference
+2507d7e  Extract the retention engine as a testable ChannelGraph, and fix it
+ab9a8c2  Add tools/pair_map.py: pure pair derivation, shared with align_arc
+d049f36  Stage 1a: fan pixel_hooks out to every subscriber
+```
+
+### Test suite — 149 checks, all passing as of `ed842df`
+
+Plain asserts, no pytest (it is not in `requirements.txt`). **Run all of these before trusting any
+change**; the whole suite takes ~2 minutes, most of it numba compiling.
+
+```
+.venv\Scripts\python.exe tests\test_epoch_fix.py         # 12  (on main)
+.venv\Scripts\python.exe tests\test_hook_fanout.py       # 16  Stage 1a
+.venv\Scripts\python.exe tests\test_channel_graph.py     # 41  retention
+.venv\Scripts\python.exe tests\test_multi_window.py      # 30  end-to-end
+.venv\Scripts\python.exe tools\pair_map.py --selftest    # 29  pair derivation
+.venv\Scripts\python.exe correlate_kernel.py             # 25  kernel equivalence
+.venv\Scripts\python.exe synthetic_source.py             #  8  generator + comb
+```
+
+### Architecture as built
+
+Stage 3 split into four modules so the parts worth testing are testable without Tk. That split is
+load-bearing, not cosmetic: the golden brute force caught a real bug during the port (the first
+version trimmed node-2 arrays *before* correlating against them, dropping nearly every coincidence
+while still drawing a plausible histogram). Keep it.
+
+| module | owns | do not put in it |
+|---|---|---|
+| `tools/pair_map.py` | which pixels pair with which | anything stateful |
+| `correlate_engine.py` | which events are safe to correlate | Tk, numba, matplotlib |
+| `correlate_kernel.py` | the histogram | anything not bit-identical to `_multistart_multistop` |
+| `correlate_multi.py` | widgets | logic worth a test |
+| `synthetic_source.py` | photons, with no detector attached | — |
+
+### Measured on this machine (16 cores)
+
+- Pool vs serial, 80 pairs / 8.76M t1 events / `n_shift=5`: **0.257 s → 0.035 s, 7.35x**,
+  bit-identical at 4, 8 and 16 workers.
+- ≈ **5 core-seconds per second of data** at 80 pixels x 1 MHz — about a third of a 16-core master.
+  This is the number that makes Stage 2 deferrable.
+- `n_shift` default changed from 20 to **5**, per the coverage argument in "Performance" below.
+
+---
+
+## RESUME HERE — next session
+
+In priority order. The first two are the only things standing between the current tree and a real
+80-pixel run.
+
+1. **Validate on hardware with the pulsed laser** (same train split onto both nodes — confirmed).
+   This is the gating item: everything in Stage 3 is proven against a synthetic source only. Start at
+   8–16 pairs, `identity` mode, and read the comb by tooth *spacing* and *position*. Two caveats
+   discovered while building, both now unit tests and both worth re-reading before the bench session:
+   a comb pins the clock offset only **modulo the repetition period** (12.5 ns at 80 MHz), and the
+   `Mark τ` SNR box structurally caps near a few σ on a comb. See the Stage 3 status block.
+2. **Stage 1b deviation 1 — widen `write_hooked` from hooked-only to all pixel keys.** One-line
+   change to the `skipped_keys` comprehension plus a docstring. **This is a Stage 3 prerequisite**:
+   as shipped, an active-but-unhooked pixel is still written, so the flag does not deliver the
+   1.28 GB/s relief that motivated it. Without this, "disk flat at 80 pixels" only holds if every
+   active pixel is in some window's pair list.
+3. **Delete `QuadCorrelateWindow`** (`correlate.py`, the `QuadCorrelateWindow` class and `_Channel`)
+   once (1) passes. It is kept *only* as the transitional cross-check. When it goes, drop the
+   `_pick_unit` staticmethod alias, remove it from `ReceiverGUI._correlators`, and re-run the suite.
+4. **Stage 2**, when pair count x rate actually demands it. Start with its Phase 0 scaffolding (the
+   env-gated raw-stream dump), which needs detector time and therefore wants to be captured during a
+   bench session you are already having.
+
+**Smaller open items**, none blocking:
+
+- The count-distribution radio (`correlate.py`'s `_draw_distribution`) was **not** absorbed into the
+  multi-pair window. The marked-τ helpers, the Compute R button, the SNR sparkline and the hold-policy
+  status line all were.
+- Stage 1b deviations 2 and 3 (disable the checkbox while streaming; record it in
+  `session_stats.json`) remain open.
+- `ReceiverGUI._correlators` now has three windows. Adding a fourth means editing that one tuple —
+  that was the point of the refactor — but re-check the four consumers if you add a window with a
+  different interface.
+
+### What Stage 2 is deferred *behind*, and why
+
+Stage 2 is a pure sender-throughput optimization with **no correctness dependency** on the
+correlator, and it only binds at ~80 pixels x 1 MHz. Validating the multi-pair engine against a
+pulsed laser at 8–16 pairs does not need it, and the measured kernel cost above says the master is
+not the bottleneck. Doing Stage 3 first put a testable window in front of the laser weeks earlier.
+Nothing about Stage 2's design below has changed; it is written against `8ec3c10` line numbers and
+will need re-anchoring when picked up.
+
+---
+
+> **What landed on `main` between the first draft and Stage 1a** (none of it from this plan except 1b):
 >
 > | commit | change | effect on this plan |
 > |---|---|---|
 > | `20a058a` | sender logs abnormal marker ids live | adds a per-chunk full-array pass Stage 2a must fold into its 512-bin histogram |
-> | `3b6a53a` | `Mark τ (ns)` marker + SNR box in both correlator windows | Stage 3's window must absorb it, like the count-distribution view |
-> | `8ec3c10` | **write-to-disk checkbox** + `CLAUDE.md` correction | Stage 1b, but narrower than specified — see 1b below |
->
-> Stage 1a has since landed (see below), which closes the two-windows-on-one-pixel clobber and the
-> `hooks[320]`/`hooks[323]` calibration overwrite. Stage 1b as shipped still does **not** relieve the
-> disk at 80 pixels, which was the throughput argument for it — read 1b before assuming Stage 1 is
-> done. Its deviation 1 (widen the flag from hooked-only to all pixel keys) is a Stage 3 prerequisite.
+> | `3b6a53a` | `Mark τ (ns)` marker + SNR box in both correlator windows | absorbed by Stage 3's window |
+> | `8ec3c10` | **write-to-disk checkbox** + `CLAUDE.md` correction | Stage 1b, but narrower than specified |
+> | `759288c` | boundary-epoch correction decided per tick run | **fixes pre-existing bug 3** below |
 
 ## Context
 
@@ -51,7 +147,18 @@ silently — fail loudly.** `QuadCorrelateWindow` is **retired** — the new win
 grid becomes the full-grid pair mode), so Quad survives only as transitional test scaffolding and the
 last Stage 3 commit deletes it.
 
-### Three pre-existing bugs found along the way
+### Three pre-existing bugs found along the way — ALL THREE NOW FIXED
+
+**But two of them are only fixed in the *new* engine.** `QuadCorrelateWindow` still carries the
+dim-channel bug, which is the one caveat on using it as a cross-check: where the two engines
+disagree on a sparse or bursty channel, the **new** one is right. Quad results taken before
+2026-08-23 with unequal pixel brightness are affected.
+
+| bug | status |
+|---|---|
+| dim-channel coincidence loss | fixed in `correlate_engine.py` (`2507d7e`); **still present in Quad** |
+| latent calibration clobber | fixed for real by `merge_hooks` (`d049f36`) |
+| non-monotonic timestamps | fixed on `main` by `759288c`, with `tests/test_epoch_fix.py` |
 
 - **Dim-channel coincidence loss** (`correlate.py:1052-1063`). `cut_for` drops any partner whose
   array is *currently empty* from the release-point `min`. `keep_for` legitimately empties a channel whose
@@ -62,10 +169,15 @@ last Stage 3 commit deletes it.
   and the histogram still looks plausible. **This affects current 4-pair results with unequal pixel
   brightness.** Fix: gate release on a `last_ts` high-water mark — the newest timestamp ever
   observed — instead of `arr[-1]`. Bit-identical on busy channels, correct on sparse ones.
+  **FIXED** in `correlate_engine.py`. Both failure modes are now demonstrated against a
+  `LegacyGraph` that reproduces the old rule: it loses 35 of 103 coincidences on a 2-partner grid
+  while the bright pair still looks perfect (which is how it survived), and returns `cut=0` where the
+  fix returns 2 on a 1-partner diagonal. A test pins that both rules stay bit-identical on busy
+  channels, so this cannot have changed existing 1v1 results.
+
 - **Latent calibration clobber** (`receiver.py:441-442`). `hooks[320] = ...` overwrites any
-  correlator that had asked for key 320. The append-merge in Stage 1 removes the hazard. **Still
-  present** — `8ec3c10` added a `write_hooked` read immediately below these lines but left the
-  clobber itself untouched.
+  correlator that had asked for key 320. **FIXED** by `merge_hooks` in `d049f36`; covered by
+  `tests/test_hook_fanout.py`.
 - **Timestamps are already non-monotonic, occasionally.** The residual documented at
   `sender_backend.py:557-561` (the last record of each chip in a chunk has no successor, so a
   `coarse == 0xFFFF` record keeps an over-counted epoch) leaves a timestamp **+6.5536 ms in the
@@ -74,6 +186,13 @@ last Stage 3 commit deletes it.
   these arrays, which assumes sorted input — so this is a latent correctness hazard in existing
   analysis, independent of any change here. Fixing it properly means carrying each chip's final
   record across chunks; that is separate work, but Stage 2's codec must **tolerate** it.
+
+  **FIXED on `main`** by `759288c`, which decides the correction per 0xFFFF tick run rather than per
+  adjacent pair — the pairwise version (`7eecfb5`) demoted a good record whenever two photons shared
+  one tick, putting ~20.6k records 6.5536 ms in the *past* on the 2026-08-20 151x151 run. A
+  documented end-of-chunk residual remains (~1/65536 per chip per chunk), so Stage 2's codec must
+  still tolerate a negative delta, and `Channel.check_monotonic` counts violations rather than
+  raising.
 
 ---
 
@@ -614,7 +733,10 @@ later.
 
 **Stage 1.**
 
-*1a (outstanding).* Enable two correlator windows on the *same* pixel: both must receive data, and
+> *1a is DONE* — see the Stage 1a status block above; `tests/test_hook_fanout.py` covers every item
+> listed below, including the `a is b` zero-copy proof and the key-320 case.
+
+*1a (as specified, now implemented).* Enable two correlator windows on the *same* pixel: both must receive data, and
 the payload objects must be identical (`a is b`) proving zero-copy fan-out. A window hooking key 320
 alongside calibration: both get every chunk (today one starves). Legacy `{key: Queue}` input still
 works.
@@ -658,6 +780,25 @@ Add a `raw_b`/`wire_b` ratio to `stats` and expect ~2.00x at the rates that matt
 **measure with writes on** or the comparison flatters the codec.
 
 **Stage 3.**
+
+> **Done / outstanding, as of `ed842df`.** Everything below is implemented and passing **except**
+> where marked. The one category not covered is *anything requiring real detectors* — by
+> construction, since the synthetic source exists precisely so the rest did not have to wait for
+> bench time.
+>
+> | item | state |
+> |---|---|
+> | kernel equivalence | **done** — `correlate_kernel.py --selftest`, 25 checks |
+> | golden brute force, diagonal + grid | **done** — 8,084 and 11,573 coincidences, exact |
+> | sparse / stall matrix (i)(ii)(iii) | **done** — plus the pre-fix engine shown to fail (ii) |
+> | whole-node lag, symmetric + asymmetric | **done** — catches up bit-identical |
+> | synthetic source mode | **done** — `synthetic_source.py`, and it is what unlocked the rest |
+> | display / save / legacy `.txt` export | **done** — `tests/test_multi_window.py` |
+> | **transitional Quad cross-check (`quad_compat`)** | **NOT DONE** — judged redundant once the golden brute force existed, since it is a strictly better oracle and Quad carries the retention bug. Reinstate only if a hardware discrepancy needs bisecting |
+> | **on hardware — the fan-out proof** | **NOT DONE** — needs detectors. Remember the `suffix` warning below |
+> | **after Quad is deleted: re-run the suite** | **NOT DONE** — Quad still exists |
+> | **kernel s/batch and peak RSS at 4 → 16 → 80 pairs** | **PARTIAL** — timing measured (7.35x, ~5 core-s per data-second at 80 pairs); peak RSS not recorded, and the sustainable `npairs x rate` for this machine is not yet in `CLAUDE.md` |
+
 - *Kernel equivalence:* the new pair-parallel kernel must match `_multistart_multistop` **exactly**
   (`np.array_equal`, int64 — reordering integer accumulation is exact, so any difference is a bug).
   Sweep n1/n2 including 0 and `n_shift > n2`, and τ exactly on a bin edge.
