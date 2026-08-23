@@ -29,6 +29,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from receiver_backend import start_server, check_connection, run_session_loop, run_intensity_session
 from correlate import CorrelateWindow, QuadCorrelateWindow
+from correlate_multi import MultiCorrelateWindow
 from offset_tools import estimate_offset
 import ssh_launcher
 
@@ -734,14 +735,20 @@ class ReceiverGUI:
         # (node, pixel-loc) between windows is fine: merge_hooks() fans the
         # payload out to every subscriber.
         self._quad_correlate_win = QuadCorrelateWindow(root)
+        # The multi-pair window. Subsumes Quad (whose 2x2 workflow is its
+        # "grid" pair mode at any size); Quad stays only as a transitional
+        # cross-check until this engine is validated on hardware.
+        self._multi_correlate_win = MultiCorrelateWindow(root)
         # Every correlator window, in one place. Each one needs its hooks
         # merged, its is_enabled consulted before calibration, and its
         # start_with_offset called on every path out of the cal -- four sites
         # that must never disagree about the set of windows. Adding a window
         # means adding it here and nowhere else.
-        self._correlators = (self._correlate_win, self._quad_correlate_win)
+        self._correlators = (self._correlate_win, self._quad_correlate_win,
+                             self._multi_correlate_win)
         self._monitor_abort: threading.Event | None = None
         self._build_ui()
+        self._push_write_disk_state()   # correlators start out agreeing with the box
         self._poll_log()
         self._schedule_health_check()
         self.root.protocol('WM_DELETE_WINDOW', self._on_close)
@@ -863,6 +870,7 @@ class ReceiverGUI:
         toggle during a run applies from the next data connection — saying so
         beats leaving someone to wonder why px_*.bin kept growing.
         """
+        self._push_write_disk_state()
         if self.write_disk_var.get():
             self._enqueue_log('Write to disk ON — every pixel is persisted as usual.\n')
         else:
@@ -870,6 +878,20 @@ class ReceiverGUI:
                 'Write to disk OFF — live-correlated pixels will be fed to the '
                 'correlator only, with no px_*.bin. Sync markers are still '
                 'written. Applies from the next START.\n')
+
+    def _push_write_disk_state(self) -> None:
+        """Tell every correlator whether the timestamps are being kept.
+
+        Without this the correlator cannot know, and its overload warning says
+        "raw data is still complete on disk" — which is false the moment the
+        checkbox is unchecked. What an overload MEANS changes with this flag:
+        a recoverable delay, or permanent photon loss.
+        """
+        on = bool(self.write_disk_var.get())
+        for c in self._correlators:
+            setter = getattr(c, 'set_write_to_disk', None)
+            if setter is not None:
+                setter(on)
 
     def _start_all(self) -> None:
         try:

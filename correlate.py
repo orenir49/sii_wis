@@ -2,13 +2,20 @@
 Live g² correlator — opened automatically by spad_receiver_gui.py.
 
 Two pixel timestamp streams are tapped in RAM via queue hooks injected into
-run_session_loop.  The tap is a copy, not a diversion — run_session_loop still
-writes both pixels to px_<n>.bin, so nothing seen here is exclusive to RAM.  A
-background thread runs the multistart-multistop algorithm on all accumulated
-timestamps and posts the updated histogram back to the main thread for display.
+run_session_loop.  The tap is a copy, not a diversion, and each key fans out to
+every subscriber — so two windows can watch one pixel.  A background thread runs
+the multistart-multistop algorithm on all accumulated timestamps and posts the
+updated histogram back to the main thread for display.
 
 No event is ever dropped to keep up. If the correlator falls behind the detector
 the backlog simply grows, and the status line reports how far behind it is.
+
+Whether that backlog is *recoverable* depends on the receiver's "Write
+timestamps to disk" checkbox, which the window is told via set_write_to_disk().
+With writes on, falling behind is only a display delay — the raw data is
+complete in px_*.bin.  With writes off, the RAM tap is the only copy and an
+overload is permanent photon loss.  This used to be stated unconditionally, and
+that claim became false the moment the checkbox shipped.
 """
 
 import os
@@ -64,6 +71,23 @@ def _prewarm():
 # ---------------------------------------------------------------------------
 
 MARK_TAU_NS_DEFAULT = '14'   # expected bunching-peak delay for this setup
+
+
+def pick_unit(tmax_ps: float) -> tuple[str, float]:
+    """Return (label, scale) such that tmax_ps / scale is in [1, 1000).
+
+    Module-level so correlate_multi.py can share it rather than reimplement the
+    axis convention; CorrelateWindow._pick_unit stays as an alias while
+    QuadCorrelateWindow still reaches for it.
+    """
+    if tmax_ps < 1_000:
+        return 'ps', 1.0
+    elif tmax_ps < 1_000_000:
+        return 'ns', 1_000.0
+    elif tmax_ps < 1_000_000_000:
+        return 'µs', 1_000_000.0
+    else:
+        return 'ms', 1_000_000_000.0
 
 
 def _parse_mark_tau_ps(var: tk.StringVar) -> float | None:
@@ -156,6 +180,7 @@ class CorrelateWindow(tk.Toplevel):
         self._offset: int | None = None
         self._correlating   = False
         self._has_new_data  = False
+        self._write_to_disk = True    # told by ReceiverGUI; see _backlog_note
         self._result_q: queue.Queue = queue.Queue()
 
         # Accumulated histogram (incremental — staging buffers are cleared each pass)
@@ -290,6 +315,14 @@ class CorrelateWindow(tk.Toplevel):
     @property
     def is_enabled(self) -> bool:
         return self._active
+
+    def set_write_to_disk(self, on: bool) -> None:
+        """Told by ReceiverGUI when the write-to-disk checkbox changes.
+
+        The correlator cannot otherwise know, and it is the difference between
+        a backlog that is a delay and one that is permanent photon loss.
+        """
+        self._write_to_disk = bool(on)
 
     # ------------------------------------------------------------------
     # Numba pre-warm
@@ -488,15 +521,18 @@ class CorrelateWindow(tk.Toplevel):
         """Non-empty only when the correlator has fallen meaningfully behind.
 
         Nothing is discarded to catch up — the backlog is allowed to grow — so
-        the only honest thing to do is say how far behind the histogram is.
+        the only honest thing to do is say how far behind the histogram is, and
+        whether that is recoverable. It is not, with disk writes off.
         """
         span, n = self._span_and_size()
         self._backlog_s = span
         if span < BACKLOG_WARN_S:
             return ''
+        fate = ('raw data is still complete on disk' if self._write_to_disk
+                else '⛔ write-to-disk is OFF — this RAM tap is the only copy')
         return (f'⚠ correlator {span:.1f} s behind the detector '
                 f'({n:,} events, {n * 8 / 1e6:.0f} MB held) — the histogram is '
-                f'not current; raw data is still complete on disk')
+                f'not current; {fate}')
 
     def _launch_correlation(self) -> None:
         """Correlate every t1 event whose full ±tmax partner window has arrived.
@@ -590,17 +626,7 @@ class CorrelateWindow(tk.Toplevel):
             pass
         self.after(200, self._poll_results)
 
-    @staticmethod
-    def _pick_unit(tmax_ps: float) -> tuple[str, float]:
-        """Return (label, scale) such that tmax_ps / scale is in [1, 1000)."""
-        if tmax_ps < 1_000:
-            return 'ps', 1.0
-        elif tmax_ps < 1_000_000:
-            return 'ns', 1_000.0
-        elif tmax_ps < 1_000_000_000:
-            return 'µs', 1_000_000.0
-        else:
-            return 'ms', 1_000_000_000.0
+    _pick_unit = staticmethod(pick_unit)
 
     def _update_plot(self, hist: np.ndarray, bins: np.ndarray,
                      write: bool = True) -> None:

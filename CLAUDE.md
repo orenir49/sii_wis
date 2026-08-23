@@ -36,6 +36,14 @@ python .claude/skills/spectral-align/align_arc.py REF.txt OTHER.txt --emit-pairs
 python tools\pair_map.py --mode affine --lo 120 --hi 200 -a 1.037 -b -2.4
 python tools\pair_map.py --selftest
 
+# Test suite (plain asserts; no pytest in requirements.txt)
+.venv\Scripts\python.exe tests\test_epoch_fix.py
+.venv\Scripts\python.exe tests\test_hook_fanout.py
+.venv\Scripts\python.exe tests\test_channel_graph.py
+.venv\Scripts\python.exe tests\test_multi_window.py
+.venv\Scripts\python.exe correlate_kernel.py      # kernel equivalence
+.venv\Scripts\python.exe synthetic_source.py      # generator + comb
+
 # SII bunching-excess / integration-time calculator
 python tools\sii_calculator.py
 
@@ -70,6 +78,10 @@ Minimal GUI that starts a command server thread on launch. Receives JSON command
 | `sender.py` | Sender GUI shell; starts command server thread |
 | `sender_backend.py` | Command server + lSPAD TCP client; contains `PIXMAP` (320-pixel array mapping); logs abnormal marker ids live (see below) |
 | `correlate.py` | `CorrelateWindow` (single-pair) + `QuadCorrelateWindow` (2 pixels/node, 4 pairwise g² histograms — e.g. mask_two.txt) live correlators, Numba JIT kernel; "Compute R…" button opens `tools/sii_calculator.py` |
+| `correlate_multi.py` | `MultiCorrelateWindow` — up to ~320 pairs, one plot + pair selector. Widgets only; the logic lives in the three modules below |
+| `correlate_engine.py` | `ChannelGraph` — which events are safe to correlate and which must be kept. No Tk; 41 tests |
+| `correlate_kernel.py` | `_pair_kernel` (`nogil`, bitwise identical to `_multistart_multistop`) + `PairPool`; `--selftest` |
+| `synthetic_source.py` | Pulsed-laser / Poisson generator — drives the whole path with no detector attached |
 | `tools/sii_calculator_backend.py` | Pure formulas: `<\|V\|^2>`, coherence time, bunching-excess `R`, required integration time |
 | `tools/sii_calculator.py` | `SIICalculatorWindow` — interactive bunching-excess / integration-time calculator |
 | `tools/plot_g2_result.py` | Peak-annotated g² histogram + count-distribution PNGs from a saved `{px1}_{px2}_{suffix}.txt` |
@@ -104,7 +116,28 @@ Throttled deliberately: `log_fn` writes to the control socket from the parser th
 
 Each key fans out to **every** subscriber. `merge_hooks()` (`receiver.py`) composes the per-window `{key_id: Queue}` maps by appending rather than overwriting, so two windows watching one pixel both get every chunk, and a correlator watching key 320/323 is no longer clobbered by the dwell-calibration tap. The payload is an immutable `bytes`, so fan-out is zero-copy — subscribers must treat it as read-only. A bare `Queue` value is still accepted and normalized once per connection, so the correlator windows keep returning plain `{px: Queue}`. `ReceiverGUI._correlators` is the single list of windows: hook merging, the `is_enabled` calibration gate, and both `start_with_offset` paths all iterate it, so adding a window means editing one line.
 
-Both correlator windows have a `Mark τ (ns)` field (default 14) that puts a marker on that bin and annotates its counts, excess over the mean, SNR and mean ± σ — the same numbers `tools/plot_g2_result.py` reports, but at a τ you name rather than at the argmax.
+### Multi-pair correlator (`correlate_multi.py`)
+
+`MultiCorrelateWindow` correlates many pairs at once — a diagonal (each node-1 pixel against its matched partner on node 2), or a full grid. The concerns are deliberately split so the hard parts are testable without Tk:
+
+| module | owns | tested by |
+|---|---|---|
+| `tools/pair_map.py` | which pixels pair with which | `--selftest`, 29 checks |
+| `correlate_engine.py` | which events are safe to correlate | `tests/test_channel_graph.py`, 41 checks |
+| `correlate_kernel.py` | the histogram | `--selftest`, 25 checks |
+| `correlate_multi.py` | widgets | `tests/test_multi_window.py`, 30 checks |
+
+Pair modes: **identity** (`p2 = p1`), **affine** (`p2 = round(((p1-160) - b)/a + 160)`, inverting `align_arc.py`'s fit — `align_arc.py --emit-pairs LO HI` calls the same helper so the two cannot disagree), **grid** (outer product — this is `QuadCorrelateWindow`'s 2×2 workflow at any size), and **file** (`pix1,pix2` CSV). Affine with `a ≠ 1` is *not* bijective, so a node-2 pixel can serve two pairs; channels are therefore keyed by **distinct pixel**, never by pair. **Enable stays disabled until Derive succeeds**, and Derive shows a preview table flagging shared channels, dropped out-of-range partners, and any pixel the mask file has switched off (a guaranteed permanent stall).
+
+Retention (`ChannelGraph`) generalizes the two-pixel logic: a node-1 event is released only once **every** partner has been observed past `t1 + tmax`. The release point is a `last_ts` **watermark** — the newest timestamp ever seen — not `arr[-1]`, so a channel legitimately trimmed to size 0 no longer reads as silent. Genuinely silent partners are excluded only after `stall_grace_s` of wall clock or `stall_tolerance_ps` of detector-time lag, and every exclusion is reported: it means coincidences are being lost *now*, which the status line distinguishes from "waiting on node 2, N s behind (nothing lost)".
+
+Overload policy is **hold**: past the RAM cap the correlator stops draining, freezes, and reports in red. No subsampling, no silent skipping. What an overload *means* depends on the receiver's write-to-disk checkbox, which is pushed into every window via `set_write_to_disk()` — with writes on a backlog is a delay, with them off it is permanent photon loss.
+
+Output is one batched `.npz` (`tau_ps`, `hist (N, nbins)`, `px1`, `px2`, counts, JSON `meta`), written `.tmp` then `os.replace()`. **Export pair → .txt** emits the legacy `{px1}_{px2}_{suffix}.txt` that `tools/plot_g2_result.py` reads.
+
+**Synthetic source** (`synthetic_source.py`) drives the entire path with no detector: one pulse train shared by both nodes, so cross-node g² shows a comb at multiples of the repetition period. The comb *period* validates the clock scale on every pair simultaneously and the tooth at τ=0 validates the offset — but only **modulo the repetition period** (12.5 ns at 80 MHz), so it pins the fine offset, not the coarse one. Note the `Mark τ` SNR box reads only a few σ on a comb no matter how long you integrate: it takes σ over the whole histogram, and ~9 equal teeth inside ±tmax inflate it.
+
+Both single-pair correlator windows have a `Mark τ (ns)` field (default 14) that puts a marker on that bin and annotates its counts, excess over the mean, SNR and mean ± σ — the same numbers `tools/plot_g2_result.py` reports, but at a τ you name rather than at the argmax.
 
 The receiver's **Write timestamps to disk** checkbox (on by default) sets `run_session_loop(write_hooked=...)`. Unchecked, hooked *pixel* keys go to the correlator queue only and their `px_*.bin` is never created — live correlation without keeping the timestamps. Keys 320–325 are never suppressed: they are hooked on every run for clock calibration, and the offline offset estimate needs them afterwards. The flag is read once per data connection, so toggling mid-run applies from the next START.
 

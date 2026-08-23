@@ -1,6 +1,7 @@
 # Scale-up to 80-pair diagonal live correlations
 
-> **Status: Stage 1 done (1a landed 2026-08-23, 1b partly); 2 and 3 not implemented.** Stage 2 is
+> **Status: Stage 1 done (1a landed 2026-08-23, 1b partly); Stage 3 landed 2026-08-23 and passes
+> end-to-end against a synthetic pulsed source; Stage 2 not implemented.** Stage 2 is
 > deliberately deferred behind Stage 3 — it is a pure sender-throughput optimization with no
 > correctness dependency on the correlator, and it only binds at ~80 pixels x 1 MHz. Validating the
 > multi-pair engine against a pulsed laser at 8-16 pairs does not need it.
@@ -328,6 +329,41 @@ unchanged as N grows; framing overhead at N=80/1 MHz is 0.8% of a flush. Also se
 ---
 
 ## Stage 3 — Multi-pair correlator (~80 diagonal pairs), replacing Quad
+
+> **LANDED 2026-08-23** on `feat/multipair-correlation`, essentially as specified below, with
+> `QuadCorrelateWindow` **not yet deleted** — it stays as the transitional cross-check until the new
+> engine is validated on hardware, which is the last commit of the stage.
+>
+> | file | role | tests |
+> |---|---|---|
+> | `tools/pair_map.py` | pair derivation | 29 checks |
+> | `correlate_engine.py` | retention (`ChannelGraph`) | 41 checks |
+> | `correlate_kernel.py` | `_pair_kernel` + `PairPool` | 25 checks |
+> | `correlate_multi.py` | the window | 30 checks |
+> | `synthetic_source.py` | pulsed-laser / Poisson generator | 8 checks |
+>
+> **Measured:** the pool is 7.35x over serial on 16 cores at 80 pairs / 8.76M events / `n_shift=5`,
+> bit-identical at 4, 8 and 16 workers — about 5 core-seconds per second of data at 80 pixels x
+> 1 MHz, so ~32% of a 16-core master. `n_shift=5` is the new default, per the coverage argument below.
+>
+> **Two findings not anticipated by the plan**, both from the synthetic source:
+>
+> - **A pulsed comb pins the clock offset only modulo the repetition period** — 12.5 ns at 80 MHz. It
+>   validates the *fine* offset and the clock *scale* (tooth spacing) on every pair at once, which is
+>   exactly what a multi-pair sanity check needs, but it cannot catch a coarse offset error. A
+>   test asserts both directions: a correct offset puts a tooth at tau = 0, and an offset wrong by
+>   half a period moves the comb off it.
+> - **The marked-tau SNR box reads only a few sigma on a comb, no matter how long you integrate.**
+>   `_mark_tau_bin` takes mean and sigma over the whole histogram, which assumes a flat background
+>   with one peak; a comb has ~9 equal teeth inside +-tmax and they inflate sigma, capping the SNR
+>   near sqrt(n_teeth). Read the comb by tooth spacing and position, not from that box — it is
+>   correct for the thermal bunching measurement it was built for.
+>
+> **Not yet done in this stage:** deleting Quad (`correlate.py:737-1214`) and the transitional
+> `quad_compat` cross-check; the count-distribution view and the backlog note were absorbed only in
+> part (the window has the marked-tau helpers, the Compute R button, a per-pair SNR sparkline reusing
+> `_mark_tau_bin`'s statistic, and a hold-policy status line, but not the count-distribution radio).
+> Hardware validation is outstanding by definition.
 
 This window **replaces `QuadCorrelateWindow`**, which is retired once it lands. That has one
 requirement consequence: Quad's workflow is a full **2x2 grid** (every node-1 pixel against every
