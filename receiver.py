@@ -40,6 +40,28 @@ CAL_POLL_MS   = 250               # how often to check collected dwell span
 CAL_MAX_WAIT_S = 30.0             # backstop if a period never accumulates
 
 
+def merge_hooks(*hook_maps) -> dict:
+    """Compose per-window {key_id: Queue} maps into {key_id: [Queue, ...]}.
+
+    Append, never overwrite: two windows asking for the same (node, pixel) both
+    get every chunk. The old {**a, **b} dict-merge silently starved the loser,
+    and did the same to any window that asked for key 320/323 alongside the
+    dwell-calibration tap.
+
+    Accepts a bare Queue or a list/tuple of them as a value, so a caller that
+    has already merged can be composed again. Dedupe is by identity: the same
+    queue passed twice must not receive the payload twice.
+    """
+    merged: dict = {}
+    for m in hook_maps:
+        for kid, v in (m or {}).items():
+            qs = merged.setdefault(kid, [])
+            for q in (v if isinstance(v, (list, tuple)) else (v,)):
+                if all(q is not seen for seen in qs):
+                    qs.append(q)
+    return merged
+
+
 # ---------------------------------------------------------------------------
 # NodePanel — one sender node (control client + data server)
 # ---------------------------------------------------------------------------
@@ -437,9 +459,14 @@ class NodePanel:
                     except queue.Empty:
                         break
 
-            hooks = dict(self._get_hooks_fn() if self._get_hooks_fn else {})
-            hooks[320] = self._master_dwell_q  # master_dwell — offset diagnostics
-            hooks[323] = self._dwell_q         # slave_dwell — needed for clock-offset calibration
+            # Append-merge, so a correlator that also watches key 320 or 323
+            # keeps its subscription instead of being overwritten by the
+            # calibration tap (and vice versa).
+            hooks = merge_hooks(
+                self._get_hooks_fn() if self._get_hooks_fn else {},
+                {320: self._master_dwell_q,   # master_dwell — offset diagnostics
+                 323: self._dwell_q},         # slave_dwell — clock-offset calibration
+            )
 
             # Read once per session, not per chunk: toggling the checkbox
             # mid-run must not leave half a pixel's timestamps on disk.
@@ -703,11 +730,16 @@ class ReceiverGUI:
 
         self._correlate_win = CorrelateWindow(root)
         # Separate tool for a 2-pixel-per-node mask (e.g. mask_two.txt) --
-        # not unified with the single-pair correlator above. If both are
-        # enabled with an overlapping (node, pixel-loc), the hooks merge
-        # below lets whichever is spread second in the dict win; the other
-        # silently gets no data for that pixel.
+        # not unified with the single-pair correlator above. Overlapping
+        # (node, pixel-loc) between windows is fine: merge_hooks() fans the
+        # payload out to every subscriber.
         self._quad_correlate_win = QuadCorrelateWindow(root)
+        # Every correlator window, in one place. Each one needs its hooks
+        # merged, its is_enabled consulted before calibration, and its
+        # start_with_offset called on every path out of the cal -- four sites
+        # that must never disagree about the set of windows. Adding a window
+        # means adding it here and nowhere else.
+        self._correlators = (self._correlate_win, self._quad_correlate_win)
         self._monitor_abort: threading.Event | None = None
         self._build_ui()
         self._poll_log()
@@ -734,8 +766,8 @@ class ReceiverGUI:
                                default_data_port=50007,
                                default_ssh_user='labcomp1',
                                log_fn=self._enqueue_log,
-                               get_hooks_fn=lambda: {**self._correlate_win.hooks_node1,
-                                                     **self._quad_correlate_win.hooks_node1},
+                               get_hooks_fn=lambda: merge_hooks(
+                                   *(c.hooks_node1 for c in self._correlators)),
                                get_write_hooked_fn=lambda: self.write_disk_var.get(),
                                set_correlate_pixel_fn=lambda pix: self._correlate_win.px1_var.set(str(pix)),
                                on_first_data_fn=self._on_node_first_data)
@@ -746,8 +778,8 @@ class ReceiverGUI:
                                default_data_port=50008,
                                default_ssh_user='oreni',
                                log_fn=self._enqueue_log,
-                               get_hooks_fn=lambda: {**self._correlate_win.hooks_node2,
-                                                     **self._quad_correlate_win.hooks_node2},
+                               get_hooks_fn=lambda: merge_hooks(
+                                   *(c.hooks_node2 for c in self._correlators)),
                                get_write_hooked_fn=lambda: self.write_disk_var.get(),
                                set_correlate_pixel_fn=lambda pix: self._correlate_win.px2_var.set(str(pix)),
                                on_first_data_fn=self._on_node_first_data)
@@ -890,7 +922,7 @@ class ReceiverGUI:
             step_ms = max(1, int(duration / 10 * 1000))
             self._schedule_progress(step_ms, 1, self._run_id)
 
-        if self._correlate_win.is_enabled or self._quad_correlate_win.is_enabled:
+        if any(c.is_enabled for c in self._correlators):
             # Wait for data to actually flow before opening the calibration
             # window. Between START and the first timestamp the sender still has
             # to reach the receiver and negotiate with lSPAD (STOP, drain,
@@ -1238,8 +1270,8 @@ class ReceiverGUI:
             self._set_cal_status(
                 f'● Calibration failed ({t1.size}/{t2.size} events) — offset = 0',
                 color='#cc3333')
-            self._correlate_win.start_with_offset(0)
-            self._quad_correlate_win.start_with_offset(0)
+            for c in self._correlators:
+                c.start_with_offset(0)
             self.node1.start_dwell_drain()
             self.node2.start_dwell_drain()
             return
@@ -1290,8 +1322,8 @@ class ReceiverGUI:
         self._set_cal_status(
             f'● Calibrated — offset {slave_offset:+,} ps, acquisition running',
             color='#228822')
-        self._correlate_win.start_with_offset(slave_offset)
-        self._quad_correlate_win.start_with_offset(slave_offset)
+        for c in self._correlators:
+            c.start_with_offset(slave_offset)
         self.node1.start_dwell_drain()
         self.node2.start_dwell_drain()
 

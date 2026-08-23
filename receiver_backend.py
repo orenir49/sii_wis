@@ -102,10 +102,16 @@ def run_session_loop(conn: socket.socket, log_fn=print,
     Blocks until the sender disconnects (ConnectionError).
     Protocol per session: KEY_SETUP → data chunks → KEY_END.
 
-    pixel_hooks:  optional {key_id: queue.Queue} — matching chunks are put()
-                  into the queue *in addition to* being written to disk (live
-                  correlator). A read tap, not a diversion: every payload is
-                  persisted regardless of who else is watching it.
+    pixel_hooks:  optional {key_id: queue.Queue} or {key_id: [queue.Queue, …]}
+                  — matching chunks are put() into every listed queue *in
+                  addition to* being written to disk (live correlator). A read
+                  tap, not a diversion: every payload is persisted regardless of
+                  who else is watching it.
+
+                  Fan-out is genuinely zero-copy — payload is an immutable
+                  bytes from readall(), so N subscribers on one key share one
+                  object and the loop costs N sub-microsecond Queue.put()s.
+                  Consumers must therefore treat it as read-only.
     event_accum:  optional single-element list [int]; the inner loop adds
                   n_bytes//8 for every pixel chunk (key_id < 320) so the
                   caller can poll it for a count-rate display.
@@ -125,12 +131,19 @@ def run_session_loop(conn: socket.socket, log_fn=print,
                   needs afterwards; dropping those would make a run
                   unanalysable rather than merely unrecorded.
     """
+    # Normalize the hook map once per connection so the inner loop stays
+    # branch-light and legacy {key: Queue} callers keep working unchanged.
+    subs: dict = {}
+    if pixel_hooks:
+        for _kid, _v in pixel_hooks.items():
+            subs[_kid] = tuple(_v) if isinstance(_v, (list, tuple)) else (_v,)
+
     # Fixed for the life of the connection: pixel_hooks is resolved by the
     # caller before this loop starts, so every back-to-back session suppresses
     # the same keys.
     skipped_keys: set = set()
-    if not write_hooked and pixel_hooks:
-        skipped_keys = {k for k in pixel_hooks if k < 320}
+    if not write_hooked and subs:
+        skipped_keys = {k for k in subs if k < 320}
 
     session = 0
     stream  = conn.makefile('rb', buffering=1 << 20)
@@ -197,8 +210,8 @@ def run_session_loop(conn: socket.socket, log_fn=print,
                         skipped += n_bytes
                     else:
                         unknown += 1
-                    if pixel_hooks and key_id in pixel_hooks:
-                        pixel_hooks[key_id].put(payload)
+                    for q in subs.get(key_id, ()):
+                        q.put(payload)
 
                     chunks += 1
                     if event_accum is not None and key_id < 320:

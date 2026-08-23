@@ -1,6 +1,11 @@
 # Scale-up to 80-pair diagonal live correlations
 
-> **Status: Stage 1b partly landed; 1a, 2 and 3 not implemented.** Written 2026-08-20, re-anchored
+> **Status: Stage 1 done (1a landed 2026-08-23, 1b partly); 2 and 3 not implemented.** Stage 2 is
+> deliberately deferred behind Stage 3 — it is a pure sender-throughput optimization with no
+> correctness dependency on the correlator, and it only binds at ~80 pixels x 1 MHz. Validating the
+> multi-pair engine against a pulsed laser at 8-16 pairs does not need it.
+>
+> Written 2026-08-20, re-anchored
 > against commit `8ec3c10` the same day. Line numbers below refer to that tree, **not** to `ee4c18e`
 > as originally drafted. Three pre-existing bugs are identified below that affect *current*
 > results — see "Three pre-existing bugs found along the way".
@@ -13,10 +18,10 @@
 > | `3b6a53a` | `Mark τ (ns)` marker + SNR box in both correlator windows | Stage 3's window must absorb it, like the count-distribution view |
 > | `8ec3c10` | **write-to-disk checkbox** + `CLAUDE.md` correction | Stage 1b, but narrower than specified — see 1b below |
 >
-> Stage 1a (`pixel_hooks` fan-out) is **untouched**: hooks are still `dict[key_id, Queue]`, so two
-> windows on one pixel still clobber each other and the `hooks[320]`/`hooks[323]` calibration
-> overwrite at `receiver.py:441-442` is still live. Stage 1b as shipped does **not** relieve the disk
-> at 80 pixels, which was the throughput argument for it — read 1b before assuming Stage 1 is done.
+> Stage 1a has since landed (see below), which closes the two-windows-on-one-pixel clobber and the
+> `hooks[320]`/`hooks[323]` calibration overwrite. Stage 1b as shipped still does **not** relieve the
+> disk at 80 pixels, which was the throughput argument for it — read 1b before assuming Stage 1 is
+> done. Its deviation 1 (widen the flag from hooked-only to all pixel keys) is a Stage 3 prerequisite.
 
 ## Context
 
@@ -73,7 +78,21 @@ last Stage 3 commit deletes it.
 
 ## Stage 1 — Optional disk writing + multi-subscriber tap
 
-### 1a. `pixel_hooks` fan-out — NOT IMPLEMENTED
+### 1a. `pixel_hooks` fan-out — LANDED
+
+Implemented as specified below, on `feat/multipair-correlation`. `merge_hooks()` sits at
+`receiver.py:44-64`; the normalization and fan-out are at `receiver_backend.py:134-139` and the
+`for q in subs.get(key_id, ())` loop replacing the old single-`put`. The `self._correlators` tuple
+landed with it, and all four per-window sites (both `get_hooks_fn` lambdas, the `is_enabled`
+calibration gate, both `start_with_offset` paths) now iterate it instead of naming windows.
+
+`tests/test_hook_fanout.py` covers it — 16 checks, all passing, driving a real
+`socket.socketpair()` through `run_session_loop()` rather than mocking it. Verified: two windows on
+one pixel both receive every chunk; the payload objects are identical (`a is b is c`), proving
+zero-copy; legacy `{key: Queue}` input still works; a window on key 320 survives the calibration tap;
+fan-out composes with `write_hooked=False` (no `px_*.bin`, both subscribers still fed, sync files
+intact). Confirmed in the real GUI: with `CorrelateWindow` and `QuadCorrelateWindow` both on pixel
+147, `get_hooks_fn()` returns 2 subscribers for key 147 where the old dict-merge returned 1.
 
 `receiver_backend.py` — hooks become `dict[int, list[Queue]]`:
 
