@@ -159,6 +159,73 @@ def drain_lspad(sock: socket.socket, quiet_for: float = 0.5,
     return head, total
 
 
+def correct_boundary_epochs(coarse, reset_arr, pixel_nr, is_mast) -> int:
+    """Undo the over-counted epoch on top-of-range records, in place.
+
+    lSPAD emits the reset marker (id 234) just *before* the final
+    coarse=0xFFFF tick of the epoch it closes, so a photon in that tick gets
+    the incremented epoch and lands one full reset period (6.5536 ms) in the
+    future — which also breaks the sortedness np.searchsorted relies on
+    downstream.
+
+    A correctly assigned top-of-range record is the LAST record of its epoch,
+    so it is stale iff the next record on the same chip still carries the same
+    epoch. Two things must be skipped when looking for that successor:
+
+      * the reset marker itself, which sits on the boundary carrying the
+        pre-increment epoch, and
+      * any same-tick partner — a second photon in the *same* 0xFFFF tick is
+        by construction in the same epoch, so a pairwise test sees it as
+        proof of staleness and demotes a perfectly good record by a full
+        epoch. That is a real regression, not a hypothetical: on the
+        2026-08-20 151x151 run it fired ~20.6k times across 1.1e10 records,
+        and every one of those was an inversion rather than a repair. It
+        scales as P(>=2 photons in a 100 ns tick), so it gets worse the
+        brighter you run.
+
+    So the unit of decision is a *run* of consecutive same-chip records that
+    are all at 0xFFFF and share an epoch — one tick's worth of photons. The
+    whole run is stale iff the first record after it carries that same epoch,
+    and the verdict applies to every member.
+
+    Residual: a run at the very end of a chip's records in this chunk has no
+    successor here and is left alone. That matters only if it sits exactly at
+    0xFFFF — 1/65536 per chip per chunk. Carrying records across chunks to
+    close that costs more than the defect.
+
+    Returns the number of records corrected.
+    """
+    n_fixed = 0
+    not_reset = pixel_nr != RESET_ID
+    for chip in (is_mast, ~is_mast):
+        idx = np.nonzero(chip & not_reset)[0]
+        m = idx.size
+        if m < 2:
+            continue
+        r_chip = reset_arr[idx]
+        is_top = coarse[idx] == TOP_COARSE
+        if not is_top.any():
+            continue
+
+        # partner[k]: record k+1 continues k's tick, so k is not the run end.
+        partner = np.zeros(m, dtype=bool)
+        partner[:-1] = is_top[:-1] & is_top[1:] & (r_chip[1:] == r_chip[:-1])
+        # run_end[k] = index of the last record in k's run (nearest
+        # non-partner position at or after k), by reverse-accumulating a min.
+        run_end = np.minimum.accumulate(
+            np.where(~partner, np.arange(m), m)[::-1])[::-1]
+
+        has_succ = run_end < m - 1
+        succ     = np.where(has_succ, np.minimum(run_end + 1, m - 1), 0)
+        stale    = is_top & has_succ & (r_chip[succ] == r_chip)
+
+        n_stale = int(stale.sum())
+        if n_stale:
+            reset_arr[idx[stale]] -= 1
+            n_fixed += n_stale
+    return n_fixed
+
+
 def is_text_reply(data: bytes) -> bool:
     """True if `data` looks like an lSPAD text reply rather than binary stream."""
     if not data:
@@ -537,40 +604,11 @@ def run(sock: socket.socket,
 
                     reset_arr = np.where(is_mast, cum_reset_m, cum_reset_s)
 
-                    # lSPAD emits the reset marker (id 234) just *before* the
-                    # final coarse=0xFFFF tick of the epoch it closes, so that
-                    # photon gets the incremented epoch and lands one full reset
-                    # period (6.5536 ms) in the future — which also breaks the
-                    # sortedness np.searchsorted relies on downstream.
-                    #
-                    # A correctly assigned top-of-range record is by definition
-                    # the LAST record of its epoch, so if the next record on the
-                    # same chip still carries the same epoch, this one was
-                    # over-counted. Runs of two share the same successor logic
-                    # and need no iteration.
-                    #
-                    # The reset marker itself must be excluded from that
-                    # comparison: it sits exactly on the boundary and carries the
-                    # pre-increment epoch, so a correctly ordered 0xFFFF record
-                    # followed by its marker would otherwise look stale.
-                    #
-                    # Residual: the final record of each chip in a chunk has no
-                    # successor here, so it is left alone. That matters only if
-                    # it sits exactly at 0xFFFF — 1/65536 per chip per chunk,
-                    # under 0.1 occurrences per 30 s run. Carrying records across
-                    # chunks to close that costs more than the defect.
-                    not_reset = pixel_nr != RESET_ID
-                    for chip in (is_mast, ~is_mast):
-                        idx = np.nonzero(chip & not_reset)[0]
-                        if idx.size < 2:
-                            continue
-                        prev, nxt = idx[:-1], idx[1:]
-                        stale = ((coarse[prev] == TOP_COARSE)
-                                 & (reset_arr[nxt] == reset_arr[prev]))
-                        n_stale = int(stale.sum())
-                        if n_stale:
-                            reset_arr[prev[stale]] -= 1
-                            stats['epoch_fixes'] += n_stale
+                    # Undo the epoch over-count on top-of-range records; see
+                    # correct_boundary_epochs() for why the decision is made per
+                    # 0xFFFF tick rather than per adjacent pair.
+                    stats['epoch_fixes'] += correct_boundary_epochs(
+                        coarse, reset_arr, pixel_nr, is_mast)
 
                     time_ps   = (reset_arr * COUNTS_PER_RESET + coarse) * PS_PER_COUNT + fine
 
