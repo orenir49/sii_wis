@@ -38,6 +38,11 @@ python tools\plot_g2_result.py spad_data\147_147_resolve_peak.txt --outdir figs\
 # Offline g2 for one or more pixel pairs, robust offset (matches the live correlator) -- run
 # interactively on real hardware, not in a sandboxed/CI shell (see the script's own docstring)
 python tools\analyze_g2_pairs_offline.py --base spad_data\<dir> 147x147 147x168 168x147 168x168
+
+# Same, but node-qualified pairs -- needed for same-node (intra-node) correlations.
+# "1:241x1:242" is node1 px241 x node1 px242; a bare "147x168" still means node1 x node2.
+python tools\analyze_g2_pairs_offline.py --base spad_data\<dir> --bin-width 100000 --tmax 5000000 ^
+    --n-shift 50 --suffix <tag> --outdir spad_data\<dir_out> 1:241x2:241 1:241x1:242
 ```
 
 ## Architecture
@@ -66,7 +71,7 @@ Minimal GUI that starts a command server thread on launch. Receives JSON command
 | `tools/sii_calculator_backend.py` | Pure formulas: `<\|V\|^2>`, coherence time, bunching-excess `R`, required integration time |
 | `tools/sii_calculator.py` | `SIICalculatorWindow` — interactive bunching-excess / integration-time calculator |
 | `tools/plot_g2_result.py` | Peak-annotated g² histogram + count-distribution PNGs from a saved `{px1}_{px2}_{suffix}.txt` |
-| `tools/analyze_g2_pairs_offline.py` | Offline g² for arbitrary pixel pairs with the robust slave-dwell clock offset (matches the live correlator) |
+| `tools/analyze_g2_pairs_offline.py` | Offline g² for arbitrary pixel pairs, cross-node *and* intra-node, with a four-clock dwell offset model (see below) |
 | `ssh_launcher.py` | Paramiko-based remote automation for launching sender nodes |
 | `setup_node.ps1` | One-shot sender node setup: OpenSSH, firewall, git clone, venv |
 | `spad_new.ipynb` | Offline g² analysis notebook |
@@ -105,6 +110,28 @@ Automates sender node startup via paramiko password auth:
 2. Wait for lSPAD port 9999 to open
 3. Apply pixel mask (`M,<path>`), run TDC calibration (`T,v,1` → `T,c,1`)
 4. Git pull the repo, launch `sender.py` detached via venv `pythonw.exe`
+
+### The four detector clocks (offline offsets)
+
+There are **four** free-running clocks in a two-node run, not two: each node has a
+master and a slave chip, and each records its own `master_dwell.bin` /
+`slave_dwell.bin`. So an offline g² pair needs the *difference* of its two clocks'
+offsets — only a pair on the same node **and** the same chip is genuinely
+offset-free. `clock_shifts()` in `tools/analyze_g2_pairs_offline.py` measures all
+four against a node1/slave reference via `offset_tools.estimate_offset` and prints
+a closure check (the two routes to node2/master agreed to 588 ps on 23-8-26 data).
+
+The trap: chip membership follows the PIXMAP **index** (`master_loc` = indices
+170-319, `slave_loc` = 0-169, `sender_backend.py`), while `px_*.bin` is named by the
+PIXMAP **value** (the loc). The two partitions differ, so adjacent locs can sit on
+different chips — e.g. locs 241 and 243 are master but 242 is slave. Use
+`chip_of_loc()`, never `loc < 170`. Measured intra-node master↔slave offsets are
+small (~1-2 ns), so they are negligible at 100 ns bins but matter at 250 ps or 1 ns.
+
+Note also that `create_multistart_multistop_chunked` labels each bin by its **left
+edge**, not its centre: at 100 ns bins the bin labelled `tau=0` spans [0, +100 ns)
+and the one labelled `-100000` spans [-100 ns, 0), so a true zero-delay peak is
+split across those two bins.
 
 ### Data files
 
