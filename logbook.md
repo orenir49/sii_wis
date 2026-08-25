@@ -174,19 +174,17 @@ separated small apertures, and the single aperture with the disc stationary.
 
 | run | pair | baseline (counts/bin) | g²(0)−1 | FWHM (ns) | significance |
 |---|---|---|---|---|---|
-| small speckle | 284×283 | 14,278 | 0.0142 ± 0.0039 | 2103 ± 713 | 3.7σ |
 | small speckle | 284×280 | 2,165,518 | 0.0085 ± 0.0003 | 1874 ± 90 | 25.8σ |
 | medium speckle | 284×280 | 1,564,510 | 0.0157 ± 0.0005 | 1195 ± 49 | 31.0σ |
 | large speckle | 284×283 | 683,730 | 0.0722 ± 0.0008 | 989 ± 14 | 85.8σ |
 
-- Contrast rises with speckle size, and the two comparisons that hold the pixel pair fixed
-  both say so: at 284×280 medium is 1.85× small (11.9σ); at 284×283 large is 5.1× small
-  (14.7σ).
+- Contrast rises with speckle size: 0.0085 → 0.0157 → 0.0722.
 - Peak width falls as contrast rises: 1874 → 1195 → 989 ns across small → medium → large.
-- Caveat: medium speckle was only taken on 284×280 and large speckle only on 284×283, so
-  any comparison spanning the two pairs mixes speckle size with pixel pairing — an
-  off-diagonal pair has less spectral overlap and a lower contrast on its own. Only the two
-  same-pair comparisons above are clean; the four-way ordering is suggestive, not measured.
-- The 284×283 small-speckle run is short — 730 k coincidences against 35 M for the large —
-  so its 3.7σ peak is marginal, but the fitted centre (204 ± 266 ns) is consistent with zero
-  delay, unlike the `nospin` null whose fit ran off to +1.86 µs.
+- Caveat: only small vs medium holds the pixel pair fixed (284×280, 1.85× at 11.9σ). The
+  large-speckle run is on 284×283, so its 4.6× step above medium mixes speckle size with
+  pixel pairing — an off-diagonal pair has less spectral overlap and a lower contrast on its
+  own. A medium-speckle run on 284×283 would settle it.
+- A fourth run, small speckle on 284×283, was dropped from the figure: 730 k coincidences
+  against 35 M for the large, giving a marginal 3.7σ peak (centre 204 ± 266 ns, consistent
+  with zero delay). The histogram is kept at
+  `figs/25-8-26/284_283_two_small_oap_small_speckle.txt`.
