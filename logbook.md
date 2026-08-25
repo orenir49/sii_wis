@@ -182,9 +182,26 @@ separated small apertures, and the single aperture with the disc stationary.
 - Peak width falls as contrast rises: 1874 → 1195 → 989 ns across small → medium → large.
 - Caveat: only small vs medium holds the pixel pair fixed (284×280, 1.85× at 11.9σ). The
   large-speckle run is on 284×283, so its 4.6× step above medium mixes speckle size with
-  pixel pairing — an off-diagonal pair has less spectral overlap and a lower contrast on its
-  own. A medium-speckle run on 284×283 would settle it.
+  pixel pairing. The arc alignment below says that mix works *against* the trend: node1 px
+  284 maps to node2 px 281, so 284×280 (1 px off) is better matched than 284×283 (2 px off),
+  and the large-speckle run is the one paying the larger overlap penalty while still showing
+  the biggest contrast. A medium-speckle run on 284×283 would still settle it properly.
 - A fourth run, small speckle on 284×283, was dropped from the figure: 730 k coincidences
   against 35 M for the large, giving a marginal 3.7σ peak (centre 204 ± 266 ns, consistent
   with zero delay). The histogram is kept at
   `figs/25-8-26/284_283_two_small_oap_small_speckle.txt`.
+
+### Arc alignment — the node1↔node2 mapping has shifted by one pixel
+
+- `figs/25-8-26/node1_vs_node2_{traces,fit}.png`, `..._active_range_matches.txt` — arc
+  alignment on the 02:51 intensity scans (`spad_data/intensity/25-8-26/node{1,2}.txt`).
+  - full detector: a = 1.01230, b = 1.450, 23 matched lines, RMS 0.180 px
+  - active range 118–216: a = 1.01109, b = 1.438, 14 matched lines, RMS 0.165 px
+  - Neither pass dropped an outlier; residuals are structureless.
+- The mapping is no longer the identity it was on 16-8, 20-8 and 22-8. Best integer matches
+  are now 128↔127, 131↔130, 137↔136, 148↔147, 169↔168 — node2 reads one pixel low in the
+  active range, growing to about three near px 280 because a > 1.
+- Consequences for the locs in use: node1 282→node2 279, 283→280, **284→281**, 285→282.
+  So of the pairs correlated today, 284×280 is 1 px from matched and 284×283 is 2 px.
+- The scan was taken at 02:51, after the 00:15–02:37 g² runs, so it is the nearest
+  calibration in time but not strictly contemporaneous with them.
