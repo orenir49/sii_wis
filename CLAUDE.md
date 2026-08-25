@@ -33,7 +33,13 @@ python .claude/skills/spectral-align/align_arc.py REF.txt OTHER.txt --outdir fig
 python tools\sii_calculator.py
 
 # Peak-annotated g2 histogram + count-distribution figures from a saved correlate.py result
-python tools\plot_g2_result.py spad_data\147_147_resolve_peak.txt --outdir figs\<DD-M-YY>
+python tools\plot_g2_result.py figs\19-8-26\147_147_resolve_peak.txt --outdir figs\<DD-M-YY>
+
+# Gaussian fits to the bunching peak of several runs at once, baseline-normalised overlay
+# plus a peak-height / peak-width comparison table
+python tools\fit_g2_gaussian.py figs\25-8-26\284_283_small_oap.txt ^
+    figs\25-8-26\284_283_two_small_oap.txt --labels small_oap two_small_oap ^
+    --outdir figs\<DD-M-YY> --prefix <tag>
 
 # Offline g2 for one or more pixel pairs, robust offset (matches the live correlator) -- run
 # interactively on real hardware, not in a sandboxed/CI shell (see the script's own docstring)
@@ -42,7 +48,7 @@ python tools\analyze_g2_pairs_offline.py --base spad_data\<dir> 147x147 147x168 
 # Same, but node-qualified pairs -- needed for same-node (intra-node) correlations.
 # "1:241x1:242" is node1 px241 x node1 px242; a bare "147x168" still means node1 x node2.
 python tools\analyze_g2_pairs_offline.py --base spad_data\<dir> --bin-width 100000 --tmax 5000000 ^
-    --n-shift 50 --suffix <tag> --outdir spad_data\<dir_out> 1:241x2:241 1:241x1:242
+    --n-shift 50 --suffix <tag> --outdir figs\<DD-M-YY> 1:241x2:241 1:241x1:242
 ```
 
 ## Architecture
@@ -71,6 +77,7 @@ Minimal GUI that starts a command server thread on launch. Receives JSON command
 | `tools/sii_calculator_backend.py` | Pure formulas: `<\|V\|^2>`, coherence time, bunching-excess `R`, required integration time |
 | `tools/sii_calculator.py` | `SIICalculatorWindow` — interactive bunching-excess / integration-time calculator |
 | `tools/plot_g2_result.py` | Peak-annotated g² histogram + count-distribution PNGs from a saved `{px1}_{px2}_{suffix}.txt` |
+| `tools/fit_g2_gaussian.py` | Gaussian-on-baseline fits to several saved histograms; normalised overlay + peak height/width comparison. Averages the model over each bin, so the quoted FWHM is not bin-broadened |
 | `tools/analyze_g2_pairs_offline.py` | Offline g² for arbitrary pixel pairs, cross-node *and* intra-node, with a four-clock dwell offset model (see below) |
 | `ssh_launcher.py` | Paramiko-based remote automation for launching sender nodes |
 | `setup_node.ps1` | One-shot sender node setup: OpenSSH, firewall, git clone, venv |
@@ -136,3 +143,8 @@ split across those two bins.
 ### Data files
 
 Stored under `spad_data/` (gitignored). Each acquisition session creates a subdirectory containing `px_000.bin` … `px_319.bin` (raw int64 timestamps per pixel) and `master_dwell.bin`, `slave_dwell.bin`, `master_line.bin`, `slave_line.bin`, `master_frame.bin`, `slave_frame.bin` (synchronization signals).
+
+Saved g² histograms (`tau_ps`/`counts` text, from the live correlator or the offline
+tool) live with the figures they produced, in `figs/<D-M-YY>/`, not in `spad_data/`;
+`spad_data/` holds raw timestamps, intensity scans and dwell diagnostics only.
+`logbook.md` indexes the figures by date.
