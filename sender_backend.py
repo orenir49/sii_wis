@@ -91,12 +91,30 @@ MARKER_NAMES = {
 }
 ANOM_LOG_S     = 2.0   # min seconds between rollup lines for one (chip, id)
 ANOM_MAX_FIRST = 40    # cap on distinct first-sighting lines per session
+# lSPAD opens every stream with a file-start marker, once per chip, so the first
+# few records are expected to carry one and saying so is noise. Past this record
+# it means the stream restarted mid-session, which is worth a line.
+FILE_START_HEAD_RECS = 16
 
 LAG_CHECK_S = 5.0      # how often to recompute parser lag
 LAG_WARN_S  = 2.0      # lag above this means data is queueing up
 
 master_loc = np.array([PIXMAP[170 + i] for i in range(150)])
 slave_loc  = np.array([PIXMAP[i]       for i in range(170)])
+
+
+def drop_head_of_stream(sel: np.ndarray, rec0: int) -> np.ndarray:
+    """Keep only the chunk-local indices in `sel` that are past the stream head.
+
+    `rec0` is the session record index of the chunk's first record, so
+    `rec0 + sel` is the absolute position of each hit. Used for the file-start
+    marker: lSPAD emits one per chip when the stream opens, which is expected
+    and not worth a log line, but one arriving later means the stream restarted
+    mid-session. Filtering the indices rather than skipping the whole group
+    keeps a genuine mid-stream marker reportable even when it lands in the same
+    chunk as the opening one.
+    """
+    return sel[(rec0 + sel) >= FILE_START_HEAD_RECS]
 
 # ---------------------------------------------------------------------------
 # Wire protocol keys
@@ -352,7 +370,9 @@ def run(sock: socket.socket,
         """Log abnormal ids in this chunk, at most one line per (chip, id) per
         ANOM_LOG_S. `rec0` is the session record index of the chunk's first
         record, so a marker's position in the stream is judgeable — a file-start
-        at record 0 is expected, one at record 4,000,000 is not."""
+        in the first few records is expected and is dropped entirely (it is not
+        abnormal, so it is left out of the session tally too); one at record
+        4,000,000 says the stream restarted and is reported."""
         now  = time.time()
         t0   = stats['first_ts'] if stats['first_ts'] is not None else 0
         idx  = np.nonzero(mask)[0]
@@ -363,6 +383,10 @@ def run(sock: socket.socket,
             chip = 'master' if int(c) & 1 else 'slave'
             key  = f'{chip}:{pid}'
             name = MARKER_NAMES.get(pid, 'unknown pixel/marker id')
+            if pid == FILE_START_ID:
+                sel = drop_head_of_stream(sel, rec0)
+                if sel.size == 0:
+                    continue
             t_s  = (int(time_ps[sel[0]])  - t0) / 1e12
             t_e  = (int(time_ps[sel[-1]]) - t0) / 1e12
             ent  = anom.get(key)
@@ -852,30 +876,8 @@ def run_command_server(cmd_port: int = DEFAULT_CMD_PORT,
         conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
         conn.ioctl(socket.SIO_KEEPALIVE_VALS, (1, 30_000, 5_000))  # 30 s idle, probe every 5 s
         status_fn({'event': 'ctrl_connected', 'addr': addr[0]})
-        _send_ctrl_msg(conn, threading.Lock(),
-                       {'status': 'log', 'msg': f'sender build {_build_id()}\n'})
         _handle_controller(conn, status_fn)
         status_fn({'event': 'ctrl_disconnected'})
-
-
-def _build_id() -> str:
-    """Identify the running code: git HEAD + pid.
-
-    A stale sender.py can keep the command port after a git pull, so the
-    receiver needs to see which build is actually answering.
-    """
-    sha = '?'
-    try:
-        import subprocess
-        sha = subprocess.run(
-            ['git', 'rev-parse', '--short', 'HEAD'],
-            cwd=os.path.dirname(os.path.abspath(__file__)),
-            capture_output=True, text=True, timeout=5,
-            creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
-        ).stdout.strip() or '?'
-    except Exception:
-        pass
-    return f'{sha} pid {os.getpid()}'
 
 
 def _send_ctrl_msg(conn: socket.socket, lock: threading.Lock,

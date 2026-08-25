@@ -100,13 +100,15 @@ Pixel mapping: `PIXMAP` in `sender_backend.py` maps lSPAD pixel indices to outpu
 
 A healthy timestream carries only photons (lSPAD ids `<150` master / `<170` slave), the coarse-counter reset `234`, and the dwell/line/frame markers `225`/`226`/`228` (`NORMAL_MARKER_IDS`). `sender_backend.py` reports every other id live over the control channel — FIFO overflow `247`, file-start `239`, and any id no pixel on that chip can emit (usually 7-byte record framing having slipped) — with the session record index and detector-relative timestamp, so a misplaced marker is distinguishable from an expected one.
 
+One exception: lSPAD opens every stream with a file-start marker, once per chip, so a `239` in the first `FILE_START_HEAD_RECS` (16) records is expected. `drop_head_of_stream()` filters those out of both the live log and the session tally — a `239` past that point means the stream restarted mid-session and is still reported. It filters record indices rather than skipping the whole group, so a restart landing in the same chunk as the opening marker survives (`tests/test_file_start_filter.py`).
+
 Throttled deliberately: `log_fn` writes to the control socket from the parser thread, so a flood would stall the parser and cost real photons. First sighting of each `(chip, id)` logs at once, then one rollup line per id per `ANOM_LOG_S`; past `ANOM_MAX_FIRST` distinct ids it stops opening new lines. Per-id totals land in `stats['abnormal']` → `session_stats.json`.
 
 ### Live g² correlator
 
 `correlate.py` integrates with `run_session_loop()` via `pixel_hooks: dict[key_id, queue.Queue]`. Matching chunks are enqueued **in addition to** being written to disk — a read tap, not a diversion. `CorrelateWindow` accumulates int64 timestamps from two pixel queues and calls the Numba JIT `_multistart_multistop()` kernel in a background thread. The kernel is pre-warmed at startup to avoid the first-call JIT delay.
 
-Both correlator windows have a `Mark τ (ns)` field (default 14) that puts a marker on that bin and annotates its counts, excess over the mean, SNR and mean ± σ — the same numbers `tools/plot_g2_result.py` reports, but at a τ you name rather than at the argmax.
+Both correlator windows mark the tallest bin as it stands at each redraw and label it in place with `τ · excess · SNR` — one line at the marker, no corner box. The bin is chosen per redraw rather than named in advance, so the label wanders while the histogram is still noise and settles once a peak grows. Mean and σ are taken over the whole histogram, peak bin included, so the numbers match `tools/plot_g2_result.py` exactly.
 
 The receiver's **Write timestamps to disk** checkbox (on by default) sets `run_session_loop(write_hooked=...)`. Unchecked, hooked *pixel* keys go to the correlator queue only and their `px_*.bin` is never created — live correlation without keeping the timestamps. Keys 320–325 are never suppressed: they are hooked on every run for clock calibration, and the offline offset estimate needs them afterwards. The flag is read once per data connection, so toggling mid-run applies from the next START.
 

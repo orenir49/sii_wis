@@ -1159,8 +1159,7 @@ class ReceiverGUI:
                          for n in (self.node1, self.node2)}
         self._cal_deadline = time.time() + CAL_MAX_WAIT_S
         self._enqueue_log(
-            f'Sparse cal: collecting one waveform period '
-            f'({SPARSE_CAL_WAVEFORM_S:.2f} s) of dwell…\n')
+            f'Beginning dwell calibration ({SPARSE_CAL_WAVEFORM_S:.2f} s)\n')
         self._set_cal_status(
             f'● Calibrating dwell offset ({SPARSE_CAL_WAVEFORM_S:.2f} s)…',
             color='#cc8800')
@@ -1226,8 +1225,10 @@ class ReceiverGUI:
                 if new.size:
                     acc[i] = np.concatenate([acc[i], new])
 
-        t1, m1 = self._cal_acc[self.node1.node_id]   # slave_dwell, master_dwell
-        t2, m2 = self._cal_acc[self.node2.node_id]
+        # master_dwell is accumulated too (draining its queue is what keeps it
+        # bounded until start_dwell_drain takes over), but only slave_dwell is fitted.
+        t1, _ = self._cal_acc[self.node1.node_id]   # slave_dwell, master_dwell
+        t2, _ = self._cal_acc[self.node2.node_id]
 
         MIN_EVENTS = 5
         if t1.size < MIN_EVENTS or t2.size < MIN_EVENTS:
@@ -1244,48 +1245,19 @@ class ReceiverGUI:
             self.node2.start_dwell_drain()
             return
 
-        # Capture diagnostics: a span well short of the window means dwell data
-        # stopped arriving early (sender-side queue lag); a full span with too
-        # few events means pulses are genuinely being missed.
-        for label, arr in (('node1', t1), ('node2', t2)):
-            if arr.size >= 2:
-                span_s = float(arr.max() - arr.min()) / 1e12
-                self._enqueue_log(
-                    f'  {label}: {arr.size} dwell events over {span_s:.2f} s '
-                    f'of a {SPARSE_CAL_WAVEFORM_S:.2f} s target '
-                    f'({arr.size / max(span_s, 1e-9):.1f} /s)\n')
-
         cluster_tol = 10_000  # 10 ns: excludes ±32 ns TDC doublet sidelobes
-        slave_offset_ps, slave_details = estimate_offset(
-            t1, t2, cluster_tol=cluster_tol, return_details=True)
+        # Only the slave offset is fitted here — it is the one the correlator is
+        # started with. The master dwell is still collected and written to disk;
+        # the master↔slave offsets are recovered offline by clock_shifts() in
+        # tools/analyze_g2_pairs_offline.py, which needs all four clocks anyway.
+        slave_offset = int(round(estimate_offset(t1, t2, cluster_tol=cluster_tol)))
 
-        if m1.size >= MIN_EVENTS and m2.size >= MIN_EVENTS:
-            master_offset_ps, master_details = estimate_offset(
-                m1, m2, cluster_tol=cluster_tol, return_details=True)
-        else:
-            master_offset_ps, master_details = float('nan'), None
-
-        slave_offset = int(round(slave_offset_ps))
-
-        self._enqueue_log('Automatic dwell calibration\n')
-        if master_details is not None and not np.isnan(master_offset_ps):
-            self._enqueue_log(
-                f'  Master offset = {int(round(master_offset_ps)):+,} ps  '
-                f'({master_details["n_matched"]} matched pairs, '
-                f'SEM = {master_details["sem"]:.0f} ps, '
-                f'streams: {master_details["n1"]} / {master_details["n2"]} events)\n'
-            )
-        else:
-            self._enqueue_log(
-                f'  Master offset: unavailable ({m1.size} / {m2.size} master dwell events)\n'
-            )
+        # One line, not six: the per-node event counts, the master offset and its
+        # SEM were diagnostics for getting the calibration working, and they
+        # buried the one number that matters on every ordinary run. The failure
+        # and short-collection paths above still say why when it goes wrong.
         self._enqueue_log(
-            f'  Slave offset  = {slave_offset:+,} ps  '
-            f'({slave_details["n_matched"]} matched pairs, '
-            f'SEM = {slave_details["sem"]:.0f} ps, '
-            f'streams: {slave_details["n1"]} / {slave_details["n2"]} events)\n'
-        )
-        self._enqueue_log('Acquiring\n')
+            f'Completed dwell calibration (slave offset {slave_offset:+,} ps)\n')
 
         self._set_cal_status(
             f'● Calibrated — offset {slave_offset:+,} ps, acquisition running',
