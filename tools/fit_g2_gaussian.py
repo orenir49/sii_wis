@@ -253,7 +253,7 @@ def main():
         ax.plot(r['tau'] / 1000.0, r['counts'] / B - 1.0, marker='.', linestyle='none',
                 markersize=5, color=c, alpha=0.55)
         ax.plot(fine / 1000.0, b['f'](fine, *b['popt']) / B - 1.0, color=c, linewidth=1.6,
-                label='%s:  g2(0)-1 = %.3f+-%.3f, FWHM = %.0f+-%.0f ns'
+                label='%s:  g2(0)-1 = %.4f+-%.4f, FWHM = %.0f+-%.0f ns'
                       % (r['label'], b['contrast'], b['e_contrast'], b['fwhm'], b['e_fwhm']))
 
     ax.axhline(0.0, color='k', linewidth=0.8)
