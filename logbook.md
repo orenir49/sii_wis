@@ -139,69 +139,46 @@ Rotating-disc pseudo-thermal source at 520 nm, locs 282–285 on both nodes.
 - `figs/24-8-26/282_282_520disc_two_fibers{,_nospin}.txt` — later two-fiber runs, spinning and
   stationary disc.
 
-## 25-8-26 — small-OAP aperture comparison
+## 25-8-26 — OAP apertures, speckle size, arc realignment
 
-Rotating-disc pseudo-thermal at 520 nm, px 284 n1 × 283 n2, live correlator,
-200 ns bins, ±5 µs, 51 bins. Three configurations: one small OAP aperture, two
-separated small apertures, and the single aperture with the disc stationary.
+Rotating-disc pseudo-thermal at 520 nm, live correlator, 200 ns bins, ±5 µs.
+Gaussian on a quadratic baseline, Poisson weights, model averaged over each bin
+so the quoted FWHM is not bin-broadened.
 
-- `figs/25-8-26/small_oap_gaussian_fit.png` + `small_oap_gaussian_fit.txt` — the three
-  runs overlaid, each normalised by its own fitted baseline. Gaussian on a quadratic
-  baseline, Poisson weights, model averaged over each bin so the quoted FWHM is the
-  underlying Gaussian rather than the bin-broadened one.
+**Aperture comparison** (px 284 n1 × 283 n2) —
+`figs/25-8-26/small_oap_gaussian_fit.png` + `small_oap_gaussian_fit.txt`:
 
-| run | baseline (counts/bin) | g²(0)−1 | FWHM (ns) | peak significance |
-|---|---|---|---|---|
-| `small_oap` | 221,640 | 0.7626 ± 0.0023 | 689 ± 2 | 352σ |
-| `two_small_oap` | 683,730 | 0.0722 ± 0.0008 | 989 ± 14 | 86σ |
-| `small_oap_nospin` | 60,127 | 0.0137 ± 0.0072 | 274 ± 186 | 1.9σ |
+| run | g²(0)−1 | FWHM (ns) |
+|---|---|---|
+| one small aperture | 0.7626 ± 0.0023 | 689 ± 2 |
+| two separated apertures | 0.0722 ± 0.0008 | 989 ± 14 |
+| one aperture, disc stopped | 0.0137 ± 0.0072 (1.9σ) | — |
 
-- **No spin → no peak.** Confirmed: 1.9σ, and the fit puts its "peak" at τ = +1.86 µs with
-  σ = 116 ns, i.e. narrower than one bin — a single-bin fluctuation, not a bunching peak.
-- **One aperture → higher peak.** Confirmed: 10.6× the two-aperture contrast
-  (Δ = +0.691 ± 0.002, 285σ), on a 3.1× *lower* baseline.
-- **Two apertures → shorter peak.** Confirmed on height. But the peak is also 1.4× **wider**,
-  not narrower: 989 ± 14 vs 689 ± 2 ns, a 301 ± 14 ns difference (21σ). Not predicted.
-- Caveat: χ²_red is 28 (`small_oap`) and 16 (`two_small_oap`) — a single Gaussian is not a
-  good description of the line shape, so the FWHM carries a model systematic well beyond the
-  quoted statistical error. The height ratio is robust; the width comparison is less so.
-  `small_oap` also needs the quadratic baseline term — its wings droop to −0.03 at ±5 µs.
+One aperture gives 10.6× the two-aperture contrast; the stationary disc gives no
+peak (the fit's 1.9σ bump sits at +1.86 µs and is narrower than one bin).
 
-### Contrast vs speckle size (two apertures)
+**Speckle size**, two apertures —
+`figs/25-8-26/speckle_size_gaussian_fit.png` + `speckle_size_gaussian_fit.txt`:
 
-- `figs/25-8-26/speckle_size_gaussian_fit.png` + `speckle_size_gaussian_fit.txt` — same
-  two-aperture configuration, speckle size varied. Same fit model and binning as above.
+| speckle | pair | g²(0)−1 | FWHM (ns) |
+|---|---|---|---|
+| small | 284×280 | 0.0085 ± 0.0003 | 1874 ± 90 |
+| medium | 284×280 | 0.0157 ± 0.0005 | 1195 ± 49 |
+| large | 284×283 | 0.0722 ± 0.0008 | 989 ± 14 |
 
-| run | pair | baseline (counts/bin) | g²(0)−1 | FWHM (ns) | significance |
-|---|---|---|---|---|---|
-| small speckle | 284×280 | 2,165,518 | 0.0085 ± 0.0003 | 1874 ± 90 | 25.8σ |
-| medium speckle | 284×280 | 1,564,510 | 0.0157 ± 0.0005 | 1195 ± 49 | 31.0σ |
-| large speckle | 284×283 | 683,730 | 0.0722 ± 0.0008 | 989 ± 14 | 85.8σ |
+Smaller speckles give a shorter peak, as expected for two spatially separated
+nodes. A short, marginal small-speckle run on 284×283 is kept but not plotted
+(`figs/25-8-26/284_283_two_small_oap_small_speckle.txt`).
 
-- Contrast rises with speckle size: 0.0085 → 0.0157 → 0.0722.
-- Peak width falls as contrast rises: 1874 → 1195 → 989 ns across small → medium → large.
-- Caveat: only small vs medium holds the pixel pair fixed (284×280, 1.85× at 11.9σ). The
-  large-speckle run is on 284×283, so its 4.6× step above medium mixes speckle size with
-  pixel pairing. The arc alignment below says that mix works *against* the trend: node1 px
-  284 maps to node2 px 281, so 284×280 (1 px off) is better matched than 284×283 (2 px off),
-  and the large-speckle run is the one paying the larger overlap penalty while still showing
-  the biggest contrast. A medium-speckle run on 284×283 would still settle it properly.
-- A fourth run, small speckle on 284×283, was dropped from the figure: 730 k coincidences
-  against 35 M for the large, giving a marginal 3.7σ peak (centre 204 ± 266 ns, consistent
-  with zero delay). The histogram is kept at
-  `figs/25-8-26/284_283_two_small_oap_small_speckle.txt`.
+Caveat on both tables: χ²_red runs 16–28, so a single Gaussian is not a good
+description of the line shape and the FWHM carries a model systematic beyond the
+quoted error. The height ratios are robust; the widths less so.
 
-### Arc alignment — the node1↔node2 mapping has shifted by one pixel
-
-- `figs/25-8-26/node1_vs_node2_{traces,fit}.png`, `..._active_range_matches.txt` — arc
-  alignment on the 02:51 intensity scans (`spad_data/intensity/25-8-26/node{1,2}.txt`).
-  - full detector: a = 1.01230, b = 1.450, 23 matched lines, RMS 0.180 px
-  - active range 118–216: a = 1.01109, b = 1.438, 14 matched lines, RMS 0.165 px
-  - Neither pass dropped an outlier; residuals are structureless.
-- The mapping is no longer the identity it was on 16-8, 20-8 and 22-8. Best integer matches
-  are now 128↔127, 131↔130, 137↔136, 148↔147, 169↔168 — node2 reads one pixel low in the
-  active range, growing to about three near px 280 because a > 1.
-- Consequences for the locs in use: node1 282→node2 279, 283→280, **284→281**, 285→282.
-  So of the pairs correlated today, 284×280 is 1 px from matched and 284×283 is 2 px.
-- The scan was taken at 02:51, after the 00:15–02:37 g² runs, so it is the nearest
-  calibration in time but not strictly contemporaneous with them.
+**Arc alignment.** Adjusting the spectrographs during the disc run left a small
+misalignment — the 02:51 scan fits a = 1.0123, b = 1.45, i.e. node2 one pixel low
+across the active range (`figs/25-8-26/align_before_realign/`). After realigning,
+the 02:58 scan (`figs/25-8-26/node1_vs_node2_{traces,fit}.png`,
+`..._active_range_matches.txt`) gives a = 1.00977, b = 0.275, 21 lines, RMS
+0.144 px — integer matches back to identity (127↔127, 130↔130, 136↔136, 147↔147)
+and registration within +0.2/−0.8 px across pixels 118–216. Scans archived in
+`spad_data/intensity/25-8-26/`.
