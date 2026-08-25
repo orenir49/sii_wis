@@ -145,11 +145,10 @@ Rotating-disc pseudo-thermal at 520 nm, px 284 n1 × 283 n2, live correlator,
 200 ns bins, ±5 µs, 51 bins. Three configurations: one small OAP aperture, two
 separated small apertures, and the single aperture with the disc stationary.
 
-- `figs/25-8-26/small_oap_gaussian_fit.png` + `small_oap_gaussian_fit.txt` — Gaussian
-  fits on a quadratic baseline, Poisson weights, model averaged over each bin so the
-  quoted FWHM is the underlying Gaussian rather than the bin-broadened one. Panels:
-  baseline-normalised overlay, the same curves y-zoomed to the shallow peaks, and a
-  height/width bar comparison.
+- `figs/25-8-26/small_oap_gaussian_fit.png` + `small_oap_gaussian_fit.txt` — the three
+  runs overlaid, each normalised by its own fitted baseline. Gaussian on a quadratic
+  baseline, Poisson weights, model averaged over each bin so the quoted FWHM is the
+  underlying Gaussian rather than the bin-broadened one.
 
 | run | baseline (counts/bin) | g²(0)−1 | FWHM (ns) | peak significance |
 |---|---|---|---|---|

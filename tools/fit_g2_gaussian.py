@@ -240,20 +240,9 @@ def main():
         fh.write('\n'.join(lines) + '\n')
 
     # ---- figure ------------------------------------------------------------
-    # A tall peak alongside a shallow one makes the shallow one unreadable, so add
-    # a zoomed copy of the same axes whenever the heights span more than ~3x.
     heights = sorted((r['best']['contrast'] for r in results), reverse=True)
-    zoom = len(heights) > 1 and heights[1] > 0 and heights[0] > 3.0 * heights[1]
-
     colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
-    if zoom:
-        fig, (ax, axz, ax2) = plt.subplots(3, 1, dpi=150, figsize=(9, 11),
-                                           gridspec_kw={'height_ratios': [2.0, 1.3, 1.2]})
-        panels = [ax, axz]
-    else:
-        fig, (ax, ax2) = plt.subplots(2, 1, dpi=150, figsize=(9, 8.5),
-                                      gridspec_kw={'height_ratios': [2.1, 1]})
-        panels = [ax]
+    fig, ax = plt.subplots(dpi=150, figsize=(9, 5.5))
 
     for k, r in enumerate(results):
         c = colors[k % len(colors)]
@@ -261,49 +250,20 @@ def main():
         B = b['p']['B']
         BIN_WIDTH_NS = r['bw']   # the model is bin-width dependent; match this dataset
         fine = np.linspace(r['tau'][0], r['tau'][-1], 1200)
-        curve = b['f'](fine, *b['popt']) / B - 1.0
-        label = ('%s:  g2(0)-1 = %.3f+-%.3f, FWHM = %.0f+-%.0f ns'
-                 % (r['label'], b['contrast'], b['e_contrast'], b['fwhm'], b['e_fwhm']))
-        for a in panels:
-            a.plot(r['tau'] / 1000.0, r['counts'] / B - 1.0, marker='.', linestyle='none',
-                   markersize=5, color=c, alpha=0.55)
-            a.plot(fine / 1000.0, curve, color=c, linewidth=1.6,
-                   label=label if a is ax else None)
+        ax.plot(r['tau'] / 1000.0, r['counts'] / B - 1.0, marker='.', linestyle='none',
+                markersize=5, color=c, alpha=0.55)
+        ax.plot(fine / 1000.0, b['f'](fine, *b['popt']) / B - 1.0, color=c, linewidth=1.6,
+                label='%s:  g2(0)-1 = %.3f+-%.3f, FWHM = %.0f+-%.0f ns'
+                      % (r['label'], b['contrast'], b['e_contrast'], b['fwhm'], b['e_fwhm']))
 
-    for a in panels:
-        a.axhline(0.0, color='k', linewidth=0.8)
-        a.set_ylabel('g2 - 1')
-        a.grid(alpha=0.25)
+    ax.axhline(0.0, color='k', linewidth=0.8)
+    ax.set_xlabel('tau (us)')
     ax.set_ylabel('g2 - 1  (counts / fitted baseline - 1)')
     ax.set_title(args.title or 'Gaussian fits to the g2 bunching peak, baseline-normalised')
     # headroom so the legend never sits on top of the tallest peak
     ax.set_ylim(top=heights[0] * 1.55)
     ax.legend(fontsize=8, loc='upper right')
-    panels[-1].set_xlabel('tau (us)')
-    if zoom:
-        axz.set_ylim(top=heights[1] * 1.9)
-        axz.set_title('same curves, y zoomed to the shallower peaks', fontsize=9)
-
-    x = np.arange(len(results))
-    ax2.bar(x - 0.19, [r['best']['contrast'] for r in results], width=0.36,
-            yerr=[r['best']['e_contrast'] for r in results], capsize=4,
-            color='steelblue', label='g2(0)-1  (peak height)')
-    ax2.set_ylabel('g2(0)-1', color='steelblue')
-    ax2.tick_params(axis='y', labelcolor='steelblue')
-    ax2.set_xticks(x)
-    ax2.set_xticklabels([r['label'] for r in results], fontsize=9)
-    ax2.grid(alpha=0.25, axis='y')
-
-    ax3 = ax2.twinx()
-    ax3.bar(x + 0.19, [r['best']['fwhm'] / 1000.0 for r in results], width=0.36,
-            yerr=[r['best']['e_fwhm'] / 1000.0 for r in results], capsize=4,
-            color='indianred', label='FWHM (us)')
-    ax3.set_ylabel('FWHM (us)', color='indianred')
-    ax3.tick_params(axis='y', labelcolor='indianred')
-
-    h1, l1 = ax2.get_legend_handles_labels()
-    h2, l2 = ax3.get_legend_handles_labels()
-    ax2.legend(h1 + h2, l1 + l2, fontsize=8, loc='upper right')
+    ax.grid(alpha=0.25)
 
     fig.tight_layout()
     png_path = os.path.join(args.outdir, '%s_gaussian_fit.png' % args.prefix)
