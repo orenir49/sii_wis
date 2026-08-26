@@ -103,7 +103,8 @@ def find_sii_wis(client: paramiko.SSHClient, username: str) -> str | None:
 
 def start_detached(client: paramiko.SSHClient,
                    exe: str, args: str, workdir: str,
-                   env: dict | None = None) -> None:
+                   env: dict | None = None,
+                   script_dir: str | None = None) -> None:
     """
     Launch a detached process on the remote host via WMI Win32_Process.Create.
     The spawned process is owned by the WMI service — fully independent of the
@@ -114,15 +115,21 @@ def start_detached(client: paramiko.SSHClient,
     SERVICE's environment, not this session's, so an `$env:X = ...` here is
     simply invisible to it. Rather than nest quotes inside the WMI command line
     (three levels deep, and one stray quote silently launches the wrong thing),
-    a small .cmd is uploaded next to the target and Create runs that. Nothing
-    persists on the machine beyond that file, unlike a Machine-scope variable.
+    a small .cmd is uploaded and Create runs that. Nothing persists on the
+    machine beyond that file, unlike a Machine-scope variable.
+
+    `script_dir` is where that .cmd goes and must be OUTSIDE the git repo. Its
+    first version wrote into `workdir`, which is the repo root: the untracked
+    file then made the working tree dirty, `ensure_repo_clean()` refused to
+    pull, and the launcher stopped being able to update the node at all -- a
+    launch helper that breaks launching.
     """
     if env:
         lines = ['@echo off']
         for k, v in env.items():
             lines.append(f'set "{k}={v}"')
         lines.append(f'start "" /b "{exe}" {args}')
-        cmd_path = workdir + chr(92) + '_launch_env.cmd'
+        cmd_path = (script_dir or workdir) + chr(92) + '_launch_env.cmd'
         crlf = chr(13) + chr(10)
         upload_file(client, cmd_path,
                     (crlf.join(lines) + crlf).encode('ascii'))
@@ -505,7 +512,9 @@ def launch_node(host: str, username: str,
             run_ps(client, f"New-Item -ItemType Directory -Force "
                            f"'{os.path.dirname(raw_dump)}' | Out-Null")
             log_fn(f'RAW CAPTURE enabled -> {raw_dump}\n')
-        start_detached(client, pythonw, sender, sii_dir, env=env)
+        # lspad_dir, not sii_dir: the .cmd must not land in the git repo.
+        start_detached(client, pythonw, sender, sii_dir, env=env,
+                       script_dir=lspad_dir)
         log_fn('sender.py launched.\n')
 
         return dwell_freq
