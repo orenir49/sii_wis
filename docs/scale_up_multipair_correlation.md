@@ -14,9 +14,9 @@ stable 1v1 fallback.**
 | stage | state |
 |---|---|
 | **1a** tap fan-out | **DONE** — `d049f36` |
-| **1b** write-to-disk checkbox | **PARTIAL** — shipped in `8ec3c10`; deviation 1 (the Stage 3 prerequisite) closed 2026-08-26; deviations 2 and 3 still open |
-| **2** sender throughput | **NOT STARTED** — deliberately deferred, see below |
-| **3** multi-pair correlator | **DONE in software and VALIDATED ON HARDWARE** 2026-08-26 (8 pairs, pulsed laser at 10 MHz). Quad not yet deleted |
+| **1b** write-to-disk checkbox | **DONE and verified on hardware** 2026-08-26 — deviation 1 closed, semantics widened to write *nothing*, and a 15-min run confirmed 11.43 GB not written with the buffer plateauing. Deviation 2 (lock the checkbox while streaming) still open; 3 largely answered by `spad_data/log/` |
+| **2** sender throughput | **DEFERRED, now on hardware evidence** — Phase 0 capture scaffolding landed 2026-08-26; 2.97 M rec/s sustained clean at 40 pixels against the ~80 M/s that would make 2a bind. Replay harness still to write |
+| **3** multi-pair correlator | **DONE in software and VALIDATED ON HARDWARE** 2026-08-26 — 8 to 40 pairs, 10 and 40 MHz, up to 15 min; comb on every pair in every run. Quad class not yet deleted (already unreachable) |
 
 ```
 ed842df  Stage 3: multi-pair live correlator with a synthetic pulsed-laser source
@@ -58,7 +58,37 @@ while still drawing a plausible histogram). Keep it.
 | `correlate_multi.py` | widgets | logic worth a test |
 | `synthetic_source.py` | photons, with no detector attached | — |
 
-### Measured on this machine (16 cores)
+### Measured on hardware, 2026-08-26 (10 MHz unless noted)
+
+Every row is a real acquisition with the pulsed laser; `.npz` files under `spad_data/`.
+
+| pairs | rep | load (M rec/s) | duration | ms/batch | core-s per data-s | peak buf | peak RSS | comb period sd |
+|---|---|---|---|---|---|---|---|---|
+| 8 | 10 MHz | 0.47 | 60 s | — | — | — | — | — |
+| 12 | 10 MHz | 0.48 | 60 s | — | — | — | — | — |
+| 16 | 10 MHz | 0.93 | 60 s | 4.94 | 0.00304 | 12.1 MB | 303 MB | 1.5 ps |
+| 40 | 10 MHz | 1.64 | 60 s | 6.38 | 0.00393 | 22.6 MB | 334 MB | 12.0 ps |
+| 40 | **40 MHz** | **4.69** | 60 s | 9.07 | 0.00559 | 67.2 MB | 438 MB | **0.40 ps** |
+| 40 | 10 MHz | 1.64 | **900 s** | 6.45 | 0.00420 | **25.1 MB** | 328 MB | 3.5 ps |
+
+The 8- and 12-pair rows predate the instrumentation (`ada69ec`), hence the gaps.
+
+What the table says:
+
+- **Kernel cost tracks events, not pairs.** 2.5x the pairs (16 -> 40) cost 1.29x the kernel, because
+  the 24 added pairs were the dim band edges. At *fixed* pair count, 2.86x the load cost 1.42x. Do
+  not extrapolate to 80 bright pairs from the sub-linear number.
+- **The buffer scales with rate, not with time.** Linear in rate (2.97x for 2.86x, since it holds
+  roughly `tmax` worth of events) and essentially flat in duration (+11% for 15x).
+- **More pulses is the cheapest precision.** 40 MHz put 20 teeth in +-250 ns instead of 5 and
+  multiplied the counts, giving 0.40 ps period scatter across 40 pairs -- 0.10 ps over the brighter
+  half. That is 4 parts in 1e9.
+- **The parser ceiling is not a fixed number.** Node 2 sustained 2.97 M rec/s with `lag_max_s` of
+  0.01 and zero overflow, well past the ~2 M/s previously recorded -- because the bucketing loop is
+  O(chunk x N_active_pixels) and 40 active pixels is 8x cheaper per record than 320. So this does
+  **not** license 2.97 M/s at 80 or 320 pixels. Killing that loop is Stage 2a.
+
+### Measured with the synthetic source (16 cores)
 
 - Pool vs serial, 80 pairs / 8.76M t1 events / `n_shift=5`: **0.257 s → 0.035 s, 7.35x**,
   bit-identical at 4, 8 and 16 workers.
@@ -87,10 +117,21 @@ Quad is now free to go.** Item 3 is the next thing to do.
      pairs as tight as the bright one. px 298 released 92.93 % of its events with three partners
      versus 92.51 % with one, so the extra sparse partners cost it nothing. The four dim pairs are
      correctly flat with no comb, and `excluded` in the saved meta is empty.
-   - **`mask_laser_40.txt`** (locs 279-318) — the scale step. Record kernel s/batch and peak RSS.
-   - **`mask_laser_80.txt`** (locs 240-319) — load only. **The laser band is just 35 px wide at 3x
-     background, so no source on this bench can give 80 pairs of real comb**; the lower half of this
-     mask is background. 80-pair *correctness* stays a synthetic-source claim until starlight.
+   - ~~**`mask_laser_16` / `mask_laser_40`, and 40 pairs at 40 MHz**~~ **DONE 2026-08-26** — see the
+     Measured-on-hardware table below. Comb on every pair in every run; the scaling is sub-linear in
+     pair count because kernel cost tracks *events*, not pairs.
+   - ~~**The writes-off run**~~ **DONE 2026-08-26**, 15 min at 40 pairs. Zero `px_*.bin` touched,
+     **11.43 GB of timestamps not written** against 0.34 MB of dwell files, `overflow`/`discarded_b`/
+     `queue_blocks` all 0. The result worth having: **peak buffer 25.1 MB at 900 s against 22.6 MB at
+     60 s** — 15x the duration for +11%, so retention really is bounded by `tmax` and not by run
+     length. That could not be established from a 60 s run, and it is what makes a long acquisition
+     safe. Peak RSS and kernel ms/batch were flat.
+   - **`mask_laser_80.txt`** (locs 240-319) — load only, **still to do**. **The laser band is just
+     35 px wide at 3x background, so no source on this bench can give 80 pairs of real comb**; the
+     lower half of this mask is background. 80-pair *correctness* stays a synthetic-source claim
+     until starlight. Worth pairing with `SII_WIS_RAW_DUMP` so one session also serves Stage 2a.
+   - **A short re-run of anything**, to exercise the write-nothing and run-log paths: both landed
+     after the runs above, so neither has touched hardware yet.
 2. ~~**Stage 1b deviation 1 — widen `write_hooked` to all pixel keys.**~~ **DONE 2026-08-26.**
    `skipped_keys = set(range(320))`; "disk flat at 80 pixels" now holds regardless of which pixels
    are hooked. Note the behaviour change to expect at the bench: unchecking the box with no
@@ -115,6 +156,11 @@ Quad is now free to go.** Item 3 is the next thing to do.
   `tools/raw_dump.py` reads the format (`--info`, `--selftest`, 12 checks) including truncated
   captures, which are expected rather than corrupt. **The replay harness itself is still to write** —
   that is 2a's job; this commit only makes the capture possible and readable.
+
+- **The mask-driven pair modes have run on hardware** (2026-08-26): the 15-min writes-off run's saved
+  meta reads `mode identity {'from_masks': True, 'lo': 279, 'hi': 318, 'n_active': 40}`, so 40 pairs
+  were derived from the receiver's own mask files with no range typed anywhere. `file` mode ran
+  earlier the same evening via `pairs_laser_8_dim.csv`. `grid` has not been exercised live.
 
 - **Scale instrumentation LANDED 2026-08-26**, so the outstanding "kernel s/batch and peak RSS at
   4 -> 16 -> 80 pairs" is now a measurement rather than a screenshot: status line and `.npz` meta both
@@ -926,7 +972,7 @@ Add a `raw_b`/`wire_b` ratio to `stats` and expect ~2.00x at the rates that matt
 > | **transitional Quad cross-check (`quad_compat`)** | **NOT DONE** — judged redundant once the golden brute force existed, since it is a strictly better oracle and Quad carries the retention bug. Reinstate only if a hardware discrepancy needs bisecting |
 > | **on hardware — the live-vs-offline proof** | **DONE 2026-08-26** — see the hardware block below. Done against `analyze_g2_pairs_offline.py` rather than `CorrelateWindow`: the offline path is a strictly better oracle (independent kernel, independent offset estimate, whole-file rather than streamed) and it sidesteps the `suffix` collision entirely |
 > | **after Quad is deleted: re-run the suite** | **NOT DONE** — Quad still exists |
-> | **kernel s/batch and peak RSS at 4 → 16 → 80 pairs** | **PARTIAL** — timing measured (7.35x, ~5 core-s per data-second at 80 pairs); peak RSS not recorded, and the sustainable `npairs x rate` for this machine is not yet in `CLAUDE.md` |
+> | **kernel s/batch and peak RSS at 4 → 16 → 80 pairs** | **DONE to 40 pairs** 2026-08-26 — see the Measured-on-hardware table. 80 pairs outstanding, and it is a load test only |
 
 - *Kernel equivalence:* the new pair-parallel kernel must match `_multistart_multistop` **exactly**
   (`np.array_equal`, int64 — reordering integer accumulation is exact, so any difference is a bug).

@@ -189,3 +189,5 @@ and registration within +0.2/−0.8 px across pixels 118–216. Scans archived i
 **Arc alignment.** Routine re-check with the setup untouched since yesterday.  Consistent with the 25-8-26 post-realignment scan.
 
 **Multi-pair correlator — validated on hardware.** 8 identity pairs (locs 295-302), pulsed laser at 10 MHz, 20 ps bins, ±250 ns. Live g2 histogram on all 8 pairs simultaneously, results consistent with expected comb form and with offline histogram. Count rate 19-25 kcps/pixel on node 1 (0.17 Mcps over the 8) and 30-60 on node 2 (0.30 Mcps), 60 s run — within ~15 % of what the intensity scan predicted.
+
+**Multi-pixel scale-up.** Several pulsed-laser, multi-pixel acquisitions to test multi-pixel live histogramming: 12 / 16 / 40 pairs at 10 MHz, 40 pairs at 40 MHz, and a 15-min 40-pair run with write-to-disk off. Comb recovered on every pair in every run; period agrees to 0.4-12 ps across pairs, and the retention buffer plateaus at ~25 MB independent of run length. Node 2 sustained 2.97 Mcps with zero overflow and 0.01 s parser lag. Saved as `spad_data/g2multi{,_dim,_16,_40,_40mhz,_nodisk}.npz`.
