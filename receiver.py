@@ -320,6 +320,19 @@ class NodePanel:
     def is_ready(self) -> bool:
         return self._state in ('ready', 'streaming')
 
+    def write_flag_is_committed(self) -> bool:
+        """True once this node's write-to-disk choice can no longer change.
+
+        `_accept_data_thread` reads get_write_hooked_fn() at the moment the data
+        connection is accepted, and run_session_loop keeps that value for every
+        back-to-back session on the connection. So the flag is fixed from the
+        accept -- and `_session_active` is included because START is sent
+        synchronously, seconds before the sender connects back: without it there
+        is a window where node 1 has committed and node 2 has not, which is the
+        exact desync this is meant to prevent.
+        """
+        return self._data_conn is not None or self._session_active
+
     # ------------------------------------------------------------------
     # Background threads
     # ------------------------------------------------------------------
@@ -728,6 +741,9 @@ class ReceiverGUI:
         # to ~1.3 GB/s of timestamps and the sender's TCP window is what must
         # not close. With write-to-disk off this file is the run's only record.
         self._run_log = RunLog()
+        # False, not None: the first _refresh_write_disk_lock() at build time
+        # would otherwise read as a transition and log "unlocked" on every start.
+        self._write_locked_last = False
         self._run_id = 0
         self._cal_waiting: set[int] = set()   # nodes whose first data chunk is still pending
         self._cal_run = -1                    # run_id that opened the current wait
@@ -757,6 +773,7 @@ class ReceiverGUI:
         self._monitor_abort: threading.Event | None = None
         self._build_ui()
         self._push_write_disk_state()   # correlators start out agreeing with the box
+        self._refresh_write_disk_lock()
         # Only now do the NodePanels exist, so this is the first moment the
         # multi-pair window can read their mask fields.
         for c in self._correlators:
@@ -823,10 +840,16 @@ class ReceiverGUI:
         self._cal_status_lbl = tk.Label(acq, textvariable=self._cal_status_var, anchor='w')
         self._cal_status_lbl.grid(row=2, column=0, columnspan=5, sticky='w', padx=8, pady=(0, 6))
 
-        ttk.Checkbutton(
+        self._write_disk_cb = ttk.Checkbutton(
             acq, text='Write timestamps to disk (uncheck: live correlation only)',
-            variable=self.write_disk_var, command=self._on_write_disk_toggle).grid(
-            row=3, column=0, columnspan=6, sticky='w', padx=8, pady=(0, 6))
+            variable=self.write_disk_var, command=self._on_write_disk_toggle)
+        self._write_disk_cb.grid(row=3, column=0, columnspan=6, sticky='w',
+                                 padx=8, pady=(0, 6))
+        # A greyed-out checkbox with no reason given is worse than a live one.
+        self._write_lock_var = tk.StringVar(value='')
+        tk.Label(acq, textvariable=self._write_lock_var, anchor='w',
+                 fg='#aa6600', wraplength=560, justify='left').grid(
+            row=4, column=0, columnspan=6, sticky='w', padx=8, pady=(0, 6))
 
         ttk.Label(acq, text='Duration (s):').grid(row=0, column=3, sticky='w', padx=(12, 4))
         self.duration_var = tk.StringVar(value='1')
@@ -889,9 +912,30 @@ class ReceiverGUI:
             self._enqueue_log('Write to disk ON — every pixel is persisted as usual.\n')
         else:
             self._enqueue_log(
-                'Write to disk OFF — live-correlated pixels will be fed to the '
-                'correlator only, with no px_*.bin. Sync markers are still '
-                'written. Applies from the next START.\n')
+                'Write to disk OFF — NOTHING will be written: no px_*.bin, no '
+                'sync files, no output directory. Hooked pixels go to the '
+                'correlator only. Applies from the next data connection.\n')
+
+    def _refresh_write_disk_lock(self) -> None:
+        """Lock the checkbox while the flag is already committed.
+
+        Deviation 2 of Stage 1b. The old mitigation only *said* the toggle
+        applied later; the box still moved, which reads as "this run will not
+        write" when the run had already decided otherwise. Worse, the value is
+        captured per node, so toggling between the two nodes' accepts wrote one
+        node's pixels and not the other's -- half a dataset, found later.
+        """
+        locked = any(n.write_flag_is_committed() for n in (self.node1, self.node2))
+        self._write_disk_cb.configure(state='disabled' if locked else 'normal')
+        self._write_lock_var.set(
+            'Locked: the write choice is fixed when a node\'s data connection '
+            'is accepted and holds for every session on it. Disconnect a node to '
+            'change it.' if locked else '')
+        if locked != getattr(self, '_write_locked_last', False):
+            self._write_locked_last = locked
+            self._enqueue_log(
+                f'Write-to-disk choice {"LOCKED" if locked else "unlocked"} '
+                f'({"ON" if self.write_disk_var.get() else "OFF"}).\n')
 
     def _push_write_disk_state(self) -> None:
         """Tell every correlator whether the timestamps are being kept.
@@ -948,6 +992,8 @@ class ReceiverGUI:
 
         self._run_id += 1
         self._set_cal_status('')
+        # Synchronously, before any accept: START has already committed the flag.
+        self._refresh_write_disk_lock()
         writing = self.write_disk_var.get()
         path = self._run_log.start(header=(
             f'# sii_wis run log — {time.strftime("%Y-%m-%d %H:%M:%S")}\n'
@@ -1395,6 +1441,7 @@ class ReceiverGUI:
     def _health_check(self) -> None:
         self.node1.health_check()
         self.node2.health_check()
+        self._refresh_write_disk_lock()
         self._schedule_health_check()
 
     # ------------------------------------------------------------------

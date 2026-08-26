@@ -14,7 +14,7 @@ stable 1v1 fallback.**
 | stage | state |
 |---|---|
 | **1a** tap fan-out | **DONE** — `d049f36` |
-| **1b** write-to-disk checkbox | **DONE and verified on hardware** 2026-08-26 — deviation 1 closed, semantics widened to write *nothing*, and a 15-min run confirmed 11.43 GB not written with the buffer plateauing. Deviation 2 (lock the checkbox while streaming) still open; 3 largely answered by `spad_data/log/` |
+| **1b** write-to-disk checkbox | **COMPLETE** 2026-08-26 — deviation 1 closed, semantics widened to write *nothing*, deviation 2 (checkbox locked once committed) fixed, deviation 3 largely answered by `spad_data/log/`. Verified on hardware: a 15-min run wrote 0 bytes of the 11.43 GB it would have, with the buffer plateauing |
 | **2** sender throughput | **DEFERRED, now on hardware evidence** — Phase 0 capture scaffolding landed 2026-08-26; 2.97 M rec/s sustained clean at 40 pixels against the ~80 M/s that would make 2a bind. Replay harness still to write |
 | **3** multi-pair correlator | **COMPLETE** 2026-08-26 — validated on hardware from 8 to 40 pairs, 10 and 40 MHz, up to 15 min, comb on every pair in every run; 80 pairs covered synthetically; `QuadCorrelateWindow` deleted |
 
@@ -26,7 +26,7 @@ ab9a8c2  Add tools/pair_map.py: pure pair derivation, shared with align_arc
 d049f36  Stage 1a: fan pixel_hooks out to every subscriber
 ```
 
-### Test suite — 250 checks, all passing as of 2026-08-26
+### Test suite — 267 checks, all passing as of 2026-08-26
 
 Plain asserts, no pytest (it is not in `requirements.txt`). **Run all of these before trusting any
 change**; the whole suite takes ~2 minutes, most of it numba compiling.
@@ -36,6 +36,7 @@ change**; the whole suite takes ~2 minutes, most of it numba compiling.
 .venv\Scripts\python.exe tests\test_hook_fanout.py       # 29  Stage 1a + 1b
 .venv\Scripts\python.exe tests\test_channel_graph.py     # 59  retention
 .venv\Scripts\python.exe tests\test_multi_window.py      # 45  end-to-end
+.venv\Scripts\python.exe tests\test_write_lock.py       # 17  write-flag lock
 .venv\Scripts\python.exe tools\pair_map.py --selftest    # 44  pair derivation
 .venv\Scripts\python.exe tools\raw_dump.py --selftest    # 12  raw-capture format
 .venv\Scripts\python.exe run_log.py                     # 16  per-run log capture
@@ -429,11 +430,14 @@ global **"Write timestamps to disk (uncheck: live correlation only)"** `Checkbut
    with writes off those are the only photons that survive anywhere, making that list the session's
    entire pixel record. Covered by four new checks in `tests/test_hook_fanout.py` (16 → 21):
    un-hooked pixel suppressed, zero-hook case, sync files still written, log line shape.
-2. **Not locked during streaming.** The flag is read per node at accept time, seconds apart, so
-   toggling in that window still desynchronizes the two nodes. Shipped mitigation is weaker: the
-   toggle handler (`receiver.py:827-840`) logs which way it went and says it applies from the next
-   START. Disabling the `Checkbutton` while any node is streaming is the actual fix and is
-   unimplemented.
+2. ~~**Not locked during streaming.**~~ **FIXED 2026-08-26.** The `Checkbutton` is now disabled
+   whenever either node reports `write_flag_is_committed()` — a data connection accepted, *or*
+   `_session_active`, since START is sent synchronously seconds before the sender connects back.
+   That second arm is the point: without it a toggle could land between the two nodes' accepts and
+   write one node's pixels but not the other's, which is half a dataset and is not visible until
+   analysis. Refreshed at build, on every 2 s health check, and synchronously inside `_start_all`
+   before any accept. An on-screen reason says why it is greyed out and where to change it, and each
+   transition logs once (not once per health check). `tests/test_write_lock.py`, 17 checks.
 3. **Not recorded in `session_stats.json`.** `_record_session_stats` (`receiver.py:357-409`) does not
    carry the flag, so a directory with no `px_*.bin` is only explicable from the log. Note the stats
    dict itself originates on the *sender*, which has no idea about this receiver-side choice — so
