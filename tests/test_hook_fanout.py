@@ -189,17 +189,59 @@ def test_tee_not_divert_multi_subscriber():
 
 def test_write_hooked_off_still_fans_out():
     """The 1b checkbox and 1a fan-out have to compose: with writes off, both
-    subscribers still get every chunk and no px_042.bin is created."""
+    subscribers still get every chunk and no px_*.bin is created at all."""
     q1, q2 = queue.Queue(), queue.Queue()
     outdir, logs = run_stream([frame(42, PAYLOAD_A)], {42: [q1, q2]},
                               write_hooked=False)
     exists = os.path.exists(os.path.join(outdir, 'px_042.bin'))
     n_px = len([f for f in os.listdir(outdir) if f.startswith('px_')])
     check('writes off: no px file, both subscribers still fed',
-          not exists and n_px == 319 and drain(q1) == drain(q2) == [PAYLOAD_A],
+          not exists and n_px == 0 and drain(q1) == drain(q2) == [PAYLOAD_A],
           f'exists={exists} n_px={n_px}')
     check('writes off: no spurious unrecognised-key_id warning',
           not any('unrecognised' in m for m in logs))
+
+
+def test_write_hooked_off_suppresses_unhooked_pixels_too():
+    """Deviation 1: the flag exists to kill the ~1.28 GB/s write path, so it
+    must suppress pixels nobody is watching as well — otherwise an acquisition
+    that correlates a subset (the normal case) keeps writing every other
+    active pixel and the flag delivers no relief at all."""
+    q = queue.Queue()
+    outdir, logs = run_stream([frame(42, PAYLOAD_A), frame(7, PAYLOAD_B)],
+                              {42: [q]}, write_hooked=False)
+    n_px = len([f for f in os.listdir(outdir) if f.startswith('px_')])
+    check('writes off: an un-hooked pixel is not written either',
+          not os.path.exists(os.path.join(outdir, 'px_007.bin')) and n_px == 0,
+          f'n_px={n_px}')
+    check('writes off: the un-hooked chunk is counted as skipped, not unknown',
+          not any('unrecognised' in m for m in logs)
+          and any('NOT written' in m for m in logs))
+    check('writes off: the hooked pixel still reaches its queue',
+          drain(q) == [PAYLOAD_A])
+
+
+def test_write_hooked_off_with_no_hooks_at_all():
+    """Unchecking the box with no correlator open must mean what it says.
+    Before deviation 1 the `and subs` guard made this a silent no-op: the
+    label promised nothing would be written and everything was."""
+    outdir, _ = run_stream([frame(42, PAYLOAD_A), frame(323, PAYLOAD_B)],
+                           {}, write_hooked=False)
+    n_px = len([f for f in os.listdir(outdir) if f.startswith('px_')])
+    check('writes off with zero hooks: no pixel files, sync still written',
+          n_px == 0 and os.path.exists(os.path.join(outdir, 'slave_dwell.bin')),
+          f'n_px={n_px}')
+
+
+def test_write_hooked_off_log_names_the_hooked_pixels():
+    """The session log is the only record of what the run kept, so it has to
+    name the hooked pixels rather than dump all 320 suppressed keys."""
+    outdir, logs = run_stream([frame(42, PAYLOAD_A)], {42: [queue.Queue()]},
+                              write_hooked=False)
+    msg = [m for m in logs if 'Write to disk OFF' in m]
+    check('writes off: one up-front log line naming the hooked pixels',
+          len(msg) == 1 and '[42]' in msg[0] and 'no px_*.bin at all' in msg[0],
+          f'msg={msg}')
 
 
 def test_sync_keys_never_suppressed_with_list_hooks():

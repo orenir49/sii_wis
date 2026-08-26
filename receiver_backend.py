@@ -119,11 +119,20 @@ def run_session_loop(conn: socket.socket, log_fn=print,
                   data chunk arrives. Marks the moment acquisition is genuinely
                   under way — several seconds after START, since the sender
                   still has to reach the receiver and negotiate with lSPAD.
-    write_hooked: when False, hooked PIXEL keys are fed to their queue only and
-                  never written — live correlation without keeping the
-                  timestamps. Their px_*.bin is not even created, so an absent
-                  file means "deliberately not recorded" rather than an empty
-                  one that reads as "pixel saw nothing".
+    write_hooked: when False, NO pixel key is written — hooked ones are fed to
+                  their queue only, un-hooked ones are discarded. Live
+                  correlation without keeping the timestamps. No px_*.bin is
+                  created at all, so an absent file means "deliberately not
+                  recorded" rather than an empty one that reads as "pixel saw
+                  nothing".
+
+                  The suppression is deliberately NOT limited to hooked keys.
+                  At 160 active pixels x 1 MHz the write path is ~1.28 GB/s and
+                  stalls; the sender's TCP window then closes and the loss
+                  resurfaces as detector FIFO overflow. Sparing the un-hooked
+                  pixels would leave that load in place whenever the correlator
+                  watches only a subset, which is the normal case, so the flag
+                  would not deliver the relief it exists for.
 
                   Only keys < 320 are ever suppressed. Keys 320–325 carry the
                   dwell/line/frame markers, which are hooked on every run for
@@ -142,8 +151,8 @@ def run_session_loop(conn: socket.socket, log_fn=print,
     # caller before this loop starts, so every back-to-back session suppresses
     # the same keys.
     skipped_keys: set = set()
-    if not write_hooked and subs:
-        skipped_keys = {k for k in subs if k < 320}
+    if not write_hooked:
+        skipped_keys = set(range(320))
 
     session = 0
     stream  = conn.makefile('rb', buffering=1 << 20)
@@ -169,11 +178,18 @@ def run_session_loop(conn: socket.socket, log_fn=print,
                 handles[kid] = open(os.path.join(output_dir, fname), 'wb')
 
             if skipped_keys:
-                # Say it once per session, up front: a run whose correlated
-                # pixels were never recorded must not look like a normal one.
-                log_fn(f'[session {session}] Write to disk OFF for live-correlated '
-                       f'pixel(s) {sorted(skipped_keys)} — timestamps go to the '
-                       f'correlator only, no px_*.bin for them')
+                # Say it once per session, up front: a run whose pixels were
+                # never recorded must not look like a normal one. Name the
+                # hooked pixels explicitly — those are the only ones whose
+                # photons survive anywhere, so that list is the session's
+                # entire pixel record.
+                _hooked = sorted(k for k in subs if k < 320)
+                _shown  = (str(_hooked) if len(_hooked) <= 12
+                           else f'{_hooked[:12]}... ({len(_hooked)} total)')
+                log_fn(f'[session {session}] Write to disk OFF — no px_*.bin at all '
+                       f'this session. Live-correlated pixel(s) {_shown} stream to '
+                       f'the correlator only; every other pixel is discarded. Sync '
+                       f'files (keys 320-325) are written as usual.')
 
             chunks    = 0
             unknown   = 0
