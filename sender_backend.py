@@ -263,6 +263,53 @@ def check_connection(sock: socket.socket) -> bool:
         return False
 
 
+def open_lspad_stream(duration: float, log_fn=print):
+    """Connect to lSPAD, clear any leftover acquisition, check the TDC
+    calibration, and start the stream (SB). Returns the streaming socket.
+
+    Extracted so a replay harness can substitute a socket that re-serves a
+    captured stream (tools/replay.py). Deliberately ONLY the handshake: the
+    parse loop it feeds is the thing a parser rewrite has to be proved
+    against, so that loop stays byte-for-byte where it was. Refactoring the
+    code under test to make it testable would defeat the point.
+    """
+    spad_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    spad_sock.settimeout(LSPAD_HANDSHAKE_S)
+    spad_sock.connect((SPAD_HOST, SPAD_PORT))
+    # Clear any acquisition still running from a previous session before
+    # touching the command protocol. lSPAD streams to every connected
+    # client, so a leftover SB would be read as our command replies and
+    # would desynchronise the 7-byte record framing for the whole run.
+    # Sending STOP straight away lets one drain cover the banner, any
+    # leftover stream and the STOP reply — three waits cost >1 s of the
+    # sparse-cal window.
+    spad_sock.sendall(b'STOP\n')
+    t_pre = time.time()
+    _, pre_n = drain_lspad(spad_sock, quiet_for=0.4, cap=PRESTART_DRAIN_S)
+    if pre_n > 256:
+        dt = time.time() - t_pre
+        log_fn(f'pre-START STOP: discarded {pre_n / 1e6:,.0f} MB of '
+               f'leftover stream in {dt:.1f} s before lSPAD went quiet\n')
+
+    spad_sock.sendall(b'T,v,1\n')
+    tdc_reply, tdc_n = drain_lspad(spad_sock, quiet_for=0.2,
+                                   cap=LSPAD_HANDSHAKE_S)
+    if not is_text_reply(tdc_reply):
+        raise RuntimeError(
+            f'lSPAD is still streaming: T,v,1 returned {tdc_n:,} bytes '
+            'of binary data instead of a calibration state. A previous '
+            'acquisition was not stopped — refusing to start, since the '
+            'record framing would be desynchronised.')
+    if tdc_reply.decode('utf8', errors='replace').strip() == 'TDC calibration is invalid':
+        spad_sock.sendall(b'T,c,1\n')
+        log_fn(drain_lspad(spad_sock, quiet_for=2.0, cap=TDC_CALIB_S)[0]
+               .decode('utf8', errors='replace'))
+
+    spad_sock.settimeout(None)   # stream loop drives its own select()
+    spad_sock.sendall(f'SB,{int(duration * 1000)}\n'.encode('utf8'))
+    return spad_sock
+
+
 def run(sock: socket.socket,
         output_dir: str,
         duration: float,
@@ -438,40 +485,7 @@ def run(sock: socket.socket,
 
         else:
             # lSPAD's own TCP command protocol — see LSPAD_CLI.md for the full command set.
-            spad_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            spad_sock.settimeout(LSPAD_HANDSHAKE_S)
-            spad_sock.connect((SPAD_HOST, SPAD_PORT))
-            # Clear any acquisition still running from a previous session before
-            # touching the command protocol. lSPAD streams to every connected
-            # client, so a leftover SB would be read as our command replies and
-            # would desynchronise the 7-byte record framing for the whole run.
-            # Sending STOP straight away lets one drain cover the banner, any
-            # leftover stream and the STOP reply — three waits cost >1 s of the
-            # sparse-cal window.
-            spad_sock.sendall(b'STOP\n')
-            t_pre = time.time()
-            _, pre_n = drain_lspad(spad_sock, quiet_for=0.4, cap=PRESTART_DRAIN_S)
-            if pre_n > 256:
-                dt = time.time() - t_pre
-                log_fn(f'pre-START STOP: discarded {pre_n / 1e6:,.0f} MB of '
-                       f'leftover stream in {dt:.1f} s before lSPAD went quiet\n')
-
-            spad_sock.sendall(b'T,v,1\n')
-            tdc_reply, tdc_n = drain_lspad(spad_sock, quiet_for=0.2,
-                                           cap=LSPAD_HANDSHAKE_S)
-            if not is_text_reply(tdc_reply):
-                raise RuntimeError(
-                    f'lSPAD is still streaming: T,v,1 returned {tdc_n:,} bytes '
-                    'of binary data instead of a calibration state. A previous '
-                    'acquisition was not stopped — refusing to start, since the '
-                    'record framing would be desynchronised.')
-            if tdc_reply.decode('utf8', errors='replace').strip() == 'TDC calibration is invalid':
-                spad_sock.sendall(b'T,c,1\n')
-                log_fn(drain_lspad(spad_sock, quiet_for=2.0, cap=TDC_CALIB_S)[0]
-                       .decode('utf8', errors='replace'))
-
-            spad_sock.settimeout(None)   # stream loop drives its own select()
-            spad_sock.sendall(f'SB,{int(duration * 1000)}\n'.encode('utf8'))
+            spad_sock = open_lspad_stream(duration, log_fn)
 
             reset_m     = 0
             reset_s     = 0

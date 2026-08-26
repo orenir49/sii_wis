@@ -26,7 +26,7 @@ ab9a8c2  Add tools/pair_map.py: pure pair derivation, shared with align_arc
 d049f36  Stage 1a: fan pixel_hooks out to every subscriber
 ```
 
-### Test suite — 267 checks, all passing as of 2026-08-26
+### Test suite — 284 checks, all passing as of 2026-08-26
 
 Plain asserts, no pytest (it is not in `requirements.txt`). **Run all of these before trusting any
 change**; the whole suite takes ~2 minutes, most of it numba compiling.
@@ -39,6 +39,7 @@ change**; the whole suite takes ~2 minutes, most of it numba compiling.
 .venv\Scripts\python.exe tests\test_write_lock.py       # 17  write-flag lock
 .venv\Scripts\python.exe tools\pair_map.py --selftest    # 44  pair derivation
 .venv\Scripts\python.exe tools\raw_dump.py --selftest    # 12  raw-capture format
+.venv\Scripts\python.exe tools\replay.py --selftest      # 17  replay harness
 .venv\Scripts\python.exe run_log.py                     # 16  per-run log capture
 .venv\Scripts\python.exe correlate_kernel.py             # 25  kernel equivalence
 .venv\Scripts\python.exe synthetic_source.py             #  8  generator + comb
@@ -193,8 +194,33 @@ Quad is now free to go.** Item 3 is the next thing to do.
   they are part of the input. `SII_WIS_RAW_DUMP_MAX_MB` caps it (2048 default): it stops, logs once,
   and keeps parsing rather than filling the disk. Bytes captured land in `stats['raw_dump_b']`.
   `tools/raw_dump.py` reads the format (`--info`, `--selftest`, 12 checks) including truncated
-  captures, which are expected rather than corrupt. **The replay harness itself is still to write** —
-  that is 2a's job; this commit only makes the capture possible and readable.
+  captures, which are expected rather than corrupt.
+
+- **The replay harness LANDED 2026-08-26** — `tools/replay.py`, 17 checks. `replay(chunks, outdir)`
+  feeds a capture through `sender_backend.run()` into the receiver's own `run_session_loop`, so the
+  output is `px_*.bin` produced end to end through the real wire protocol rather than a
+  harness-specific intermediate; `compare()` then diffs two replays byte-for-byte plus every
+  input-derived stat. Three things it gets right, each of which rules an easier design out:
+  - **A plain socketpair replay would be wrong.** TCP coalesces, so the new parser would see
+    different chunking than the old one and any difference would be the harness's fault. `ReplaySocket.recv()`
+    returns each captured chunk verbatim, holding a real socketpair purely so `select.select` has a
+    handle (on Windows it needs one).
+  - **The code under test was not refactored to make it testable.** Only the handshake came out, as
+    `sender_backend.open_lspad_stream()`; the parse loop — the actual reference — is untouched.
+  - **Timing stats are excluded by name** (`lag_s`, `lag_max_s`, `queue_max`, `queue_blocks`), since
+    they depend on machine speed rather than input. A harness that flags those produces false alarms
+    that then get explained away, which is worse than no harness.
+
+  The selftest **demonstrates** the boundary sensitivity rather than asserting it: the same bytes cut
+  so that a `coarse == 0xFFFF` record ends a chunk give `epoch_fixes` 0, and cut so it does not give
+  1, with genuinely different timestamps in the output. That is the concrete reason the capture is
+  length-prefixed. Bulk re-chunking, where no boundary lands on such a record, agrees on every
+  timestamp. It also proves it can *detect* a regression: one altered record in one chunk shows up as
+  a differing `px_*.bin`.
+
+  **Still needed: one real capture.** The raw dump landed after the 26-8-26 runs, so nothing has been
+  captured from hardware yet. Until then the harness is proven against synthetic records only, and
+  Stage 2a stays argued rather than proved.
 
 - **The mask-driven pair modes have run on hardware** (2026-08-26): the 15-min writes-off run's saved
   meta reads `mode identity {'from_masks': True, 'lo': 279, 'hi': 318, 'n_active': 40}`, so 40 pairs

@@ -48,6 +48,7 @@ python tools\raw_dump.py --info spad_data\capture.raw
 .venv\Scripts\python.exe tests\test_multi_window.py
 .venv\Scripts\python.exe tests\test_write_lock.py
 .venv\Scripts\python.exe tools\raw_dump.py --selftest
+.venv\Scripts\python.exe tools\replay.py --selftest
 .venv\Scripts\python.exe correlate_kernel.py      # kernel equivalence
 .venv\Scripts\python.exe synthetic_source.py      # generator + comb
 
@@ -95,6 +96,7 @@ Minimal GUI that starts a command server thread on launch. Receives JSON command
 | `tools/plot_g2_result.py` | Peak-annotated g² histogram + count-distribution PNGs from a saved `{px1}_{px2}_{suffix}.txt` |
 | `tools/analyze_g2_pairs_offline.py` | Offline g² for arbitrary pixel pairs with the robust slave-dwell clock offset (matches the live correlator) |
 | `tools/raw_dump.py` | Reader + `--selftest` for the sender's env-gated raw lSPAD capture (`SII_WIS_RAW_DUMP`); length-prefixed chunks so a replay reproduces the original recv() boundaries |
+| `tools/replay.py` | Replays a capture through `sender_backend.run()` into the real receiver loop, and diffs two replays (`px_*.bin` bytes + input-derived stats). The oracle a parser rewrite has to pass; `--selftest` |
 | `tools/pair_map.py` | Pure (node-1, node-2) pair derivation — identity / grid (both mask-driven) and file for the GUI, plus affine for `align_arc --emit-pairs`; mask cross-check, `--selftest` |
 | `ssh_launcher.py` | Paramiko-based remote automation for launching sender nodes |
 | `setup_node.ps1` | One-shot sender node setup: OpenSSH, firewall, git clone, venv |
