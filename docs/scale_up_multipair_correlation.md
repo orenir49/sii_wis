@@ -23,7 +23,7 @@ Stage 5 resolves.
 | **1b** write-to-disk checkbox | **COMPLETE** 2026-08-26 — deviation 1 closed, semantics widened to write *nothing*, deviation 2 (checkbox locked once committed) fixed, deviation 3 largely answered by `spad_data/log/`. Verified on hardware: a 15-min run wrote 0 bytes of the 11.43 GB it would have, with the buffer plateauing |
 | **2** sender throughput | **DEFERRED, and now PROVABLE** — Phase 0 complete 2026-08-26: real captures taken from both nodes and `tools/replay.py` reproduces each acquisition byte-for-byte across all 326 files, `epoch_fixes` included. Still deferred on merit: 2.97 M rec/s runs clean at 40 pixels against the ~80 M/s that would make 2a bind |
 | **3** multi-pair correlator | **COMPLETE** 2026-08-26 — validated on hardware from 8 to 40 pairs, 10 and 40 MHz, up to 15 min, comb on every pair in every run; 80 pairs covered synthetically; `QuadCorrelateWindow` deleted |
-| **4** retire the single-pair correlator | **NOT STARTED** — the multi-pair window is the only correlator that should remain; see Stage 4 |
+| **4** retire the single-pair correlator | **NOT STARTED** — one correlator only. Port the count-distribution view in first; take the synthetic source's GUI surface out. See Stage 4 |
 | **5** tag the 1v1 fallback, then merge to `main` | **NOT STARTED** — do it in that order; see Stage 5 |
 
 ```
@@ -1073,18 +1073,54 @@ Two ways, and the choice should be deliberate:
   `correlate_kernel.py`'s docstring reference. One correlator, one module. **Preferred** — the whole
   point of the stage is that there is no second correlator to share with.
 
-### What is genuinely lost, and the decision that goes with it
+### Port first: the count-distribution view
 
-**The count-distribution view** (`correlate.py:_draw_distribution`). It histograms counts-per-bin
-against a Poisson of the same mean and reports both a local p-value and a **Lee-effect-corrected**
-p-value over the N bins searched. The multi-pair window has no distribution view at all — this was
-flagged as "not absorbed" when Stage 3 landed and never was.
+**Decided 2026-08-26 — port it, do not drop it.** `correlate.py:_draw_distribution` is the one thing
+the single-pair window does that the multi-pair window cannot, and it exists nowhere else in the
+codebase. It must move BEFORE `CorrelateWindow` is deleted, or the capability is gone with it.
 
-That is a real statistical tool and it exists nowhere else in the codebase, so retiring
-`CorrelateWindow` either **ports it first** or **deletes it**. It is the only part of this stage that
-is a judgement call rather than a mechanical move: everything else the single-pair window did, the
-multi-pair window does. Port it if the bunching search is still going to use it; drop it if the
-marked-peak SNR plus `tools/plot_g2_result.py` cover the need.
+What it does, and why it is worth keeping: it histograms counts-per-bin, overlays a Poisson PMF of the
+same mean, and reports a local p-value **and a Lee-effect-corrected one** over the `N_trials = nbins`
+searched. That correction is the point — a g² histogram is thousands of bins, so the largest bin is
+a multiple-comparisons result, and a local p-value read off it overstates the case by orders of
+magnitude. Nothing else in the codebase makes that correction.
+
+How to fit it into a window that is deliberately one plot:
+
+- A **view radio** on the selected pair (`g²` / `count distribution`), which is how
+  `CorrelateWindow` does it (`mode_var`, values `histogram` / `distribution`). **Not** a second
+  permanent axes — the SNR-vs-pair panel was just removed for occupying space every run to answer a
+  question asked occasionally, and this would repeat that mistake.
+- It reads `expected_var` (the R field) to draw `Nc = mean x R` as a marked line. The multi-pair
+  window has the **Compute R…** button but no R entry, so that field comes across too, or the line is
+  dropped and the button's result has nowhere to land.
+- `scipy.stats.poisson` is already a dependency.
+
+Everything else the single-pair window did, the multi-pair window already does.
+
+### Also come out: the synthetic source's GUI surface
+
+**Decided 2026-08-26.** `synthetic_source.py` stays — it is how 80 pairs got covered at all, and how
+the whole path was validated before any detector was involved. What goes is its **presence in the
+live window**: the `Synthetic source` checkbox, the `rep (ns)` entry, `_on_synth_toggle`, the
+`self._synth` attribute, the feed hook in `_poll_data`, `SYNTH_SPAN_S`, and the
+`from synthetic_source import SyntheticSource` import.
+
+Why: a production acquisition window that can silently manufacture data is a foot-gun. The
+`meta['synthetic']` flag mitigated it, but not having the button at all is stronger — with no GUI path
+to synthetic data, **every saved `.npz` is real by construction** rather than by checking a field.
+`meta['synthetic']` goes with it, and `tests/test_multi_window.py`'s assertion on it needs updating.
+
+This costs the tests nothing, because they never used the toggle: they assign `w._synth` directly and
+call `SyntheticSource.feed(graph, dt)`. That is the interface to keep — `feed()` takes a
+`ChannelGraph`, so a synthetic run needs no window at all. Both existing offline harnesses already
+work that way with no Tk in sight, which is the proof this is the right seam:
+
+    src = SyntheticSource(pl.channels_node1, pl.channels_node2, period_ps=...)
+    src.feed(graph, dt); graph.drain_all(); rel = graph.release()
+
+So the tests move from `w._synth.feed(w._graph, dt)` to feeding the graph directly, and the window
+loses a code path only tests exercised.
 
 ### After
 
