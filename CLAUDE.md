@@ -92,7 +92,7 @@ Minimal GUI that starts a command server thread on launch. Receives JSON command
 | `tools/plot_g2_result.py` | Peak-annotated g² histogram + count-distribution PNGs from a saved `{px1}_{px2}_{suffix}.txt` |
 | `tools/analyze_g2_pairs_offline.py` | Offline g² for arbitrary pixel pairs with the robust slave-dwell clock offset (matches the live correlator) |
 | `tools/raw_dump.py` | Reader + `--selftest` for the sender's env-gated raw lSPAD capture (`SII_WIS_RAW_DUMP`); length-prefixed chunks so a replay reproduces the original recv() boundaries |
-| `tools/pair_map.py` | Pure (node-1, node-2) pair derivation for the multi-pair correlator — identity / affine / grid / file modes, mask cross-check, `--selftest` |
+| `tools/pair_map.py` | Pure (node-1, node-2) pair derivation — identity / grid (both mask-driven) and file for the GUI, plus affine for `align_arc --emit-pairs`; mask cross-check, `--selftest` |
 | `ssh_launcher.py` | Paramiko-based remote automation for launching sender nodes |
 | `setup_node.ps1` | One-shot sender node setup: OpenSSH, firewall, git clone, venv |
 | `spad_new.ipynb` | Offline g² analysis notebook |
@@ -128,12 +128,24 @@ Each key fans out to **every** subscriber. `merge_hooks()` (`receiver.py`) compo
 
 | module | owns | tested by |
 |---|---|---|
-| `tools/pair_map.py` | which pixels pair with which | `--selftest`, 29 checks |
+| `tools/pair_map.py` | which pixels pair with which | `--selftest`, 44 checks |
 | `correlate_engine.py` | which events are safe to correlate | `tests/test_channel_graph.py`, 59 checks |
 | `correlate_kernel.py` | the histogram | `--selftest`, 25 checks |
-| `correlate_multi.py` | widgets | `tests/test_multi_window.py`, 33 checks |
+| `correlate_multi.py` | widgets | `tests/test_multi_window.py`, 45 checks |
 
-Pair modes: **identity** (`p2 = p1`), **affine** (`p2 = round(((p1-160) - b)/a + 160)`, inverting `align_arc.py`'s fit — `align_arc.py --emit-pairs LO HI` calls the same helper so the two cannot disagree), **grid** (outer product — this is `QuadCorrelateWindow`'s 2×2 workflow at any size), and **file** (`pix1,pix2` CSV). Affine with `a ≠ 1` is *not* bijective, so a node-2 pixel can serve two pairs; channels are therefore keyed by **distinct pixel**, never by pair. **Enable stays disabled until Derive succeeds**, and Derive shows a preview table flagging shared channels, dropped out-of-range partners, and any pixel the mask file has switched off (a guaranteed permanent stall).
+Pair modes — **three**, and each reads exactly one input:
+
+| mode | input | pairs |
+|---|---|---|
+| **identity** | the two masks | `p2 = p1` over the pixels active on **both** nodes |
+| **grid** | the two masks | outer product of the two active sets (`QuadCorrelateWindow`'s 2×2 workflow at any size) |
+| **file** | a `pix1,pix2` CSV | whatever the CSV says |
+
+Only the widgets the chosen mode actually reads are on screen (`_on_mode_change`), and changing mode invalidates the derived list. There is **no affine mode in the GUI**: an affine mapping is a *fit result*, not something to retype, so `align_arc.py --emit-pairs LO HI` writes the pair CSV the fit implies and the window loads it in file mode. `pair_map.derive('affine', …)` still exists because `align_arc.write_pair_list` calls it — one owner of the inversion, so the fit and the correlator cannot disagree about `a`, `b`, `FIT_CENTER` or the tie-rounding rule.
+
+The mask fields are **read-only and pulled from the receiver's `NodePanel.mask_var`** (`get_masks_fn`), resolved to a local copy in `.claude/masks/`. The mask that matters is the one actually applied to the detector; a second editable copy here would only ever be a chance to disagree. A name with no local copy fails Derive loudly rather than deriving 320 pairs from an empty set.
+
+A non-bijective mapping (affine with `a ≠ 1`) means a node-2 pixel can serve two pairs; channels are therefore keyed by **distinct pixel**, never by pair. **Enable stays disabled until Derive succeeds**, and Derive shows a preview table flagging shared channels, dropped out-of-range partners, pixels active on **one node only** (`one_sided` — no pair can form, so that part of the detector is not being correlated), and any pixel the mask has switched off (`masked_off`, now principally a file-mode concern: a CSV can name a pixel the mask is not passing, which is a guaranteed permanent stall).
 
 Exclusion is a **relative** judgement — a channel is only costing coincidences while its partners are still delivering. When nothing at all has arrived for `idle_after_s` (3 s, deliberately far shorter than the 30 s `stall_grace_s`: "is anything arriving" is answered by the next poll, while "has this channel given up" must be slow enough not to condemn a bursty pixel) the graph sets `stream_idle`, clears every exclusion and reports `idle — no data arriving`: a normal end of acquisition must not read as `LOSING COINCIDENCES` forever. Genuine exclusions are kept in `exclusion_history` (cleared on `start()`) so going idle cannot erase the audit trail, and that history — not the live flags — is what the saved `.npz` records, since saving usually happens after the stream has stopped.
 

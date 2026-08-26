@@ -737,7 +737,12 @@ class ReceiverGUI:
         # correlate.py pending its deletion commit; nothing instantiates it.
         # Overlapping (node, pixel-loc) between the remaining windows is fine:
         # merge_hooks() fans the payload out to every subscriber.
-        self._multi_correlate_win = MultiCorrelateWindow(root)
+        # The mask fields are pulled from the NodePanels rather than retyped:
+        # the mask that matters is the one actually applied to the detector, and
+        # a second copy in the correlator is only ever a chance to disagree.
+        self._multi_correlate_win = MultiCorrelateWindow(
+            root, get_masks_fn=lambda: (self.node1.mask_var.get(),
+                                        self.node2.mask_var.get()))
         # Every correlator window, in one place. Each one needs its hooks
         # merged, its is_enabled consulted before calibration, and its
         # start_with_offset called on every path out of the cal -- four sites
@@ -747,6 +752,12 @@ class ReceiverGUI:
         self._monitor_abort: threading.Event | None = None
         self._build_ui()
         self._push_write_disk_state()   # correlators start out agreeing with the box
+        # Only now do the NodePanels exist, so this is the first moment the
+        # multi-pair window can read their mask fields.
+        for c in self._correlators:
+            refresh = getattr(c, '_refresh_masks', None)
+            if refresh:
+                refresh()
         self._poll_log()
         self._schedule_health_check()
         self.root.protocol('WM_DELETE_WINDOW', self._on_close)

@@ -46,8 +46,29 @@ def check(name, cond, detail=''):
     say(f'  ok  {name}')
 
 
-def make_window(root):
-    w = MultiCorrelateWindow(root)
+def write_mask(dirpath, name, active):
+    """A mask file lists the DISABLED locations; `active` is what stays on."""
+    path = os.path.join(dirpath, name)
+    keep = set(active)
+    with open(path, 'w') as f:
+        for i in range(320):
+            if i not in keep:
+                print(i, file=f)
+    return path
+
+
+def masked_window(root, active1, active2, tmp=None):
+    """A window whose identity/grid input is a pair of real mask files, wired
+    the way the receiver wires it: the window reads the masks, never a range."""
+    tmp = tmp or tempfile.mkdtemp(prefix='mw_')
+    m1 = write_mask(tmp, 'n1.txt', active1)
+    m2 = write_mask(tmp, 'n2.txt', active2)
+    w = make_window(root, masks=lambda: (m1, m2))
+    return w, tmp
+
+
+def make_window(root, masks=None):
+    w = MultiCorrelateWindow(root, get_masks_fn=masks)
     w.withdraw()
     # The window prewarms numba on a background thread and only then flips the
     # status line; the kernels compile lazily on first call anyway.
@@ -118,13 +139,11 @@ def test_end_to_end_comb():
     root = tk.Tk()
     root.withdraw()
     try:
-        w = make_window(root)
+        w, mtmp = masked_window(root, range(150, 158), range(150, 158))
         install_sync_tick(w)
 
         PERIOD_NS, OFFSET = 12.5, 33_333
         w.mode_var.set('identity')
-        w.lo_var.set('150')
-        w.hi_var.set('157')
         w.bw_var.set('250')
         w.tmax_var.set('50000')
         w.nshift_var.set('12')
@@ -301,26 +320,104 @@ def test_end_to_end_comb():
         root.destroy()
 
 
-def test_masked_pixel_is_flagged_at_derive():
+def test_mask_mismatch_is_flagged_at_derive():
+    """Identity now reads the masks, so a pixel one node has ON and the other
+    OFF cannot form a pair at all. It must be REPORTED, not quietly skipped:
+    silently dropping it reads as "the correlator ignored half my detector"
+    an hour into a run."""
     root = tk.Tk()
     root.withdraw()
     try:
-        w = make_window(root)
+        w, tmp = masked_window(root, range(150, 158),
+                               [p for p in range(150, 158) if p not in (152, 153)])
         w._show_preview = lambda *a, **k: None
-        tmp = tempfile.mkdtemp(prefix='mask_')
-        mask = os.path.join(tmp, 'mask.txt')
-        with open(mask, 'w') as f:
-            f.write('152\n153\n')        # masked-OFF locations
         w.mode_var.set('identity')
-        w.lo_var.set('150')
-        w.hi_var.set('157')
-        w.mask2_var.set(mask)
         w._derive()
-        check('a masked-off partner is flagged at Derive, not an hour in',
-              w._pairs is not None and w._pairs.masked_off == [(2, 152), (2, 153)],
+        pairs = [(p.p1, p.p2) for p in w._pairs.pairs]
+        check('the diagonal covers only pixels active on BOTH nodes',
+              pairs == [(150, 150), (151, 151), (154, 154), (155, 155),
+                        (156, 156), (157, 157)], str(pairs))
+        check('the one-node-only pixels are reported',
+              w._pairs.one_sided == [(1, 152), (1, 153)], str(w._pairs.one_sided))
+        check('summary says ONE NODE ONLY', 'ONE NODE ONLY' in w.pairs_var.get(),
+              w.pairs_var.get())
+        shutil.rmtree(tmp, ignore_errors=True)
+    finally:
+        root.destroy()
+
+
+def test_file_mode_still_flags_masked_off_pairs():
+    """masked_off is now file mode's job, and it is the one that matters: a pair
+    CSV from align_arc --emit-pairs can name a pixel the mask has switched off,
+    which is a guaranteed permanent stall."""
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        w, tmp = masked_window(root, range(150, 158),
+                               [p for p in range(150, 158) if p != 155])
+        w._show_preview = lambda *a, **k: None
+        csv = os.path.join(tmp, 'pairs.csv')
+        with open(csv, 'w') as f:
+            f.write('pix1,pix2\n')
+            for p in range(150, 158):
+                f.write(f'{p},{p}\n')
+        w.mode_var.set('file')
+        w.pairfile_var.set(csv)
+        w._derive()
+        check('a CSV pair on a masked-off pixel is flagged',
+              w._pairs is not None and w._pairs.masked_off == [(2, 155)],
               str(w._pairs.masked_off if w._pairs else None))
         check('summary says MASKED OFF', 'MASKED OFF' in w.pairs_var.get(),
               w.pairs_var.get())
+        shutil.rmtree(tmp, ignore_errors=True)
+    finally:
+        root.destroy()
+
+
+def test_only_the_relevant_input_widget_is_shown():
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        w, tmp = masked_window(root, range(150, 158), range(150, 158))
+        shown = lambda widget: bool(widget.winfo_manager())
+        w.mode_var.set('identity'); w._on_mode_change()
+        check('identity shows the masks and hides the pair CSV',
+              shown(w.mask_row) and not shown(w.file_row))
+        w.mode_var.set('grid'); w._on_mode_change()
+        check('grid shows the masks too', shown(w.mask_row) and not shown(w.file_row))
+        w.mode_var.set('file'); w._on_mode_change()
+        check('file shows the pair CSV and hides the masks',
+              shown(w.file_row) and not shown(w.mask_row))
+        check('changing mode invalidates the derived list',
+              w._pairs is None and str(w.enable_btn['state']) == 'disabled',
+              w.pairs_var.get())
+        shutil.rmtree(tmp, ignore_errors=True)
+    finally:
+        root.destroy()
+
+
+def test_mask_fields_come_from_the_receiver():
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        w, tmp = masked_window(root, range(150, 158), range(150, 156))
+        w._refresh_masks()
+        check('both mask paths are populated from the receiver callback',
+              w.mask1_var.get().endswith('n1.txt')
+              and w.mask2_var.get().endswith('n2.txt'),
+              f'{w.mask1_var.get()!r} / {w.mask2_var.get()!r}')
+        check('and the active count of each is reported',
+              '8 active' in w.maskinfo_var.get() and '6 active' in w.maskinfo_var.get(),
+              w.maskinfo_var.get())
+        # A name the receiver has but no local copy of must say so, not derive
+        # 320 pairs from a silently-empty mask.
+        w2 = make_window(root, masks=lambda: ('no_such_mask.txt', 'n2.txt'))
+        w2._show_preview = lambda *a, **k: None
+        w2.mode_var.set('identity')
+        w2._derive()
+        check('a mask with no local copy fails Derive loudly',
+              w2._pairs is None and 'no local copy' in w2.pairs_var.get(),
+              w2.pairs_var.get())
         shutil.rmtree(tmp, ignore_errors=True)
     finally:
         root.destroy()
@@ -330,47 +427,67 @@ def test_bad_derive_keeps_enable_disabled():
     root = tk.Tk()
     root.withdraw()
     try:
-        w = make_window(root)
+        # Masks with nothing in common: the diagonal would be empty.
+        w, tmp = masked_window(root, range(150, 158), range(200, 208))
         w._show_preview = lambda *a, **k: None
         w.mode_var.set('identity')
-        w.lo_var.set('200')
-        w.hi_var.set('100')             # empty range
         w._derive()
         check('a failed derive leaves Enable disabled',
               w._pairs is None and str(w.enable_btn['state']) == 'disabled',
               w.pairs_var.get())
+        check('and says why', 'no pixel in common' in w.pairs_var.get(),
+              w.pairs_var.get())
 
-        w.mode_var.set('grid')
-        w.list1_var.set(','.join(str(i) for i in range(40)))
-        w.list2_var.set(','.join(str(i) for i in range(40)))
-        w._derive()
+        # Grid over two 40-pixel masks is 1600 pairs: refuse, never truncate.
+        w2, tmp2 = masked_window(root, range(40), range(40))
+        w2._show_preview = lambda *a, **k: None
+        w2.mode_var.set('grid')
+        w2._derive()
         check('the 1600-pair grid is refused rather than truncated',
-              w._pairs is None and '1600' in w.pairs_var.get(), w.pairs_var.get())
+              w2._pairs is None and '1600' in w2.pairs_var.get(), w2.pairs_var.get())
+        shutil.rmtree(tmp, ignore_errors=True)
+        shutil.rmtree(tmp2, ignore_errors=True)
     finally:
         root.destroy()
 
 
-def test_affine_mode_shares_node2_channels():
+def test_file_mode_shares_node2_channels():
+    """The non-bijective mapping that used to come from the affine GUI fields now
+    arrives as a pair CSV from align_arc --emit-pairs. The property that matters
+    is unchanged: a node-2 pixel serving two pairs is ONE channel, accumulated
+    once, because channels are keyed by distinct pixel and never by pair."""
     root = tk.Tk()
     root.withdraw()
     try:
-        w = make_window(root)
+        w, tmp = masked_window(root, range(120, 200), range(120, 200))
         w._show_preview = lambda *a, **k: None
-        w.mode_var.set('affine')
-        w.lo_var.set('120')
-        w.hi_var.set('199')
-        w.a_var.set('1.05')
-        w.b_var.set('0.0')
+        # a = 1.05 over 80 px: dp2/dp1 = 1/a, so partners repeat.
+        csv = os.path.join(tmp, 'affine_pairs.csv')
+        sys.path.insert(0, os.path.join(ROOT, 'tools'))
+        import pair_map
+        pl_ref = pair_map.derive('affine', lo=120, hi=199, a=1.05, b=0.0)
+        with open(csv, 'w') as f:
+            print('pix1,pix2', file=f)
+            for p in pl_ref.pairs:
+                print(f'{p.p1},{p.p2}', file=f)
+        w.mode_var.set('file')
+        w.pairfile_var.set(csv)
         w._derive()
         w._enable()
         shared = w._pairs.shared_node2()
-        check(f'affine a=1.05 over 80 px shares {len(shared)} node-2 channel(s)',
+        check(f'an affine CSV over 80 px shares {len(shared)} node-2 channel(s)',
               len(shared) >= 1 and len(w._graph.ch2) < len(w._pairs.pairs),
               f'{len(w._graph.ch2)} channels for {len(w._pairs.pairs)} pairs')
         check('a shared channel is accumulated once, not once per pair',
-              all(len(w._graph.hooks_node2) == len(w._graph.ch2) for _ in (0,)))
+              len(w._graph.hooks_node2) == len(w._graph.ch2))
+        check('the CSV reproduces what the affine helper derived',
+              [(p.p1, p.p2) for p in w._pairs.pairs]
+              == [(p.p1, p.p2) for p in pl_ref.pairs])
+        shutil.rmtree(tmp, ignore_errors=True)
     finally:
         root.destroy()
+
+
 
 
 if __name__ == '__main__':

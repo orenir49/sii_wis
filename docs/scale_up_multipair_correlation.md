@@ -26,7 +26,7 @@ ab9a8c2  Add tools/pair_map.py: pure pair derivation, shared with align_arc
 d049f36  Stage 1a: fan pixel_hooks out to every subscriber
 ```
 
-### Test suite — 199 checks, all passing as of 2026-08-26
+### Test suite — 226 checks, all passing as of 2026-08-26
 
 Plain asserts, no pytest (it is not in `requirements.txt`). **Run all of these before trusting any
 change**; the whole suite takes ~2 minutes, most of it numba compiling.
@@ -35,8 +35,8 @@ change**; the whole suite takes ~2 minutes, most of it numba compiling.
 .venv\Scripts\python.exe tests\test_epoch_fix.py         # 12  (on main)
 .venv\Scripts\python.exe tests\test_hook_fanout.py       # 21  Stage 1a + 1b
 .venv\Scripts\python.exe tests\test_channel_graph.py     # 59  retention
-.venv\Scripts\python.exe tests\test_multi_window.py      # 33  end-to-end
-.venv\Scripts\python.exe tools\pair_map.py --selftest    # 29  pair derivation
+.venv\Scripts\python.exe tests\test_multi_window.py      # 45  end-to-end
+.venv\Scripts\python.exe tools\pair_map.py --selftest    # 44  pair derivation
 .venv\Scripts\python.exe tools\raw_dump.py --selftest    # 12  raw-capture format
 .venv\Scripts\python.exe correlate_kernel.py             # 25  kernel equivalence
 .venv\Scripts\python.exe synthetic_source.py             #  8  generator + comb
@@ -569,7 +569,7 @@ node-2 pixel), not a diagonal, so the pair-list input needs a grid mode or that 
 | mode | pairs | covers |
 |---|---|---|
 | **identity diagonal** | `p2 = p1` over a range | the common matched-pixel case; bijective, 1 partner per channel |
-| **affine diagonal** | `p2 = round(((p1-160) - b)/a + 160)`, inverting `align_arc.py:253-257` (unchanged) | matched *wavelength*; `a != 1` so **not** bijective — some node-2 pixels serve two pairs |
+| ~~**affine diagonal**~~ | **REMOVED from the GUI 2026-08-26** — an affine mapping is a fit result, not a pair of numbers to retype. `align_arc.py --emit-pairs LO HI` writes the CSV the fit implies and the window loads it in **file** mode. `pair_map.derive('affine', ...)` stays, because `align_arc.write_pair_list` is now its only caller — one owner of the inversion |
 | **full grid** | outer product of two pixel lists | **the old Quad**, at any size |
 | **file** | explicit `pix1,pix2` CSV | hand-tuned overrides |
 
@@ -619,6 +619,37 @@ under `.claude/` — the file lists
 *masked-off* locations, so active = `set(range(320)) - file`; `receiver.py:120-122`) and flag any derived pixel that is
 masked off — that is a guaranteed permanent stall, and catching it at Derive time is far better than
 discovering it an hour in.
+
+### Pair-list inputs — revised 2026-08-26
+
+Three modes, each reading exactly one input, with only that input's widgets on screen:
+
+| mode | input | pairs |
+|---|---|---|
+| **identity** | the two masks | `p2 = p1` over pixels active on **both** nodes |
+| **grid** | the two masks | outer product of the two active sets |
+| **file** | a `pix1,pix2` CSV | whatever the CSV says |
+
+Why this shape:
+
+- **No `lo`/`hi`, no `a`/`b`, no grid lists.** Every one of those was a number retyped from
+  somewhere else, and the pair list is exactly where a retyped number silently correlates the wrong
+  pixels all night. The mask already says which pixels are on; the fit already knows `a` and `b`.
+- **The masks are read-only and come from the receiver** (`get_masks_fn` -> `NodePanel.mask_var`,
+  resolved against `.claude/masks/`). The mask that matters is the one applied to the detector. A
+  name with no local copy fails Derive loudly rather than deriving 320 pairs from an empty set.
+- **Identity uses the intersection**, and `PairList.one_sided` reports any pixel active on one node
+  only. That case cannot form a pair, and dropping it silently would read as "the correlator ignored
+  half my detector" an hour in. With mask-driven identity `masked_off` is necessarily empty, so it is
+  now principally a **file-mode** signal: a CSV can name a pixel the mask is not passing, which is a
+  guaranteed permanent stall.
+- **Grid over two 40-pixel masks is 1600 pairs**, which `max_pairs` refuses rather than truncates.
+  Grid is for small masks (its original 2x2 Quad workflow); the guard is what keeps that honest.
+
+The affine workflow is now: `align_arc.py --emit-pairs` -> CSV -> file mode. That also means the
+**one hardware gap left for affine is a light source with spectral structure** — the pulsed laser
+illuminates a band uniformly, so any pairing produces a comb and it cannot distinguish a correct
+mapping from a wrong one. That needs the arc lamp.
 
 ### Channels and retention
 

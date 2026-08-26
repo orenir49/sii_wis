@@ -60,6 +60,11 @@ class PairList:
     mode: str = ''
     dropped: list = field(default_factory=list)      # (p1, p2_raw, reason)
     masked_off: list = field(default_factory=list)   # (node, pixel)
+    # Pixels a mask has ON for one node but OFF for the other, when the masks
+    # are what drove the derivation. Those pixels cannot form a pair, and
+    # dropping them silently would hide a mismatched mask pair -- which reads
+    # as "the correlator ignored half my detector" an hour into a run.
+    one_sided: list = field(default_factory=list)    # (node, pixel)
     params: dict = field(default_factory=dict)
 
     def __len__(self) -> int:
@@ -110,12 +115,30 @@ class PairList:
             parts.append(f'{len(self.dropped)} dropped')
         if self.masked_off:
             parts.append(f'{len(self.masked_off)} MASKED OFF')
+        if self.one_sided:
+            parts.append(f'{len(self.one_sided)} px active on ONE NODE ONLY')
         return ', '.join(parts)
 
 
 # ---------------------------------------------------------------------------
 # Derivation
 # ---------------------------------------------------------------------------
+
+def _require_masks(mask1, mask2, mode: str):
+    """Active-pixel sets for a mask-driven derivation, or a clear refusal.
+
+    Refusing beats defaulting to the whole detector: a missing mask would
+    silently derive 320 pairs (or 102,400 in grid mode) from nothing.
+    """
+    if not mask1 or not mask2:
+        missing = ' and '.join(n for n, m in (('node 1', mask1), ('node 2', mask2))
+                               if not m)
+        raise ValueError(
+            f'{mode} mode needs the active-pixel set for both nodes, but the '
+            f'{missing} mask is missing or empty. Load both mask files (or give '
+            f'an explicit range instead).')
+    return set(mask1), set(mask2)
+
 
 def affine_partner(p1, a: float, b: float):
     """Invert align_arc.py's fit: it reports
@@ -171,12 +194,29 @@ def derive(mode: str, *, lo=None, hi=None, a=1.0, b=0.0,
     dropped: list = []
     params: dict = {}
 
+    one_sided: list = []
+
     if mode == 'identity':
-        lo, hi = int(lo), int(hi)
-        if lo > hi:
-            raise ValueError(f'empty range: lo={lo} > hi={hi}')
-        params = {'lo': lo, 'hi': hi}
-        raw = [(p, p) for p in range(lo, hi + 1)]
+        if lo is None and hi is None:
+            # Driven by the masks: the diagonal over pixels active on BOTH
+            # nodes. Anything active on only one cannot pair, and is reported
+            # rather than dropped quietly.
+            a1, a2 = _require_masks(mask1, mask2, 'identity')
+            both = sorted(a1 & a2)
+            if not both:
+                raise ValueError('the two masks have no pixel in common — '
+                                 'the diagonal would be empty')
+            one_sided = ([(1, p) for p in sorted(a1 - a2)]
+                         + [(2, p) for p in sorted(a2 - a1)])
+            params = {'from_masks': True, 'lo': both[0], 'hi': both[-1],
+                      'n_active': len(both)}
+            raw = [(p, p) for p in both]
+        else:
+            lo, hi = int(lo), int(hi)
+            if lo > hi:
+                raise ValueError(f'empty range: lo={lo} > hi={hi}')
+            params = {'lo': lo, 'hi': hi}
+            raw = [(p, p) for p in range(lo, hi + 1)]
 
     elif mode == 'affine':
         lo, hi = int(lo), int(hi)
@@ -188,9 +228,17 @@ def derive(mode: str, *, lo=None, hi=None, a=1.0, b=0.0,
         raw = [(int(x), int(y)) for x, y in zip(p1s, p2s)]
 
     elif mode == 'grid':
-        list1 = [int(x) for x in (list1 or [])]
-        list2 = [int(x) for x in (list2 or [])]
-        params = {'list1': list1, 'list2': list2}
+        if list1 is None and list2 is None:
+            # Driven by the masks: every active node-1 pixel against every
+            # active node-2 pixel. Deliberately unguarded here -- max_pairs
+            # below is what refuses an accidental 1600-pair request.
+            a1, a2 = _require_masks(mask1, mask2, 'grid')
+            list1, list2 = sorted(a1), sorted(a2)
+            params = {'from_masks': True, 'n1': len(list1), 'n2': len(list2)}
+        else:
+            list1 = [int(x) for x in (list1 or [])]
+            list2 = [int(x) for x in (list2 or [])]
+            params = {'list1': list1, 'list2': list2}
         raw = [(x, y) for x in list1 for y in list2]
 
     elif mode == 'file':
@@ -230,7 +278,7 @@ def derive(mode: str, *, lo=None, hi=None, a=1.0, b=0.0,
         masked_off += [(2, p) for p in sorted({q.p2 for q in pairs}) if p not in mask2]
 
     return PairList(pairs=pairs, mode=mode, dropped=dropped,
-                    masked_off=masked_off, params=params)
+                    masked_off=masked_off, one_sided=one_sided, params=params)
 
 
 def _read_pair_csv(path) -> list:
@@ -410,6 +458,55 @@ def _selftest() -> int:
     ck('mask file lists masked-OFF pixels (active = all - file)',
        len(act) == 318 and 150 not in act and 151 not in act and 152 in act,
        f'{len(act)} active')
+
+    # -- mask-driven identity and grid (what the GUI now uses) -------------
+    m1 = {5, 6, 7, 8, 9}
+    m2 = {6, 7, 8, 9, 10}
+    pl = derive('identity', mask1=m1, mask2=m2)
+    ck('mask-driven identity pairs the intersection only',
+       [(p.p1, p.p2) for p in pl.pairs] == [(6, 6), (7, 7), (8, 8), (9, 9)],
+       str([(p.p1, p.p2) for p in pl.pairs]))
+    ck('and reports the pixels active on one node only',
+       sorted(pl.one_sided) == [(1, 5), (2, 10)], str(pl.one_sided))
+    ck('one-sided pixels are named in the summary',
+       'ONE NODE ONLY' in pl.summary(), pl.summary())
+    ck('mask-driven identity records that it came from the masks',
+       pl.params.get('from_masks') is True and pl.params['n_active'] == 4,
+       str(pl.params))
+    ck('an explicit range still wins over the masks',
+       [(p.p1, p.p2) for p in derive('identity', lo=6, hi=7,
+                                     mask1=m1, mask2=m2).pairs] == [(6, 6), (7, 7)])
+    ck('identical masks leave nothing one-sided',
+       derive('identity', mask1=m1, mask2=set(m1)).one_sided == [])
+
+    pl = derive('grid', mask1={1, 2}, mask2={3, 4, 5})
+    ck('mask-driven grid is the full outer product',
+       len(pl) == 6 and pl.params['n1'] == 2 and pl.params['n2'] == 3,
+       pl.summary())
+
+    for kw, why in (({'mask1': m1, 'mask2': None}, 'node 2 missing'),
+                    ({'mask1': None, 'mask2': m2}, 'node 1 missing'),
+                    ({'mask1': set(), 'mask2': m2}, 'node 1 empty')):
+        for mode in ('identity', 'grid'):
+            try:
+                derive(mode, **kw)
+                ck(f'{mode} without both masks raises ({why})', False, 'no exception')
+            except ValueError as exc:
+                ck(f'{mode} without both masks raises ({why})', 'mask' in str(exc).lower(),
+                   str(exc))
+
+    try:
+        derive('identity', mask1={1, 2}, mask2={3, 4})
+        ck('disjoint masks raise rather than deriving nothing', False, 'no exception')
+    except ValueError as exc:
+        ck('disjoint masks raise rather than deriving nothing',
+           'no pixel in common' in str(exc), str(exc))
+
+    try:
+        derive('grid', mask1=set(range(40)), mask2=set(range(40)), max_pairs=400)
+        ck('mask-driven grid past max_pairs refuses', False, 'no exception')
+    except ValueError as exc:
+        ck('mask-driven grid past max_pairs refuses', '1600' in str(exc), str(exc))
 
     try:
         derive('identity', lo=10, hi=5)

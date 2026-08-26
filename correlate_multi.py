@@ -111,8 +111,12 @@ def _peak_rss_bytes():
 
 class MultiCorrelateWindow(tk.Toplevel):
 
-    def __init__(self, parent: tk.Tk) -> None:
+    def __init__(self, parent: tk.Tk, get_masks_fn=None) -> None:
+        """get_masks_fn: () -> (node1_mask, node2_mask) as the receiver has
+        them, so the correlator cannot be pointed at a different mask than the
+        one actually applied to the hardware. Optional, for standalone use."""
         super().__init__(parent)
+        self._get_masks_fn = get_masks_fn
         self.title('Live g² Correlator — multi-pair')
         self.resizable(True, True)
         self.geometry('+90+90')
@@ -159,55 +163,50 @@ class MultiCorrelateWindow(tk.Toplevel):
         self.mode_var = tk.StringVar(value='identity')
         mf = ttk.Frame(pf)
         mf.grid(row=0, column=1, columnspan=5, sticky='w')
+        # No affine radio. An affine mapping is a *fit result*, not something to
+        # retype: align_arc.py --emit-pairs writes the pair CSV the fit implies,
+        # and this window loads it in file mode. Two places owning a and b is how
+        # the fit and the correlator end up disagreeing.
         for text, val in (('identity (p2=p1)', 'identity'),
-                          ('affine', 'affine'),
                           ('grid', 'grid'),
-                          ('file', 'file')):
-            ttk.Radiobutton(mf, text=text, variable=self.mode_var,
-                            value=val).pack(side='left', padx=(0, 10))
+                          ('file (pair CSV)', 'file')):
+            ttk.Radiobutton(mf, text=text, variable=self.mode_var, value=val,
+                            command=self._on_mode_change).pack(side='left', padx=(0, 10))
 
-        ttk.Label(pf, text='Node-1 range:').grid(row=1, column=0, padx=6, pady=4, sticky='w')
-        self.lo_var = tk.StringVar(value='140')
-        self.hi_var = tk.StringVar(value='179')
-        ttk.Entry(pf, textvariable=self.lo_var, width=6).grid(row=1, column=1, sticky='w')
-        ttk.Label(pf, text='to').grid(row=1, column=2, sticky='w')
-        ttk.Entry(pf, textvariable=self.hi_var, width=6).grid(row=1, column=3, sticky='w')
-
-        ttk.Label(pf, text='a:').grid(row=1, column=4, padx=(16, 2), sticky='e')
-        self.a_var = tk.StringVar(value='1.0')
-        ttk.Entry(pf, textvariable=self.a_var, width=10).grid(row=1, column=5, sticky='w')
-        ttk.Label(pf, text='b:').grid(row=1, column=6, padx=(10, 2), sticky='e')
-        self.b_var = tk.StringVar(value='0.0')
-        ttk.Entry(pf, textvariable=self.b_var, width=10).grid(row=1, column=7, sticky='w')
-
-        ttk.Label(pf, text='Grid lists:').grid(row=2, column=0, padx=6, pady=4, sticky='w')
-        self.list1_var = tk.StringVar(value='147,168')
-        self.list2_var = tk.StringVar(value='147,168')
-        ttk.Entry(pf, textvariable=self.list1_var, width=18).grid(
-            row=2, column=1, columnspan=3, sticky='w')
-        ttk.Entry(pf, textvariable=self.list2_var, width=18).grid(
-            row=2, column=5, columnspan=3, sticky='w')
-
-        ttk.Label(pf, text='Pair CSV:').grid(row=3, column=0, padx=6, pady=4, sticky='w')
+        # -- file mode input: the pair CSV -------------------------------
+        self.file_row = ttk.Frame(pf)
+        ttk.Label(self.file_row, text='Pair CSV:').pack(side='left', padx=(0, 6))
         self.pairfile_var = tk.StringVar(value='')
-        ttk.Entry(pf, textvariable=self.pairfile_var, width=44).grid(
-            row=3, column=1, columnspan=6, sticky='w')
-        ttk.Button(pf, text='…', width=3,
-                   command=lambda: self._pick_file(self.pairfile_var)).grid(row=3, column=7)
+        ttk.Entry(self.file_row, textvariable=self.pairfile_var, width=52).pack(side='left')
+        ttk.Button(self.file_row, text='…', width=3,
+                   command=lambda: self._pick_file(self.pairfile_var)).pack(
+                       side='left', padx=(4, 0))
 
-        ttk.Label(pf, text='Masks (n1 / n2):').grid(row=4, column=0, padx=6, pady=4, sticky='w')
+        # -- identity / grid input: the masks, from the receiver ---------
+        # Read-only on purpose. The mask that matters is the one actually
+        # applied to the detector, which the receiver owns; letting this window
+        # hold a second opinion is exactly the desync worth designing out.
+        self.mask_row = ttk.Frame(pf)
+        ttk.Label(self.mask_row, text='Masks (from receiver):').pack(
+            side='left', padx=(0, 6))
         self.mask1_var = tk.StringVar(value='')
         self.mask2_var = tk.StringVar(value='')
-        ttk.Entry(pf, textvariable=self.mask1_var, width=20).grid(
-            row=4, column=1, columnspan=3, sticky='w')
-        ttk.Entry(pf, textvariable=self.mask2_var, width=20).grid(
-            row=4, column=5, columnspan=3, sticky='w')
+        for v in (self.mask1_var, self.mask2_var):
+            ttk.Entry(self.mask_row, textvariable=v, width=22,
+                      state='readonly').pack(side='left', padx=(0, 6))
+        ttk.Button(self.mask_row, text='↻', width=3,
+                   command=self._refresh_masks).pack(side='left')
+        self.maskinfo_var = tk.StringVar(value='')
+        ttk.Label(pf, textvariable=self.maskinfo_var, anchor='w',
+                  foreground='#555555').grid(row=2, column=0, columnspan=8,
+                                             sticky='w', padx=6)
 
         ttk.Button(pf, text='Derive…', width=10, command=self._derive).grid(
-            row=5, column=1, pady=(2, 6), sticky='w')
+            row=3, column=0, padx=6, pady=(2, 6), sticky='w')
         self.pairs_var = tk.StringVar(value='No pair list derived yet.')
         ttk.Label(pf, textvariable=self.pairs_var, anchor='w').grid(
-            row=5, column=2, columnspan=6, sticky='w', padx=6)
+            row=3, column=1, columnspan=7, sticky='w', padx=6)
+        self._on_mode_change()
 
         # ── parameters ────────────────────────────────────────────────
         cfg = ttk.LabelFrame(self, text='Parameters')
@@ -329,6 +328,71 @@ class MultiCorrelateWindow(tk.Toplevel):
     # Pair derivation
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Pair-list inputs
+    # ------------------------------------------------------------------
+
+    def _on_mode_change(self, *_) -> None:
+        """Show only the input the chosen mode actually reads.
+
+        file mode takes a pair CSV; identity and grid take the two masks.
+        Having both on screen invited setting one and expecting the other.
+        """
+        if self.mode_var.get() == 'file':
+            self.mask_row.grid_remove()
+            self.file_row.grid(row=1, column=0, columnspan=8, padx=6, pady=4,
+                               sticky='w')
+            self.maskinfo_var.set('')
+        else:
+            self.file_row.grid_remove()
+            self.mask_row.grid(row=1, column=0, columnspan=8, padx=6, pady=4,
+                               sticky='w')
+            self._refresh_masks()
+        # Any change of input invalidates a pair list derived from the old one.
+        self._pairs = None
+        if hasattr(self, 'enable_btn'):
+            self.enable_btn.configure(state='disabled')
+            self.pairs_var.set('Mode changed - Derive again.')
+
+    def _resolve_mask(self, name: str):
+        """Receiver mask name -> local path, or (None, reason).
+
+        The receiver holds the file NAME as the sender sees it; the readable
+        copy lives in .claude/masks/. A full path is accepted too, so a mask
+        kept elsewhere still works.
+        """
+        name = (name or '').strip()
+        if not name:
+            return None, 'not set in the receiver'
+        for cand in (name, os.path.join('.claude', 'masks', name)):
+            if os.path.isfile(cand):
+                return cand, None
+        return None, f'no local copy of {name!r} (looked in .claude/masks/)'
+
+    def _refresh_masks(self) -> None:
+        """Pull the receiver's mask choice and report what it resolves to."""
+        if self._get_masks_fn is None:
+            self.maskinfo_var.set('No receiver attached - set the mask vars directly.')
+            return
+        try:
+            n1, n2 = self._get_masks_fn()
+        except Exception as exc:
+            self.maskinfo_var.set(f'Could not read the receiver mask fields: {exc}')
+            return
+        self.mask1_var.set(n1 or '')
+        self.mask2_var.set(n2 or '')
+        bits = []
+        for node, name in ((1, n1), (2, n2)):
+            path, why = self._resolve_mask(name)
+            if path is None:
+                bits.append(f'node {node}: {why}')
+                continue
+            try:
+                bits.append(f'node {node}: {len(pair_map.load_mask_active(path))} active')
+            except Exception as exc:
+                bits.append(f'node {node}: unreadable ({exc})')
+        self.maskinfo_var.set('   |   '.join(bits))
+
     def _derive(self) -> None:
         """Derive the pair list and show it for inspection.
 
@@ -339,16 +403,24 @@ class MultiCorrelateWindow(tk.Toplevel):
         """
         mode = self.mode_var.get()
         try:
-            m1 = pair_map.load_mask_active(self.mask1_var.get().strip()) \
-                if self.mask1_var.get().strip() else None
-            m2 = pair_map.load_mask_active(self.mask2_var.get().strip()) \
-                if self.mask2_var.get().strip() else None
-            split = lambda s: [int(x) for x in s.replace(' ', '').split(',') if x]
+            if mode != 'file':
+                self._refresh_masks()
+            m1 = m2 = None
+            for node, var in ((1, self.mask1_var), (2, self.mask2_var)):
+                path, why = self._resolve_mask(var.get())
+                if path is None:
+                    if mode != 'file':
+                        raise ValueError(f'node-{node} mask {why}')
+                    continue
+                active = pair_map.load_mask_active(path)
+                if node == 1:
+                    m1 = active
+                else:
+                    m2 = active
+            # No lo/hi, no a/b, no grid lists: identity and grid read the masks,
+            # file reads the CSV. Nothing here is retyped by hand.
             pl = pair_map.derive(
                 mode,
-                lo=self.lo_var.get(), hi=self.hi_var.get(),
-                a=float(self.a_var.get()), b=float(self.b_var.get()),
-                list1=split(self.list1_var.get()), list2=split(self.list2_var.get()),
                 path=self.pairfile_var.get().strip() or None,
                 mask1=m1, mask2=m2, max_pairs=MAX_PAIRS)
         except Exception as exc:
@@ -384,6 +456,14 @@ class MultiCorrelateWindow(tk.Toplevel):
             ttk.Label(top, foreground='#cc3333', anchor='w', wraplength=500,
                       text=('MASKED OFF — these pairs will never accumulate and will '
                             'stall: ' + ', '.join(f'n{n}px{p}' for n, p in pl.masked_off))
+                      ).pack(fill='x', padx=8)
+        if pl.one_sided:
+            ttk.Label(top, foreground='#aa6600', anchor='w', wraplength=500,
+                      text=('ACTIVE ON ONE NODE ONLY — no pair could be formed for '
+                            'these, so that part of the detector is not being '
+                            'correlated: '
+                            + ', '.join(f'n{n}px{p}' for n, p in pl.one_sided[:20])
+                            + (' …' if len(pl.one_sided) > 20 else ''))
                       ).pack(fill='x', padx=8)
         for p1, p2, reason in pl.dropped[:10]:
             ttk.Label(top, foreground='#aa6600', anchor='w',
