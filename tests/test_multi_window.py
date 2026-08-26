@@ -128,7 +128,6 @@ def test_end_to_end_comb():
         w.bw_var.set('250')
         w.tmax_var.set('50000')
         w.nshift_var.set('12')
-        w.mark_var.set('0')
         w.suffix_var.set('selftest_multi')
 
         # Derive pops a preview Toplevel; suppress it so the test stays headless.
@@ -208,16 +207,15 @@ def test_end_to_end_comb():
         check('redraw of a selected pair works and reports its counts',
               '153' in w.ax.get_title() and w.pairinfo_var.get() != '',
               f'{w.ax.get_title()!r} / {w.pairinfo_var.get()!r}')
-        snr = w._snr_at_mark(w._hist[(153, 153)], centers, 0.0, 250.0)
-        # Positive, but only a few sigma -- and that is structural, not a weak
-        # signal. _mark_tau_bin takes mean and sigma over the WHOLE histogram,
-        # which assumes a flat background with one peak; a comb has ~9 equal
-        # teeth inside +-tmax, so they inflate sigma and cap the SNR at roughly
-        # sqrt(n_teeth) no matter how many counts accumulate. On the bench the
-        # comb is read by eye from tooth spacing and position, not from this
-        # box; the box is for the thermal bunching measurement it was built for.
-        check(f'marked-tau SNR at tau=0 is positive on a comb (SNR {snr:.1f}; '
-              'capped by the other teeth inflating sigma)', snr > 3, str(snr))
+        snr = w._peak_snr(w._hist[(153, 153)])
+        # Positive, but the magnitude is a SHAPE statistic, not a significance:
+        # mean and sigma are taken over the whole histogram, which assumes a
+        # flat background with one peak, and a comb's equal teeth inflate sigma.
+        # Peak and sigma both scale with counts, so integrating longer does not
+        # move it. Read a comb by tooth spacing and phase, not from this number.
+        check(f'peak SNR is positive on a comb (SNR {snr:.1f})', snr > 3, str(snr))
+        check('the pair-info line carries the peak SNR',
+              'peak SNR' in w.pairinfo_var.get(), w.pairinfo_var.get())
         w._step_pair(+1)
         check('the pair selector steps', w.pair_var.get() == '154 × 154',
               w.pair_var.get())

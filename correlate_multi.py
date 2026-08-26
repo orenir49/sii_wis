@@ -44,8 +44,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tools'))
 
 import pair_map
-from correlate import (MARK_TAU_NS_DEFAULT, _mark_tau_bin, _parse_mark_tau_ps,
-                       _prewarm, pick_unit)
+from correlate import _mark_peak_bin, _prewarm, pick_unit
 from correlate_engine import PS_PER_S, ChannelGraph
 from correlate_kernel import PairPool, bin_edges, prewarm, suggest_n_shift, tau_coverage_ps
 from sii_calculator import SIICalculatorWindow
@@ -178,14 +177,9 @@ class MultiCorrelateWindow(tk.Toplevel):
         self.interval_var = tk.StringVar(value='1.5')
         ttk.Entry(cfg, textvariable=self.interval_var, width=8).grid(row=1, column=1, sticky='w')
 
-        ttk.Label(cfg, text='Mark τ (ns):').grid(row=1, column=2, padx=(16, 6), sticky='w')
-        self.mark_var = tk.StringVar(value=MARK_TAU_NS_DEFAULT)
-        ttk.Entry(cfg, textvariable=self.mark_var, width=8).grid(row=1, column=3, sticky='w')
-        self.mark_var.trace_add('write', self._on_display_change)
-
-        ttk.Label(cfg, text='RAM cap (MB):').grid(row=1, column=4, padx=(16, 6), sticky='w')
+        ttk.Label(cfg, text='RAM cap (MB):').grid(row=1, column=2, padx=(16, 6), sticky='w')
         self.ramcap_var = tk.StringVar(value=str(DEFAULT_RAM_CAP_MB))
-        ttk.Entry(cfg, textvariable=self.ramcap_var, width=8).grid(row=1, column=5, sticky='w')
+        ttk.Entry(cfg, textvariable=self.ramcap_var, width=8).grid(row=1, column=3, sticky='w')
 
         ttk.Label(cfg, text='Suffix:').grid(row=2, column=0, padx=6, pady=4, sticky='w')
         self.suffix_var = tk.StringVar(value='g2multi')
@@ -240,17 +234,14 @@ class MultiCorrelateWindow(tk.Toplevel):
         self.pairinfo_var = tk.StringVar(value='')
         ttk.Label(sel, textvariable=self.pairinfo_var).pack(side='left', padx=12)
 
-        # Two axes: the selected pair's histogram, and an at-a-glance SNR line
-        # over all pairs so you can see WHICH pair to select without clicking
-        # through 80. A 2-D matrix is the wrong shape for a diagonal.
-        self.fig = Figure(figsize=(9, 5))
-        self.ax = self.fig.add_subplot(211)
-        self.ax_snr = self.fig.add_subplot(212)
+        # One axes: the selected pair's histogram, peak bin marked. The pair
+        # selector plus the peak-SNR readout on the info line is how you find
+        # the pair worth looking at.
+        self.fig = Figure(figsize=(9, 4))
+        self.ax = self.fig.add_subplot(111)
         self.ax.set_xlabel('τ (ps)')
         self.ax.set_ylabel('Counts')
         self.ax.set_title('g² — waiting for data')
-        self.ax_snr.set_xlabel('pair index')
-        self.ax_snr.set_ylabel('marked-τ SNR')
         # tight_layout ONCE, at build. Calling it per redraw (as the old windows
         # did, once per pair per batch) is a large fraction of the Tk main
         # thread's budget at 80 pairs.
@@ -663,29 +654,26 @@ class MultiCorrelateWindow(tk.Toplevel):
         if self._hist:
             self._redraw()
 
-    def _snr_at_mark(self, hist: np.ndarray, centers: np.ndarray,
-                     mark_ps, bw: float):
-        """The same statistic _mark_tau_bin annotates, so the sparkline and the
-        box can never disagree: mean and sigma over the whole histogram."""
-        if mark_ps is None or hist is None or centers.size == 0:
-            return np.nan
-        i = int(np.argmin(np.abs(centers - mark_ps)))
-        if abs(centers[i] - mark_ps) > bw:
+    @staticmethod
+    def _peak_snr(hist):
+        """The same statistic _mark_peak_bin annotates, so the pair-info line
+        and the box on the plot can never disagree: tallest bin against mean
+        and sigma over the whole histogram."""
+        if hist is None or hist.size == 0:
             return np.nan
         c = hist.astype(float)
         s = c.std()
-        return (c[i] - c.mean()) / s if s > 0 else np.nan
+        return (c.max() - c.mean()) / s if s > 0 else np.nan
 
     def _redraw(self) -> None:
         if self._bins is None:
             return
         centers = (self._bins[:-1] + self._bins[1:]) / 2
         try:
-            bw, tmax, _ = self._get_params()
+            _, tmax, _ = self._get_params()
         except Exception:
-            bw, tmax = 200.0, float(centers[-1])
+            tmax = float(centers[-1])
         unit, scale = pick_unit(tmax)
-        mark_ps = _parse_mark_tau_ps(self.mark_var)
 
         key = self._selected_key()
         hist = self._hist.get(key)
@@ -699,31 +687,16 @@ class MultiCorrelateWindow(tk.Toplevel):
             n1, n2 = self._counts.get(key, (0, 0))
             self.ax.set_title(f'g² — pixel {key[0]} × {key[1]}   '
                               f'({n1:,} × {n2:,} events)')
-            _mark_tau_bin(self.ax, centers, hist, mark_ps, scale, bw)
+            _mark_peak_bin(self.ax, centers, hist, scale)
         self.ax.set_xlabel(f'τ ({unit})')
         self.ax.set_ylabel('Counts')
-
-        # SNR-vs-pair: which pair is worth selecting, without clicking 80 times.
-        keys = self._pair_keys()
-        snr = [self._snr_at_mark(self._hist.get(k), centers, mark_ps, bw) for k in keys]
-        self.ax_snr.clear()
-        if any(not np.isnan(s) for s in snr):
-            self.ax_snr.plot(range(len(keys)), snr, marker='.', linewidth=1,
-                             color='darkorange')
-            if key in keys:
-                i = keys.index(key)
-                self.ax_snr.plot([i], [snr[i]], marker='o', color='red',
-                                 markersize=8, fillstyle='none')
-            self.ax_snr.axhline(0, color='k', linewidth=0.5)
-        self.ax_snr.set_xlabel('pair index')
-        self.ax_snr.set_ylabel(f'SNR at τ = {self.mark_var.get() or "?"} ns')
         self.canvas.draw_idle()
 
         if key is not None:
             n1, n2 = self._counts.get(key, (0, 0))
+            snr = self._peak_snr(hist)
             self.pairinfo_var.set(f'{n1:,} start × {n2:,} stop events'
-                                  + (f',  SNR {snr[keys.index(key)]:.2f}'
-                                     if key in keys and not np.isnan(snr[keys.index(key)]) else ''))
+                                  + ('' if np.isnan(snr) else f',  peak SNR {snr:.2f}'))
 
     # ------------------------------------------------------------------
     # Output
@@ -746,13 +719,16 @@ class MultiCorrelateWindow(tk.Toplevel):
             'mode': self._pairs.mode, 'params': self._pairs.params,
             'bin_width_ps': self.bw_var.get(), 'tmax_ps': self.tmax_var.get(),
             'n_shift': self.nshift_var.get(), 'offset_ps': self._offset,
-            'mark_tau_ns': self.mark_var.get(),
             'write_to_disk': self._write_to_disk,
             'synthetic': self._synth is not None,
             'masked_off': self._pairs.masked_off,
-            'excluded': [(c.node, c.pixel, c.exclude_reason)
-                         for c in (self._graph.channels if self._graph else [])
-                         if c.excluded],
+            # exclusion_history, not the live flags: saving usually happens
+            # after the stream has stopped, when every channel reads quiet and
+            # the live flags are (correctly) all clear. The history is what
+            # actually cost coincidences during the run.
+            'excluded': [(n, p, r) for (n, p), r
+                         in (self._graph.exclusion_history.items()
+                             if self._graph else {}.items())],
         }
         suffix = self.suffix_var.get().strip() or 'g2multi'
         path = os.path.join('.', 'spad_data', f'{suffix}.npz')

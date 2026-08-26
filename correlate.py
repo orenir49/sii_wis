@@ -70,7 +70,6 @@ def _prewarm():
 # Marked-bin annotation
 # ---------------------------------------------------------------------------
 
-MARK_TAU_NS_DEFAULT = '14'   # expected bunching-peak delay for this setup
 
 
 def pick_unit(tmax_ps: float) -> tuple[str, float]:
@@ -90,41 +89,25 @@ def pick_unit(tmax_ps: float) -> tuple[str, float]:
         return 'ms', 1_000_000_000.0
 
 
-def _parse_mark_tau_ps(var: tk.StringVar) -> float | None:
-    """Marked-bin τ in ps from a 'Mark τ (ns)' entry. None if blank or mid-edit."""
-    text = var.get().strip()
-    if not text:
-        return None
-    try:
-        return float(text) * 1_000.0
-    except ValueError:
-        return None
+def _mark_peak_bin(ax, centers: np.ndarray, hist: np.ndarray,
+                   scale: float, fontsize: int = 8) -> bool:
+    """Mark the tallest bin and annotate its height, excess over mean and SNR.
 
-
-def _mark_tau_bin(ax, centers: np.ndarray, hist: np.ndarray,
-                  mark_tau_ps: float | None, scale: float,
-                  bin_width_ps: float, fontsize: int = 8) -> bool:
-    """Mark the bin holding `mark_tau_ps` and annotate its height, excess and SNR.
-
-    Unlike tools/plot_g2_result.py, which annotates wherever the maximum happens
-    to land, this marks a τ the user names — so it reports the bin we expect the
-    bunching peak in even while it is still buried in noise, which is the whole
-    point of watching it live. Mean and σ are taken over the entire histogram,
-    marked bin included, so the numbers agree with the offline tool exactly
-    rather than nearly.
+    Marks wherever the maximum actually lands, the same convention as
+    tools/plot_g2_result.py, so a live window and a replotted saved file agree.
+    Mean and sigma are taken over the entire histogram, peak bin included, so
+    the numbers match the offline tool exactly rather than nearly.
 
     Returns True if a marker was drawn.
     """
-    if mark_tau_ps is None or centers.size == 0:
+    if centers.size == 0:
         return False
-    i = int(np.argmin(np.abs(centers - mark_tau_ps)))
-    if abs(centers[i] - mark_tau_ps) > bin_width_ps:
-        return False        # the requested τ lies outside ±tmax
     counts = hist.astype(float)
     mean   = counts.mean()
     std    = counts.std()
     if mean <= 0:
-        return False        # nothing accumulated yet — no baseline to compare to
+        return False        # nothing accumulated yet -- no baseline to compare to
+    i      = int(np.argmax(counts))
     height = counts[i]
     excess = (height - mean) / mean * 100
     snr    = f'{(height - mean) / std:.2f}' if std > 0 else 'n/a'
@@ -132,7 +115,7 @@ def _mark_tau_bin(ax, centers: np.ndarray, hist: np.ndarray,
     ax.plot(centers[i] / scale, height, marker='x', color='red',
             markersize=12, markeredgewidth=2.5, linestyle='none', zorder=5)
     ax.annotate(
-        f'τ = {centers[i] / 1_000.0:g} ns\n'
+        f'peak τ = {centers[i] / 1_000.0:g} ns\n'
         f'counts = {height:,.0f}\n'
         f'excess = {excess:.3f}% of mean\n'
         f'SNR = {snr}\n'
@@ -270,13 +253,6 @@ class CorrelateWindow(tk.Toplevel):
         ttk.Button(cfg, text='Compute R…', width=12,
                    command=self._open_r_calculator).grid(
             row=5, column=3, padx=(2, 6), sticky='w')
-
-        ttk.Label(cfg, text='Mark τ (ns):').grid(
-            row=6, column=0, padx=6, pady=4, sticky='w')
-        self.mark_var = tk.StringVar(value=MARK_TAU_NS_DEFAULT)
-        ttk.Entry(cfg, textvariable=self.mark_var, width=8).grid(
-            row=6, column=1, sticky='w')
-        self.mark_var.trace_add('write', self._on_display_change)
 
         btn_row = ttk.Frame(cfg)
         btn_row.grid(row=6, column=2, columnspan=2, padx=8, pady=4)
@@ -652,8 +628,7 @@ class CorrelateWindow(tk.Toplevel):
             self.ax.set_ylabel(ylabel)
             self.ax.set_title(title)
             if bw:
-                _mark_tau_bin(self.ax, centers, hist,
-                              _parse_mark_tau_ps(self.mark_var), scale, bw)
+                _mark_peak_bin(self.ax, centers, hist, scale)
         self.fig.tight_layout()
         self.canvas.draw_idle()
         if write:
@@ -866,13 +841,6 @@ class QuadCorrelateWindow(tk.Toplevel):
         self.suffix_var = tk.StringVar(value='g2')
         ttk.Entry(cfg, textvariable=self.suffix_var, width=32).grid(
             row=4, column=1, columnspan=3, sticky='w')
-
-        ttk.Label(cfg, text='Mark τ (ns):').grid(
-            row=5, column=0, padx=6, pady=4, sticky='w')
-        self.mark_var = tk.StringVar(value=MARK_TAU_NS_DEFAULT)
-        ttk.Entry(cfg, textvariable=self.mark_var, width=8).grid(
-            row=5, column=1, sticky='w')
-        self.mark_var.trace_add('write', self._on_display_change)
 
         btn_row = ttk.Frame(cfg)
         btn_row.grid(row=5, column=2, columnspan=2, padx=8, pady=4)
@@ -1207,8 +1175,7 @@ class QuadCorrelateWindow(tk.Toplevel):
         ax.set_title(self._pair_title(key))
         if bw:
             # Four subplots share one figure, so the box has to be smaller here.
-            _mark_tau_bin(ax, centers, hist, _parse_mark_tau_ps(self.mark_var),
-                          scale, bw, fontsize=7)
+            _mark_peak_bin(ax, centers, hist, scale, fontsize=7)
         self.fig.tight_layout()
         self.canvas.draw_idle()
         if write:

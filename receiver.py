@@ -28,7 +28,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from receiver_backend import start_server, check_connection, run_session_loop, run_intensity_session
-from correlate import CorrelateWindow, QuadCorrelateWindow
+from correlate import CorrelateWindow
 from correlate_multi import MultiCorrelateWindow
 from offset_tools import estimate_offset
 import ssh_launcher
@@ -730,22 +730,20 @@ class ReceiverGUI:
         self._cal_deadline = 0.0
 
         self._correlate_win = CorrelateWindow(root)
-        # Separate tool for a 2-pixel-per-node mask (e.g. mask_two.txt) --
-        # not unified with the single-pair correlator above. Overlapping
-        # (node, pixel-loc) between windows is fine: merge_hooks() fans the
-        # payload out to every subscriber.
-        self._quad_correlate_win = QuadCorrelateWindow(root)
-        # The multi-pair window. Subsumes Quad (whose 2x2 workflow is its
-        # "grid" pair mode at any size); Quad stays only as a transitional
-        # cross-check until this engine is validated on hardware.
+        # QuadCorrelateWindow is NOT opened. Its 2x2 workflow is the multi-pair
+        # window's "grid" pair mode at any size, and the multi-pair engine was
+        # validated on hardware on 2026-08-26, so Quad's only remaining job --
+        # transitional cross-check -- is done. The class still exists in
+        # correlate.py pending its deletion commit; nothing instantiates it.
+        # Overlapping (node, pixel-loc) between the remaining windows is fine:
+        # merge_hooks() fans the payload out to every subscriber.
         self._multi_correlate_win = MultiCorrelateWindow(root)
         # Every correlator window, in one place. Each one needs its hooks
         # merged, its is_enabled consulted before calibration, and its
         # start_with_offset called on every path out of the cal -- four sites
         # that must never disagree about the set of windows. Adding a window
         # means adding it here and nowhere else.
-        self._correlators = (self._correlate_win, self._quad_correlate_win,
-                             self._multi_correlate_win)
+        self._correlators = (self._correlate_win, self._multi_correlate_win)
         self._monitor_abort: threading.Event | None = None
         self._build_ui()
         self._push_write_disk_state()   # correlators start out agreeing with the box
