@@ -36,11 +36,16 @@ python .claude/skills/spectral-align/align_arc.py REF.txt OTHER.txt --emit-pairs
 python tools\pair_map.py --mode affine --lo 120 --hi 200 -a 1.037 -b -2.4
 python tools\pair_map.py --selftest
 
+# Raw lSPAD capture (Stage 2 Phase 0) -- set on the SENDER, off by default
+$env:SII_WIS_RAW_DUMP = 'C:\spad\capture.raw'   # optional: SII_WIS_RAW_DUMP_MAX_MB (2048)
+python tools\raw_dump.py --info spad_data\capture.raw
+
 # Test suite (plain asserts; no pytest in requirements.txt)
 .venv\Scripts\python.exe tests\test_epoch_fix.py
 .venv\Scripts\python.exe tests\test_hook_fanout.py
 .venv\Scripts\python.exe tests\test_channel_graph.py
 .venv\Scripts\python.exe tests\test_multi_window.py
+.venv\Scripts\python.exe tools\raw_dump.py --selftest
 .venv\Scripts\python.exe correlate_kernel.py      # kernel equivalence
 .venv\Scripts\python.exe synthetic_source.py      # generator + comb
 
@@ -79,13 +84,14 @@ Minimal GUI that starts a command server thread on launch. Receives JSON command
 | `sender_backend.py` | Command server + lSPAD TCP client; contains `PIXMAP` (320-pixel array mapping); logs abnormal marker ids live (see below) |
 | `correlate.py` | `CorrelateWindow` (single-pair) live correlator, Numba JIT kernel; "Compute R…" button opens `tools/sii_calculator.py`. Also still defines `QuadCorrelateWindow` (2 pixels/node, 4 pairwise g²), which **`receiver.py` no longer instantiates** — the multi-pair window's grid mode subsumes it; pending deletion |
 | `correlate_multi.py` | `MultiCorrelateWindow` — up to ~320 pairs, one plot + pair selector. Widgets only; the logic lives in the three modules below |
-| `correlate_engine.py` | `ChannelGraph` — which events are safe to correlate and which must be kept. No Tk; 55 tests |
+| `correlate_engine.py` | `ChannelGraph` — which events are safe to correlate and which must be kept. No Tk; 59 tests |
 | `correlate_kernel.py` | `_pair_kernel` (`nogil`, bitwise identical to `_multistart_multistop`) + `PairPool`; `--selftest` |
 | `synthetic_source.py` | Pulsed-laser / Poisson generator — drives the whole path with no detector attached |
 | `tools/sii_calculator_backend.py` | Pure formulas: `<\|V\|^2>`, coherence time, bunching-excess `R`, required integration time |
 | `tools/sii_calculator.py` | `SIICalculatorWindow` — interactive bunching-excess / integration-time calculator |
 | `tools/plot_g2_result.py` | Peak-annotated g² histogram + count-distribution PNGs from a saved `{px1}_{px2}_{suffix}.txt` |
 | `tools/analyze_g2_pairs_offline.py` | Offline g² for arbitrary pixel pairs with the robust slave-dwell clock offset (matches the live correlator) |
+| `tools/raw_dump.py` | Reader + `--selftest` for the sender's env-gated raw lSPAD capture (`SII_WIS_RAW_DUMP`); length-prefixed chunks so a replay reproduces the original recv() boundaries |
 | `tools/pair_map.py` | Pure (node-1, node-2) pair derivation for the multi-pair correlator — identity / affine / grid / file modes, mask cross-check, `--selftest` |
 | `ssh_launcher.py` | Paramiko-based remote automation for launching sender nodes |
 | `setup_node.ps1` | One-shot sender node setup: OpenSSH, firewall, git clone, venv |
@@ -123,15 +129,17 @@ Each key fans out to **every** subscriber. `merge_hooks()` (`receiver.py`) compo
 | module | owns | tested by |
 |---|---|---|
 | `tools/pair_map.py` | which pixels pair with which | `--selftest`, 29 checks |
-| `correlate_engine.py` | which events are safe to correlate | `tests/test_channel_graph.py`, 55 checks |
+| `correlate_engine.py` | which events are safe to correlate | `tests/test_channel_graph.py`, 59 checks |
 | `correlate_kernel.py` | the histogram | `--selftest`, 25 checks |
-| `correlate_multi.py` | widgets | `tests/test_multi_window.py`, 31 checks |
+| `correlate_multi.py` | widgets | `tests/test_multi_window.py`, 33 checks |
 
 Pair modes: **identity** (`p2 = p1`), **affine** (`p2 = round(((p1-160) - b)/a + 160)`, inverting `align_arc.py`'s fit — `align_arc.py --emit-pairs LO HI` calls the same helper so the two cannot disagree), **grid** (outer product — this is `QuadCorrelateWindow`'s 2×2 workflow at any size), and **file** (`pix1,pix2` CSV). Affine with `a ≠ 1` is *not* bijective, so a node-2 pixel can serve two pairs; channels are therefore keyed by **distinct pixel**, never by pair. **Enable stays disabled until Derive succeeds**, and Derive shows a preview table flagging shared channels, dropped out-of-range partners, and any pixel the mask file has switched off (a guaranteed permanent stall).
 
 Exclusion is a **relative** judgement — a channel is only costing coincidences while its partners are still delivering. When nothing at all has arrived for `idle_after_s` (3 s, deliberately far shorter than the 30 s `stall_grace_s`: "is anything arriving" is answered by the next poll, while "has this channel given up" must be slow enough not to condemn a bursty pixel) the graph sets `stream_idle`, clears every exclusion and reports `idle — no data arriving`: a normal end of acquisition must not read as `LOSING COINCIDENCES` forever. Genuine exclusions are kept in `exclusion_history` (cleared on `start()`) so going idle cannot erase the audit trail, and that history — not the live flags — is what the saved `.npz` records, since saving usually happens after the stream has stopped.
 
 Retention (`ChannelGraph`) generalizes the two-pixel logic: a node-1 event is released only once **every** partner has been observed past `t1 + tmax`. The release point is a `last_ts` **watermark** — the newest timestamp ever seen — not `arr[-1]`, so a channel legitimately trimmed to size 0 no longer reads as silent. Genuinely silent partners are excluded only after `stall_grace_s` of wall clock or `stall_tolerance_ps` of detector-time lag, and every exclusion is reported: it means coincidences are being lost *now*, which the status line distinguishes from "waiting on node 2, N s behind (nothing lost)".
+
+Scale figures ride along with each run: the status line reports kernel ms/batch (last and mean), peak buffer and peak process RSS, and the saved `.npz` meta carries `n_pairs`, `peak_buffer_bytes`, `peak_rss_bytes`, `kernel_s_total`, `kernel_batches` and `kernel_s_per_batch` — so "what did 40 pairs cost" is answerable from a saved file rather than a screenshot. The buffer high-water mark lives on `ChannelGraph.peak_nbytes` (updated in `drain_all`, cleared by `start()`), not in the window: sampling it from the UI poll would miss the gated polls, which are exactly the ones holding the most. Peak RSS reads Windows' own `PeakWorkingSetSize` via ctypes — no polling loop can miss a spike, and it avoids adding `psutil` to `requirements.txt`, which every sender node installs from.
 
 Overload policy is **hold**: past the RAM cap the correlator stops draining, freezes, and reports in red. No subsampling, no silent skipping. What an overload *means* depends on the receiver's write-to-disk checkbox, which is pushed into every window via `set_write_to_disk()` — with writes on a backlog is a delay, with them off it is permanent photon loss.
 

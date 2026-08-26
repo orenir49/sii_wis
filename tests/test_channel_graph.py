@@ -495,6 +495,34 @@ def test_masked_off_pixel_stalls_then_is_excluded():
           sorted(drv.taus[(150, 150)]) == want)
 
 
+def test_peak_nbytes_is_a_high_water_mark():
+    """The RAM cap has to be sized against the worst moment, not whatever a UI
+    poll happened to see. The peak is tracked in drain_all, so it catches the
+    gated polls -- exactly the ones that return early and hold the most."""
+    rng = np.random.default_rng(43)
+    clock = FakeClock()
+    pl, g, clock, drv = build('identity', lo=150, hi=150, clock=clock)
+    check('peak starts at zero', g.peak_nbytes == 0)
+
+    # Feed node 1 only: nothing can be released, so the buffer just grows.
+    s1 = poisson_stream(rng, 1e6, 0.004)
+    for c in chunk(s1, 6):
+        drv.step({(1, 150): c}, dt=0.5)
+    peak = g.peak_nbytes
+    check('peak tracks a growing gated buffer',
+          peak >= g.ch1[150].nbytes > 0, f'peak {peak} vs now {g.ch1[150].nbytes}')
+
+    # Let node 2 through: the buffer drains but the peak must not follow it down.
+    drv.flush()
+    drv.step(None, dt=0.5)
+    check('peak does not fall back when the buffer drains',
+          g.peak_nbytes >= peak and g.nbytes < peak,
+          f'peak {g.peak_nbytes}, now {g.nbytes}, was {peak}')
+
+    g.start()
+    check('start() clears the peak', g.peak_nbytes == 0)
+
+
 def test_acquisition_stopping_is_not_coincidence_loss():
     """When the whole array goes quiet the run has ended -- that must not read
     as "LOSING COINCIDENCES". Exclusion is a relative judgement: it only means

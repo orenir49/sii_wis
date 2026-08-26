@@ -246,6 +246,21 @@ def test_end_to_end_comb():
                   meta['offset_ps'] == OFFSET and meta['mode'] == 'identity'
                   and 'write_to_disk' in meta and meta['synthetic'] is True,
                   str(meta)[:160])
+            # Scale figures ride along with the run, so a saved .npz answers
+            # "what did 40 pairs cost" without a screenshot of the status line.
+            check('npz meta carries the scale measurements',
+                  meta['n_pairs'] == 8 and meta['kernel_batches'] > 0
+                  and meta['kernel_s_per_batch'] > 0
+                  and meta['peak_buffer_bytes'] > 0,
+                  f"pairs={meta['n_pairs']} batches={meta['kernel_batches']} "
+                  f"s/batch={meta['kernel_s_per_batch']} "
+                  f"buf={meta['peak_buffer_bytes']}")
+            # None off Windows; an int and a plausible one on it. Either is a
+            # pass -- the tests must not be Windows-only.
+            rss = meta['peak_rss_bytes']
+            check('npz meta carries peak RSS, or None off Windows',
+                  rss is None or (isinstance(rss, int) and rss > 10 * 10**6),
+                  str(rss))
 
             w.pair_var.set('151 × 151')
             w._export_pair_txt()

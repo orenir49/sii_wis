@@ -40,6 +40,21 @@ QUEUE_MAXSIZE     = 200
 
 # lSPAD command-protocol timings (seconds)
 LSPAD_HANDSHAKE_S = 10.0    # banner / T,v,1 — never block forever on a wedged lSPAD
+
+# Stage 2 Phase 0 scaffolding: env-gated verbatim capture of lSPAD's stream,
+# OFF unless SII_WIS_RAW_DUMP names a file. It exists so a parser rewrite can be
+# *proved* rather than argued: raw detector bytes are not otherwise retained and
+# two acquisitions are never the same photons, so "run it twice and diff" is
+# unavailable. Replaying one capture through the old and the new parse path must
+# give byte-identical px_*.bin and identical stats counters.
+#
+# Chunks are length-prefixed ('<I' then the bytes) rather than concatenated: the
+# parser carries a partial record across recv() boundaries, so preserving the
+# original chunking is what lets a replay reproduce the original run exactly,
+# not merely agree with another replay of itself.
+RAW_DUMP_ENV     = 'SII_WIS_RAW_DUMP'
+RAW_DUMP_MAX_ENV = 'SII_WIS_RAW_DUMP_MAX_MB'
+RAW_DUMP_MAX_MB  = 2048.0   # bench PCs have finite disks; stop, log, keep parsing
 STOP_CONFIRM_S    = 5.0     # hard-abort drain budget; a soft stop has none
 DRAIN_REPORT_S    = 5.0     # progress cadence while draining after STOP
 PRESTART_DRAIN_S  = 120.0   # budget for reading a stale backlog to silence;
@@ -466,6 +481,11 @@ def run(sock: socket.socket,
             t_stream    = time.time()
             last_lag_check = t_stream
 
+            raw_dump      = None      # env-gated verbatim capture, see RAW_DUMP_ENV
+            raw_written   = 0
+            raw_cap       = 0.0
+            raw_capped    = False
+
             stopping      = False
             stop_deadline = None      # None while a soft stop is draining
             drain_start   = 0.0
@@ -540,6 +560,28 @@ def run(sock: socket.socket,
                         break
                     if first_chunk:
                         first_chunk = False
+                        raw_path = os.environ.get(RAW_DUMP_ENV)
+                        if raw_path:
+                            try:
+                                raw_dump = open(raw_path, 'wb')
+                                raw_cap = float(os.environ.get(
+                                    RAW_DUMP_MAX_ENV, RAW_DUMP_MAX_MB)) * 1e6
+                                log_fn(f'RAW DUMP ON -> {raw_path} '
+                                       f'(cap {raw_cap / 1e6:.0f} MB)\n')
+                            except OSError as exc:
+                                log_fn(f'raw dump could not be opened: {exc!r}\n')
+
+                    if raw_dump is not None:
+                        # Write before parsing, so the capture is what arrived
+                        # rather than what we managed to interpret.
+                        if raw_written + len(data) <= raw_cap:
+                            raw_dump.write(struct.pack('<I', len(data)))
+                            raw_dump.write(data)
+                            raw_written += len(data)
+                        elif not raw_capped:
+                            raw_capped = True
+                            log_fn(f'raw dump hit its {raw_cap / 1e6:.0f} MB cap '
+                                   f'— capture truncated, parsing continues\n')
 
                     total_bytes += len(data)
                     # The parse loop has a large fixed cost per chunk (the
@@ -696,6 +738,11 @@ def run(sock: socket.socket,
                            f'{total_bytes} B / {time.time() - t_stream:.1f} s '
                            f'— lSPAD ended an indefinite (SB,0) acquisition\n')
             finally:
+                if raw_dump is not None:
+                    raw_dump.close()
+                    stats['raw_dump_b'] = int(raw_written)
+                    log_fn(f'raw dump closed — {raw_written / 1e6:,.1f} MB captured'
+                           + (' (TRUNCATED at the cap)' if raw_capped else '') + '\n')
                 spad_sock.close()
 
     finally:

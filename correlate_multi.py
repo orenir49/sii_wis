@@ -63,6 +63,52 @@ BACKLOG_WARN_S = 2.0
 SYNTH_SPAN_S = 0.02
 
 
+def _peak_rss_bytes():
+    """Peak working set of THIS process, or None off Windows / on failure.
+
+    Windows already tracks the high-water mark for us (PeakWorkingSetSize), so
+    this is a read rather than a poll -- no sampling loop can miss a spike
+    between two polls. ctypes rather than psutil deliberately: psutil is not in
+    requirements.txt, the sender nodes install from it, and a diagnostic should
+    not add a dependency to every node. Same approach as
+    tools/analyze_g2_pairs_offline.py's working-set trim.
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _PMC(ctypes.Structure):
+            _fields_ = [('cb', wintypes.DWORD),
+                        ('PageFaultCount', wintypes.DWORD),
+                        ('PeakWorkingSetSize', ctypes.c_size_t),
+                        ('WorkingSetSize', ctypes.c_size_t),
+                        ('QuotaPeakPagedPoolUsage', ctypes.c_size_t),
+                        ('QuotaPagedPoolUsage', ctypes.c_size_t),
+                        ('QuotaPeakNonPagedPoolUsage', ctypes.c_size_t),
+                        ('QuotaNonPagedPoolUsage', ctypes.c_size_t),
+                        ('PagefileUsage', ctypes.c_size_t),
+                        ('PeakPagefileUsage', ctypes.c_size_t)]
+
+        k32, psapi = ctypes.windll.kernel32, ctypes.windll.psapi
+        # GetCurrentProcess returns the pseudo-handle (HANDLE)-1. Without an
+        # explicit restype ctypes treats it as c_int and truncates it on 64-bit,
+        # so the call fails and returns 0 -- silently, since it is the struct
+        # that carries the answer.
+        k32.GetCurrentProcess.restype = ctypes.c_void_p
+        psapi.GetProcessMemoryInfo.argtypes = [ctypes.c_void_p,
+                                               ctypes.POINTER(_PMC),
+                                               wintypes.DWORD]
+        psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+        pmc = _PMC()
+        pmc.cb = ctypes.sizeof(_PMC)
+        if not psapi.GetProcessMemoryInfo(k32.GetCurrentProcess(),
+                                          ctypes.byref(pmc), pmc.cb):
+            return None
+        return int(pmc.PeakWorkingSetSize)
+    except Exception:
+        return None
+
+
 class MultiCorrelateWindow(tk.Toplevel):
 
     def __init__(self, parent: tk.Tk) -> None:
@@ -87,6 +133,12 @@ class MultiCorrelateWindow(tk.Toplevel):
         self._result_q: queue.Queue = queue.Queue()
         self._synth: SyntheticSource | None = None
         self._last_kernel_s = 0.0
+        # Scale measurements the plan asks for at 4 -> 16 -> 80 pairs. Peak, not
+        # instantaneous: the status line's "MB buffered" is whatever the last
+        # poll happened to see, which is not what a RAM cap has to be sized
+        # against.
+        self._kernel_s_total = 0.0
+        self._kernel_batches = 0
 
         self._build_ui()
         self.status_var.set('Compiling correlation kernels …')
@@ -439,6 +491,8 @@ class MultiCorrelateWindow(tk.Toplevel):
         self._offset = None
         self._accumulating = False
         self._held = False
+        self._kernel_s_total = 0.0
+        self._kernel_batches = 0
         if self._graph is not None:
             self._graph.start(offset=0)
             self._graph.stop()
@@ -577,6 +631,8 @@ class MultiCorrelateWindow(tk.Toplevel):
             batches = [((p1, p2), t1, t2) for p1, p2, t1, t2 in rel.batches]
             hists = self._pool.run(batches, bw, tmax, nbins, nshift)
             dt = time.perf_counter() - t0
+            self._kernel_s_total += dt
+            self._kernel_batches += 1
             sizes = {(p1, p2): (int(t1.size), int(t2.size))
                      for p1, p2, t1, t2 in rel.batches}
             self._result_q.put(('ok', hists, sizes, rel, dt))
@@ -614,9 +670,14 @@ class MultiCorrelateWindow(tk.Toplevel):
             self._redraw()
             g = self._graph
             if g is not None:
+                mean_ms = (self._kernel_s_total / self._kernel_batches * 1000
+                           if self._kernel_batches else 0.0)
+                rss = _peak_rss_bytes()
                 self._set_status(
-                    f'{g.status()} — kernel {self._last_kernel_s * 1000:.0f} ms/batch, '
-                    f'{len(self._hist)} pairs accumulating',
+                    f'{g.status()} — kernel {self._last_kernel_s * 1000:.0f} ms/batch '
+                    f'(mean {mean_ms:.0f}), {len(self._hist)} pairs accumulating, '
+                    f'peak buf {g.peak_nbytes / 1e6:.0f} MB'
+                    + (f', peak RSS {rss / 1e6:.0f} MB' if rss else ''),
                     bad=any(c.excluded for c in g.channels))
         self.after(250, self._poll_results)
 
@@ -720,6 +781,15 @@ class MultiCorrelateWindow(tk.Toplevel):
             'bin_width_ps': self.bw_var.get(), 'tmax_ps': self.tmax_var.get(),
             'n_shift': self.nshift_var.get(), 'offset_ps': self._offset,
             'write_to_disk': self._write_to_disk,
+            # Scale measurements, so a saved run carries its own cost figures
+            # instead of them living only in a screenshot of the status line.
+            'n_pairs': len(self._pairs) if self._pairs else 0,
+            'peak_buffer_bytes': int(self._graph.peak_nbytes) if self._graph else 0,
+            'peak_rss_bytes': _peak_rss_bytes(),
+            'kernel_s_total': round(self._kernel_s_total, 4),
+            'kernel_batches': int(self._kernel_batches),
+            'kernel_s_per_batch': (round(self._kernel_s_total / self._kernel_batches, 5)
+                                   if self._kernel_batches else None),
             'synthetic': self._synth is not None,
             'masked_off': self._pairs.masked_off,
             # exclusion_history, not the live flags: saving usually happens

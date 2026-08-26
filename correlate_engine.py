@@ -260,12 +260,17 @@ class ChannelGraph:
 
         self.accumulating = False
         self._t_start = None
-        # True when nothing at all has arrived for stall_grace_s. Exclusion is a
+        # True when nothing at all has arrived for idle_after_s. Exclusion is a
         # RELATIVE judgement, so this gates it -- see _refresh_exclusions.
         self.stream_idle = False
         # Exclusions that happened while the stream was live, kept so going idle
         # cannot erase the audit trail: {(node, pixel): reason}.
         self.exclusion_history: dict = {}
+        # High-water mark of the buffer, for sizing the RAM cap. The graph owns
+        # the buffer, so it owns the peak: sampling it from the UI poll would
+        # miss the moments that matter, which are the gated ones where a poll
+        # returns early.
+        self.peak_nbytes = 0
 
     # -- wiring ------------------------------------------------------------
 
@@ -301,6 +306,7 @@ class ChannelGraph:
         self._t_start = self.clock()
         self.stream_idle = False
         self.exclusion_history.clear()
+        self.peak_nbytes = 0
 
     def stop(self) -> None:
         self.accumulating = False
@@ -375,6 +381,9 @@ class ChannelGraph:
         for c in self.channels:
             if c.drain(self.accumulating, now):
                 new = True
+        nb = self.nbytes
+        if nb > self.peak_nbytes:
+            self.peak_nbytes = nb
         return new
 
     def _would_release(self) -> bool:

@@ -26,7 +26,7 @@ ab9a8c2  Add tools/pair_map.py: pure pair derivation, shared with align_arc
 d049f36  Stage 1a: fan pixel_hooks out to every subscriber
 ```
 
-### Test suite — 181 checks, all passing as of 2026-08-26
+### Test suite — 199 checks, all passing as of 2026-08-26
 
 Plain asserts, no pytest (it is not in `requirements.txt`). **Run all of these before trusting any
 change**; the whole suite takes ~2 minutes, most of it numba compiling.
@@ -34,9 +34,10 @@ change**; the whole suite takes ~2 minutes, most of it numba compiling.
 ```
 .venv\Scripts\python.exe tests\test_epoch_fix.py         # 12  (on main)
 .venv\Scripts\python.exe tests\test_hook_fanout.py       # 21  Stage 1a + 1b
-.venv\Scripts\python.exe tests\test_channel_graph.py     # 55  retention
-.venv\Scripts\python.exe tests\test_multi_window.py      # 31  end-to-end
+.venv\Scripts\python.exe tests\test_channel_graph.py     # 59  retention
+.venv\Scripts\python.exe tests\test_multi_window.py      # 33  end-to-end
 .venv\Scripts\python.exe tools\pair_map.py --selftest    # 29  pair derivation
+.venv\Scripts\python.exe tools\raw_dump.py --selftest    # 12  raw-capture format
 .venv\Scripts\python.exe correlate_kernel.py             # 25  kernel equivalence
 .venv\Scripts\python.exe synthetic_source.py             #  8  generator + comb
 ```
@@ -103,6 +104,21 @@ Quad is now free to go.** Item 3 is the next thing to do.
    bench session you are already having.
 
 **Smaller open items**, none blocking:
+
+- **Stage 2 Phase 0 scaffolding LANDED 2026-08-26**, ahead of the 80-pixel run so one bench session
+  serves both. `sender_backend.py` writes a verbatim capture of lSPAD's stream when
+  `SII_WIS_RAW_DUMP` names a file (off otherwise), length-prefixed per `recv()` so a replay
+  reproduces the *original* chunk boundaries — the parser carries a partial record across them, so
+  they are part of the input. `SII_WIS_RAW_DUMP_MAX_MB` caps it (2048 default): it stops, logs once,
+  and keeps parsing rather than filling the disk. Bytes captured land in `stats['raw_dump_b']`.
+  `tools/raw_dump.py` reads the format (`--info`, `--selftest`, 12 checks) including truncated
+  captures, which are expected rather than corrupt. **The replay harness itself is still to write** —
+  that is 2a's job; this commit only makes the capture possible and readable.
+
+- **Scale instrumentation LANDED 2026-08-26**, so the outstanding "kernel s/batch and peak RSS at
+  4 -> 16 -> 80 pairs" is now a measurement rather than a screenshot: status line and `.npz` meta both
+  carry it. `ChannelGraph.peak_nbytes` is the buffer high-water mark; peak RSS comes from Windows'
+  `PeakWorkingSetSize`.
 
 - The count-distribution radio (`correlate.py`'s `_draw_distribution`) was **not** absorbed into the
   multi-pair window. The Compute R button and the hold-policy status line were. The peak-marker helper
@@ -894,9 +910,9 @@ Add a `raw_b`/`wire_b` ratio to `stats` and expect ~2.00x at the rates that matt
   (`correlate.py:221` vs `840`): both write `{px1}_{px2}_{suffix}.txt` (`correlate.py:687` and
   `1207`), so with matching suffixes they fight over one file and you would unknowingly diff it
   against itself. Then a 15-min run with writes off — now one checkbox click, per 1b: disk flat,
-  sync files growing, backlog quiet, RAM plateauing at the predicted level. Note the shipped flag
-  suppresses only *hooked* pixels, so "disk flat" holds only if every active pixel is in some
-  window's pair list; otherwise expect the un-hooked ones to keep writing.
+  sync files growing, backlog quiet, RAM plateauing at the predicted level. Since deviation 1 closed
+  (2026-08-26) the flag suppresses **every** pixel key, so "disk flat" means literally no `px_*.bin`
+  at all, regardless of which pixels any window happens to be watching.
 - *After Quad is deleted:* re-run the full suite with `receiver.py`'s `_correlators` list down to two
   windows, and confirm the prewarm once-lock, `start_with_offset` fan-out
   (`receiver.py:1241-1242`, `1293-1294`), and `is_enabled` check (`receiver.py:893`) all still cover
