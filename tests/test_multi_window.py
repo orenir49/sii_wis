@@ -75,15 +75,20 @@ def make_window(root, masks=None):
     return w
 
 
-def drive(w, seconds, dt=0.002):
+def drive(w, src, seconds, dt=0.002):
     """Advance the pipeline by `seconds` of DETECTOR time.
 
     Milliseconds, not seconds: at an 80 MHz rep rate a single second of
     detector time is ~1e8 pulses, and 30 ms already gives every pair a comb
     thousands of counts tall.
+
+    `src` is passed in rather than read off the window: the synthetic source's
+    GUI surface was removed (Stage 4), so a generator now feeds the ChannelGraph
+    directly and needs no window at all. That is what `SyntheticSource.feed`
+    always took -- a graph, not a widget.
     """
     for _ in range(max(1, int(round(seconds / dt)))):
-        w._synth.feed(w._graph, dt)
+        src.feed(w._graph, dt)
         w._tick_once_synchronously()
 
 
@@ -168,10 +173,10 @@ def test_end_to_end_comb():
         check('start_with_offset begins accumulation at the given offset',
               w._accumulating and w._offset == OFFSET)
 
-        w._synth = SyntheticSource(list(w._graph.ch1), list(w._graph.ch2),
-                                   period_ps=PERIOD_NS * 1000, p_detect=0.06,
-                                   rate_hz=30_000, offset_ps=OFFSET, seed=9)
-        drive(w, seconds=0.03)
+        src = SyntheticSource(list(w._graph.ch1), list(w._graph.ch2),
+                              period_ps=PERIOD_NS * 1000, p_detect=0.06,
+                              rate_hz=30_000, offset_ps=OFFSET, seed=9)
+        drive(w, src, seconds=0.03)
 
         check(f'every pair accumulated a histogram ({len(w._hist)} of 8)',
               len(w._hist) == 8, str(sorted(w._hist)))
@@ -263,7 +268,7 @@ def test_end_to_end_comb():
             meta = json.loads(str(d['meta']))
             check('npz meta records offset, mode and the write-to-disk state',
                   meta['offset_ps'] == OFFSET and meta['mode'] == 'identity'
-                  and 'write_to_disk' in meta and meta['synthetic'] is True,
+                  and 'write_to_disk' in meta,
                   str(meta)[:160])
             # Scale figures ride along with the run, so a saved .npz answers
             # "what did 40 pairs cost" without a screenshot of the status line.
@@ -299,7 +304,7 @@ def test_end_to_end_comb():
         # Overload policy.
         w.set_write_to_disk(False)
         w.ramcap_var.set('0.001')       # 1 kB -- trips on any retained tail
-        w._synth.feed(w._graph, 0.002)
+        src.feed(w._graph, 0.002)
         w._graph.drain_all()
         w._tick()
         check('RAM cap trips into HOLD and says photons are being lost',

@@ -50,19 +50,11 @@ from correlate import _mark_peak_bin, _prewarm, pick_unit
 from correlate_engine import PS_PER_S, ChannelGraph
 from correlate_kernel import PairPool, bin_edges, prewarm, suggest_n_shift, tau_coverage_ps
 from sii_calculator import SIICalculatorWindow
-from synthetic_source import SyntheticSource
 
 MAX_PAIRS = 320           # guard: grid mode is how you ask for 6400 by accident
 DEFAULT_RAM_CAP_MB = 2000
 BACKLOG_WARN_S = 2.0
 
-# Detector time the synthetic source emits per poll. Deliberately NOT tied to
-# the poll interval: at an 80 MHz rep rate and 1 Mcps/pixel, one second of
-# detector time is ~1e6 events per channel, so a 1.5 s poll across 160 channels
-# would generate a quarter of a billion timestamps and wedge the GUI. Synthetic
-# detector time therefore advances slower than wall clock, which costs nothing
-# -- the histogram only cares how many events it has seen, not when.
-SYNTH_SPAN_S = 0.02
 
 
 def _peak_rss_bytes():
@@ -137,7 +129,6 @@ class MultiCorrelateWindow(tk.Toplevel):
         self._held = False             # RAM cap tripped: draining stopped
         self._write_to_disk = True
         self._result_q: queue.Queue = queue.Queue()
-        self._synth: SyntheticSource | None = None
         self._last_kernel_s = 0.0
         # Scale measurements the plan asks for at 4 -> 16 -> 80 pairs. Peak, not
         # instantaneous: the status line's "MB buffered" is whatever the last
@@ -279,12 +270,6 @@ class MultiCorrelateWindow(tk.Toplevel):
         ttk.Button(btn, text='Export pair → .txt', width=17,
                    command=self._export_pair_txt).grid(row=0, column=4, padx=3)
 
-        self.synth_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(btn, text='Synthetic source', variable=self.synth_var,
-                        command=self._on_synth_toggle).grid(row=0, column=5, padx=(14, 3))
-        ttk.Label(btn, text='rep (ns):').grid(row=0, column=6, padx=(6, 2))
-        self.synth_period_var = tk.StringVar(value='12.5')
-        ttk.Entry(btn, textvariable=self.synth_period_var, width=7).grid(row=0, column=7)
 
         self.status_var = tk.StringVar(value='Disabled.')
         self.status_lbl = ttk.Label(cfg, textvariable=self.status_var, anchor='w')
@@ -604,29 +589,6 @@ class MultiCorrelateWindow(tk.Toplevel):
         self.status_var.set('Data cleared. ' +
                             ('Enabled — waiting for DWELL.' if self._active else 'Disabled.'))
 
-    def _on_synth_toggle(self) -> None:
-        if not self.synth_var.get():
-            self._synth = None
-            self.status_var.set('Synthetic source off.')
-            return
-        if self._graph is None:
-            self.synth_var.set(False)
-            self.status_var.set('Enable first — the synthetic source fills the '
-                                'derived channels.')
-            return
-        try:
-            period_ps = float(self.synth_period_var.get()) * 1000.0
-        except ValueError:
-            period_ps = 12_500.0
-        self._synth = SyntheticSource(
-            list(self._graph.ch1), list(self._graph.ch2),
-            period_ps=period_ps, offset_ps=self._offset or 0)
-        if not self._accumulating:
-            self.start_with_offset(0)
-        self.status_var.set(f'Synthetic source ON — {period_ps / 1000:g} ns pulse '
-                            f'train shared by both nodes; expect comb teeth every '
-                            f'{period_ps / 1000:g} ns.')
-
     # ------------------------------------------------------------------
     # Hooks / calibration
     # ------------------------------------------------------------------
@@ -653,8 +615,6 @@ class MultiCorrelateWindow(tk.Toplevel):
         self._bins = None
         self._accumulating = True
         self._held = False
-        if self._synth is not None:
-            self._synth.offset_ps = int(offset)
         self.status_var.set(f'Accumulating — offset {offset:+,} ps, '
                             f'{len(self._pairs)} pairs')
 
@@ -687,9 +647,6 @@ class MultiCorrelateWindow(tk.Toplevel):
         g = self._graph
         if g is None or not self._accumulating:
             return
-
-        if self._synth is not None:
-            self._synth.feed(g, SYNTH_SPAN_S)
 
         # HOLD policy. Stop draining, freeze, report -- no subsampling, no
         # silent skipping. Which sentence is true depends on the disk flag, so
@@ -957,7 +914,6 @@ class MultiCorrelateWindow(tk.Toplevel):
             'kernel_batches': int(self._kernel_batches),
             'kernel_s_per_batch': (round(self._kernel_s_total / self._kernel_batches, 5)
                                    if self._kernel_batches else None),
-            'synthetic': self._synth is not None,
             'masked_off': self._pairs.masked_off,
             # exclusion_history, not the live flags: saving usually happens
             # after the stream has stopped, when every channel reads quiet and
