@@ -37,8 +37,13 @@ python tools\pair_map.py --mode affine --lo 120 --hi 200 -a 1.037 -b -2.4
 python tools\pair_map.py --selftest
 
 # Raw lSPAD capture (Stage 2 Phase 0) -- set on the SENDER, off by default
-$env:SII_WIS_RAW_DUMP = 'C:\spad\capture.raw'   # optional: SII_WIS_RAW_DUMP_MAX_MB (2048)
-python tools\raw_dump.py --info spad_data\capture.raw
+# Set on the MASTER before launching receiver.py; forwarded to each node as
+# <that node repo>\<value>_node{1,2}. Relative is preferred: the two nodes have
+# different usernames, so an absolute master-side path names a missing home dir.
+$env:SII_WIS_RAW_DUMP = 'spad_data\cap.raw'   # optional: SII_WIS_RAW_DUMP_MAX_MB (2048)
+python tools\fetch_capture.py                 # pull both captures to the master
+python tools\raw_dump.py --info spad_data\captures\cap_node1.raw
+python tools\replay.py spad_data\captures\cap_node1.raw --outdir replay_out
 
 # Test suite (plain asserts; no pytest in requirements.txt)
 .venv\Scripts\python.exe tests\test_epoch_fix.py
@@ -97,6 +102,7 @@ Minimal GUI that starts a command server thread on launch. Receives JSON command
 | `tools/analyze_g2_pairs_offline.py` | Offline g² for arbitrary pixel pairs with the robust slave-dwell clock offset (matches the live correlator) |
 | `tools/raw_dump.py` | Reader + `--selftest` for the sender's env-gated raw lSPAD capture (`SII_WIS_RAW_DUMP`); length-prefixed chunks so a replay reproduces the original recv() boundaries |
 | `tools/replay.py` | Replays a capture through `sender_backend.run()` into the real receiver loop, and diffs two replays (`px_*.bin` bytes + input-derived stats). The oracle a parser rewrite has to pass; `--selftest` |
+| `tools/fetch_capture.py` | Pulls both nodes' raw captures back to the master over SFTP and summarizes them (chunks, records, truncation) |
 | `tools/pair_map.py` | Pure (node-1, node-2) pair derivation — identity / grid (both mask-driven) and file for the GUI, plus affine for `align_arc --emit-pairs`; mask cross-check, `--selftest` |
 | `ssh_launcher.py` | Paramiko-based remote automation for launching sender nodes |
 | `setup_node.ps1` | One-shot sender node setup: OpenSSH, firewall, git clone, venv |
@@ -177,6 +183,8 @@ Automates sender node startup via paramiko password auth:
 2. Wait for lSPAD port 9999 to open
 3. Apply pixel mask (`M,<path>`), run TDC calibration (`T,v,1` → `T,c,1`)
 4. Git pull the repo, launch `sender.py` detached via venv `pythonw.exe`
+
+`start_detached()` takes an optional `env`. It cannot be done by exporting over SSH: a `Win32_Process.Create` child inherits the **WMI service's** environment, not the session's, so `$env:X = …` is invisible to it. Rather than nest quotes three deep in the WMI command line — where one stray quote silently launches the wrong thing — a small `_launch_env.cmd` is uploaded beside the target and `Create` runs that; nothing persists on the node beyond that file, unlike a Machine-scope variable. This is what lets `SII_WIS_RAW_DUMP` reach the sender at all, since the capture has to be enabled in the sender's own environment at launch. `download_file()` is the counterpart to `upload_file()`, used by `tools/fetch_capture.py`.
 
 ### Data files
 
