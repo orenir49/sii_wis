@@ -406,7 +406,7 @@ def launch_node(host: str, username: str,
     `mask_pixel` (a physical sensor location, not a pix ID) generates a
     single-pixel mask and takes priority over `mask_filename`.
     `raw_dump`, if given, enables sender_backend's verbatim lSPAD capture
-    (SII_WIS_RAW_DUMP) — the Stage 2a replay oracle. It has to be set in the
+    (SII_WIS_RAW_DUMP) — the Stage 2a replay reference. It has to be set in the
     sender's own environment at launch, which is why start_detached takes an env
     at all. Prefer a RELATIVE path (spad_data then the filename): it resolves
     against this node's own repo, whereas an absolute path from the master would

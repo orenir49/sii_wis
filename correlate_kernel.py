@@ -57,7 +57,7 @@ def _multistart_multistop(t1, t2, idx, bin_width, tmax, nbins, n_shift):
     """The reference g2 kernel: parallel over SHIFTS, one pair at a time.
 
     Moved here from correlate.py when `CorrelateWindow` was retired (Stage 4).
-    It is kept because it is the oracle `_pair_kernel` is proved equal to, not
+    It is kept because it is what `_pair_kernel` is proved equal to, not
     because anything calls it in production -- `_selftest` below is its only
     caller.
 

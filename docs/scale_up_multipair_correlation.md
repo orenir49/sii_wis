@@ -263,7 +263,7 @@ this branch into `main`. Item 6 (Stage 2) stays deferred on merit.
   is 14x faster) and `raw_dump_b` (the captured run had the dump on, the replay does not). `recv_calls`
   and `recv_mean_b` are excluded too — they describe how the stream was *chunked*, not the parse.
 
-  **Stage 2a is now provable.** The capture, the oracle and the ground-truth comparison all exist; what
+  **Stage 2a is now provable.** The capture, the reference and the ground-truth comparison all exist; what
   remains is writing the faster parser.
 
 - **All three pair modes have now run on hardware** (2026-08-26). `identity` from the masks on the
@@ -1144,7 +1144,7 @@ loses a code path only tests exercised.
 
 `pick_unit` and `_mark_peak_bin` went to `correlate_multi.py` (the only window left).
 `_multistart_multistop` went to **`correlate_kernel.py`**, which is the change worth noting: it had no
-executable users outside `correlate.py`, so it looked deletable — but it is the oracle `_pair_kernel`
+executable users outside `correlate.py`, so it looked deletable — but it is what `_pair_kernel`
 is proved equal to, and `correlate_kernel._selftest` held a *verbatim copy* rather than importing it.
 Deleting it would have left the selftest passing forever while the function it claimed equality with
 no longer existed. It is now the module-level reference and `_selftest` uses it directly, so the proof
@@ -1277,18 +1277,18 @@ Add a `raw_b`/`wire_b` ratio to `stats` and expect ~2.00x at the rates that matt
 > | whole-node lag, symmetric + asymmetric | **done** — catches up bit-identical |
 > | synthetic source mode | **done** — `synthetic_source.py`, and it is what unlocked the rest |
 > | display / save / legacy `.txt` export | **done** — `tests/test_multi_window.py` |
-> | **transitional Quad cross-check (`quad_compat`)** | **NOT DONE** — judged redundant once the golden brute force existed, since it is a strictly better oracle and Quad carries the retention bug. Reinstate only if a hardware discrepancy needs bisecting |
-> | **on hardware — the live-vs-offline proof** | **DONE 2026-08-26** — see the hardware block below. Done against `analyze_g2_pairs_offline.py` rather than `CorrelateWindow`: the offline path is a strictly better oracle (independent kernel, independent offset estimate, whole-file rather than streamed) and it sidesteps the `suffix` collision entirely |
+> | **transitional Quad cross-check (`quad_compat`)** | **NOT DONE** — judged redundant once the golden brute force existed, since it is a strictly better reference and Quad carries the retention bug. Reinstate only if a hardware discrepancy needs bisecting |
+> | **on hardware — the live-vs-offline proof** | **DONE 2026-08-26** — see the hardware block below. Done against `analyze_g2_pairs_offline.py` rather than `CorrelateWindow`: the offline path is a strictly better reference (independent kernel, independent offset estimate, whole-file rather than streamed) and it sidesteps the `suffix` collision entirely |
 > | **after Quad is deleted: re-run the suite** | **DONE 2026-08-26** — suite green, and the four per-window wiring sites re-checked (they all iterate `_correlators`) |
 > | **kernel s/batch and peak RSS at 4 → 16 → 80 pairs** | **DONE to 40 pairs** 2026-08-26 — see the Measured-on-hardware table. 80 pairs outstanding, and it is a load test only |
 
 - *Kernel equivalence:* the new pair-parallel kernel must match `_multistart_multistop` **exactly**
   (`np.array_equal`, int64 — reordering integer accumulation is exact, so any difference is a bug).
   Sweep n1/n2 including 0 and `n_shift > n2`, and τ exactly on a bin edge.
-- *Golden brute force — the primary oracle.* Small streams through the batched pipeline vs an
+- *Golden brute force — the primary reference.* Small streams through the batched pipeline vs an
   O(n1·n2) double loop over the same neighbour window, with `tmax` chosen so coincidences straddle
   many batch boundaries. Exact equality proves no boundary loss and no double counting. **Since Quad
-  is being retired, this is the real ground truth, and it is a better oracle than Quad ever was —
+  is being retired, this is the real ground truth, and it is a better reference than Quad ever was —
   Quad carries the retention bug.** Run it in both grid and diagonal topologies so the 1-partner and
   N-partner adjacency paths are both covered.
 - *Transitional Quad cross-check, in **two** modes.* Worth doing while Quad still exists, purely to

@@ -93,14 +93,14 @@ Minimal GUI that starts a command server thread on launch. Receives JSON command
 | `sender_backend.py` | Command server + lSPAD TCP client; contains `PIXMAP` (320-pixel array mapping); logs abnormal marker ids live (see below) |
 | `correlate_multi.py` | `MultiCorrelateWindow` — **the only correlator**. Up to ~320 pairs, one plot + pair selector, `g²`/count-distribution views, `Compute R…`. `QuadCorrelateWindow` and `CorrelateWindow` were both retired into it 2026-08-26; it also owns the shared `pick_unit`/`_mark_peak_bin` display helpers |
 | `correlate_engine.py` | `ChannelGraph` — which events are safe to correlate and which must be kept. No Tk; 59 tests |
-| `correlate_kernel.py` | `_pair_kernel` (`nogil`) + `PairPool`, and the reference `_multistart_multistop` it is proved bitwise identical to — moved here from `correlate.py` so the oracle and the proof have one owner; `prewarm()` warms both; `--selftest` |
+| `correlate_kernel.py` | `_pair_kernel` (`nogil`) + `PairPool`, and the reference `_multistart_multistop` it is proved bitwise identical to — moved here from `correlate.py` so the reference and the proof have one owner; `prewarm()` warms both; `--selftest` |
 | `synthetic_source.py` | Pulsed-laser / Poisson generator — drives the whole path with no detector attached |
 | `tools/sii_calculator_backend.py` | Pure formulas: `<\|V\|^2>`, coherence time, bunching-excess `R`, required integration time |
 | `tools/sii_calculator.py` | `SIICalculatorWindow` — interactive bunching-excess / integration-time calculator |
 | `tools/plot_g2_result.py` | Peak-annotated g² histogram + count-distribution PNGs from a saved `{px1}_{px2}_{suffix}.txt` |
 | `tools/analyze_g2_pairs_offline.py` | Offline g² for arbitrary pixel pairs with the robust slave-dwell clock offset (matches the live correlator) |
 | `tools/raw_dump.py` | Reader + `--selftest` for the sender's env-gated raw lSPAD capture (`SII_WIS_RAW_DUMP`); length-prefixed chunks so a replay reproduces the original recv() boundaries |
-| `tools/replay.py` | Replays a capture through `sender_backend.run()` into the real receiver loop, and diffs two replays (`px_*.bin` bytes + input-derived stats). The oracle a parser rewrite has to pass; `--selftest` |
+| `tools/replay.py` | Replays a capture through `sender_backend.run()` into the real receiver loop, and diffs two replays (`px_*.bin` bytes + input-derived stats). The check a parser rewrite has to pass; `--selftest` |
 | `tools/fetch_capture.py` | Pulls both nodes' raw captures back to the master over SFTP and summarizes them (chunks, records, truncation) |
 | `tools/pair_map.py` | Pure (node-1, node-2) pair derivation — identity / grid (both mask-driven) and file for the GUI, plus affine for `align_arc --emit-pairs`; mask cross-check, `--selftest` |
 | `ssh_launcher.py` | Paramiko-based remote automation for launching sender nodes |

@@ -2,7 +2,7 @@
 
     .venv\\Scripts\\python.exe tests\\test_channel_graph.py
 
-The primary oracle is a golden brute force: every coincidence within +-tmax,
+The primary reference is a golden brute force: every coincidence within +-tmax,
 counted by an O(n1*n2) double loop over the *whole* stream, must equal what the
 batched pipeline produces summed over release cycles. tmax is deliberately
 large relative to the chunk spacing so coincidences straddle many batch
@@ -71,7 +71,7 @@ def chunk(arr, n):
 
 def brute_taus(t1, t2, tmax=TMAX):
     """Every coincidence within +-tmax, as a sorted list of tau. O(n1*n2) by
-    construction -- this is the oracle, so it must be obviously right rather
+    construction -- this is the reference, so it must be obviously right rather
     than fast."""
     out = []
     for a in t1:
