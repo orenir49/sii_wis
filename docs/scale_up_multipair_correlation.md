@@ -26,7 +26,7 @@ ab9a8c2  Add tools/pair_map.py: pure pair derivation, shared with align_arc
 d049f36  Stage 1a: fan pixel_hooks out to every subscriber
 ```
 
-### Test suite — 179 checks, all passing as of 2026-08-26
+### Test suite — 181 checks, all passing as of 2026-08-26
 
 Plain asserts, no pytest (it is not in `requirements.txt`). **Run all of these before trusting any
 change**; the whole suite takes ~2 minutes, most of it numba compiling.
@@ -34,7 +34,7 @@ change**; the whole suite takes ~2 minutes, most of it numba compiling.
 ```
 .venv\Scripts\python.exe tests\test_epoch_fix.py         # 12  (on main)
 .venv\Scripts\python.exe tests\test_hook_fanout.py       # 21  Stage 1a + 1b
-.venv\Scripts\python.exe tests\test_channel_graph.py     # 53  retention
+.venv\Scripts\python.exe tests\test_channel_graph.py     # 55  retention
 .venv\Scripts\python.exe tests\test_multi_window.py      # 31  end-to-end
 .venv\Scripts\python.exe tools\pair_map.py --selftest    # 29  pair derivation
 .venv\Scripts\python.exe correlate_kernel.py             # 25  kernel equivalence
@@ -77,9 +77,14 @@ Quad is now free to go.** Item 3 is the next thing to do.
    on period to 0.1-1.1 ps, 1 part in 1e8**, which validates `_pair_kernel` and `ChannelGraph` on
    real data. Retention provably lost nothing (see the Stage 3 block). Remaining hardware work is
    now scale and the dim-channel case, not correctness:
-   - **`mask_laser_8_dim.txt`** (locs 295-302 + 200, 250 at background only, ~20x contrast) — the
-     dim-channel coincidence-loss fix, bug 1 below, exercised on hardware for the first time. The
-     eight bright pairs must come back matching a `mask_laser_8` run.
+   - ~~**`mask_laser_8_dim.txt`**~~ **DONE 2026-08-26.** Run in `file` pair mode via
+     `.claude/masks/pairs_laser_8_dim.csv`, 12 pairs: the 8 bright diagonal, 200x200 and 250x250,
+     plus 298x200 and 298x250 — the last two give node-1 px 298 three partners, two of them sparse,
+     which is the exact shape of bug 1. **No loss on any of them:** live counts divided by offline
+     counts, over the node-1 release fraction, came out 0.9996 / 1.0022 / 1.0043 / 1.0052 — the dim
+     pairs as tight as the bright one. px 298 released 92.93 % of its events with three partners
+     versus 92.51 % with one, so the extra sparse partners cost it nothing. The four dim pairs are
+     correctly flat with no comb, and `excluded` in the saved meta is empty.
    - **`mask_laser_40.txt`** (locs 279-318) — the scale step. Record kernel s/batch and peak RSS.
    - **`mask_laser_80.txt`** (locs 240-319) — load only. **The laser band is just 35 px wide at 3x
      background, so no source on this bench can give 80 pairs of real comb**; the lower half of this

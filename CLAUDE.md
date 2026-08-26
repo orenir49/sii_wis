@@ -79,7 +79,7 @@ Minimal GUI that starts a command server thread on launch. Receives JSON command
 | `sender_backend.py` | Command server + lSPAD TCP client; contains `PIXMAP` (320-pixel array mapping); logs abnormal marker ids live (see below) |
 | `correlate.py` | `CorrelateWindow` (single-pair) live correlator, Numba JIT kernel; "Compute R…" button opens `tools/sii_calculator.py`. Also still defines `QuadCorrelateWindow` (2 pixels/node, 4 pairwise g²), which **`receiver.py` no longer instantiates** — the multi-pair window's grid mode subsumes it; pending deletion |
 | `correlate_multi.py` | `MultiCorrelateWindow` — up to ~320 pairs, one plot + pair selector. Widgets only; the logic lives in the three modules below |
-| `correlate_engine.py` | `ChannelGraph` — which events are safe to correlate and which must be kept. No Tk; 53 tests |
+| `correlate_engine.py` | `ChannelGraph` — which events are safe to correlate and which must be kept. No Tk; 55 tests |
 | `correlate_kernel.py` | `_pair_kernel` (`nogil`, bitwise identical to `_multistart_multistop`) + `PairPool`; `--selftest` |
 | `synthetic_source.py` | Pulsed-laser / Poisson generator — drives the whole path with no detector attached |
 | `tools/sii_calculator_backend.py` | Pure formulas: `<\|V\|^2>`, coherence time, bunching-excess `R`, required integration time |
@@ -123,13 +123,13 @@ Each key fans out to **every** subscriber. `merge_hooks()` (`receiver.py`) compo
 | module | owns | tested by |
 |---|---|---|
 | `tools/pair_map.py` | which pixels pair with which | `--selftest`, 29 checks |
-| `correlate_engine.py` | which events are safe to correlate | `tests/test_channel_graph.py`, 53 checks |
+| `correlate_engine.py` | which events are safe to correlate | `tests/test_channel_graph.py`, 55 checks |
 | `correlate_kernel.py` | the histogram | `--selftest`, 25 checks |
 | `correlate_multi.py` | widgets | `tests/test_multi_window.py`, 31 checks |
 
 Pair modes: **identity** (`p2 = p1`), **affine** (`p2 = round(((p1-160) - b)/a + 160)`, inverting `align_arc.py`'s fit — `align_arc.py --emit-pairs LO HI` calls the same helper so the two cannot disagree), **grid** (outer product — this is `QuadCorrelateWindow`'s 2×2 workflow at any size), and **file** (`pix1,pix2` CSV). Affine with `a ≠ 1` is *not* bijective, so a node-2 pixel can serve two pairs; channels are therefore keyed by **distinct pixel**, never by pair. **Enable stays disabled until Derive succeeds**, and Derive shows a preview table flagging shared channels, dropped out-of-range partners, and any pixel the mask file has switched off (a guaranteed permanent stall).
 
-Exclusion is a **relative** judgement — a channel is only costing coincidences while its partners are still delivering. When nothing at all has arrived for `stall_grace_s` the graph sets `stream_idle`, clears every exclusion and reports `idle — no data arriving`: a normal end of acquisition must not read as `LOSING COINCIDENCES` forever. Genuine exclusions are kept in `exclusion_history` (cleared on `start()`) so going idle cannot erase the audit trail, and that history — not the live flags — is what the saved `.npz` records, since saving usually happens after the stream has stopped.
+Exclusion is a **relative** judgement — a channel is only costing coincidences while its partners are still delivering. When nothing at all has arrived for `idle_after_s` (3 s, deliberately far shorter than the 30 s `stall_grace_s`: "is anything arriving" is answered by the next poll, while "has this channel given up" must be slow enough not to condemn a bursty pixel) the graph sets `stream_idle`, clears every exclusion and reports `idle — no data arriving`: a normal end of acquisition must not read as `LOSING COINCIDENCES` forever. Genuine exclusions are kept in `exclusion_history` (cleared on `start()`) so going idle cannot erase the audit trail, and that history — not the live flags — is what the saved `.npz` records, since saving usually happens after the stream has stopped.
 
 Retention (`ChannelGraph`) generalizes the two-pixel logic: a node-1 event is released only once **every** partner has been observed past `t1 + tmax`. The release point is a `last_ts` **watermark** — the newest timestamp ever seen — not `arr[-1]`, so a channel legitimately trimmed to size 0 no longer reads as silent. Genuinely silent partners are excluded only after `stall_grace_s` of wall clock or `stall_tolerance_ps` of detector-time lag, and every exclusion is reported: it means coincidences are being lost *now*, which the status line distinguishes from "waiting on node 2, N s behind (nothing lost)".
 

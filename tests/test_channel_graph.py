@@ -511,7 +511,18 @@ def test_acquisition_stopping_is_not_coincidence_loss():
         drv.step(feed, dt=0.5)
     check('nothing excluded while every channel is live', not drv.excluded_seen)
 
-    clock.advance(60.0)                  # 6x the grace, nothing fed
+    # Idle has its own threshold, far shorter than the 30 s stall grace: the
+    # question "is anything arriving at all" is answered by the next poll, and
+    # waiting the full grace left the bench staring at a stale line for 30 s
+    # after every stop. One poll's worth of silence must NOT trip it, though.
+    clock.advance(1.0)
+    drv.step(None, dt=0.0)
+    check('a one-second lull is not idle', not g.stream_idle)
+    clock.advance(4.0)
+    drv.step(None, dt=0.0)
+    check('a few seconds of array-wide silence is', g.stream_idle)
+
+    clock.advance(60.0)                  # 2x the grace, nothing fed
     rel = drv.step(None, dt=0.0)
     check('acquisition stopping excludes nothing', rel.excluded == [],
           str(rel.excluded))

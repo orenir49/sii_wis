@@ -79,6 +79,15 @@ PS_PER_S = 1_000_000_000_000
 
 DEFAULT_STALL_GRACE_S = 30.0        # wall clock with no chunk at all
 DEFAULT_STALL_TOL_PS = 5 * PS_PER_S  # detector-time lag behind the leader
+# Array-wide silence that means the run has ended. Deliberately much shorter
+# than the stall grace: that one asks "has THIS channel given up", which needs
+# to be slow so a bursty pixel is not condemned, while this asks "is anything
+# arriving at all", which is answered by the next poll. The sender flushes every
+# 0.2 s against a poll of ~1.5 s, so a couple of seconds of total silence at any
+# working count rate means the stream stopped. Note a soft stop keeps streaming
+# the buffered backlog, so the stop CLICK is not the end of acquisition -- the
+# stream going quiet is, which is what this measures.
+DEFAULT_IDLE_AFTER_S = 3.0
 
 
 class Channel:
@@ -229,12 +238,14 @@ class ChannelGraph:
     def __init__(self, pair_list, tmax_ps: float, offset: int = 0,
                  stall_grace_s: float = DEFAULT_STALL_GRACE_S,
                  stall_tolerance_ps: float = DEFAULT_STALL_TOL_PS,
+                 idle_after_s: float = DEFAULT_IDLE_AFTER_S,
                  check_monotonic: bool = False,
                  clock=time.monotonic) -> None:
         self.tmax = float(tmax_ps)
         self.offset = int(offset)
         self.stall_grace_s = float(stall_grace_s)
         self.stall_tolerance_ps = float(stall_tolerance_ps)
+        self.idle_after_s = float(idle_after_s)
         self.clock = clock
 
         self.pairs = [(p.p1, p.p2) for p in pair_list.pairs]
@@ -322,7 +333,7 @@ class ChannelGraph:
         # nothing is arriving. Genuine exclusions stay in exclusion_history.
         arrivals = [c.last_arrival for c in self.channels if c.last_arrival is not None]
         newest = max(arrivals) if arrivals else None
-        self.stream_idle = newest is not None and (now - newest) > self.stall_grace_s
+        self.stream_idle = newest is not None and (now - newest) > self.idle_after_s
         if self.stream_idle:
             for c in self.channels:
                 c.excluded = False
