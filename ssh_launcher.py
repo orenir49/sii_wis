@@ -102,19 +102,56 @@ def find_sii_wis(client: paramiko.SSHClient, username: str) -> str | None:
 
 
 def start_detached(client: paramiko.SSHClient,
-                   exe: str, args: str, workdir: str) -> None:
+                   exe: str, args: str, workdir: str,
+                   env: dict | None = None) -> None:
     """
     Launch a detached process on the remote host via WMI Win32_Process.Create.
     The spawned process is owned by the WMI service — fully independent of the
     SSH session and survives after this connection closes.
+
+    `env` sets environment variables for the child. It cannot be done by
+    exporting them over SSH: a Win32_Process.Create child inherits the WMI
+    SERVICE's environment, not this session's, so an `$env:X = ...` here is
+    simply invisible to it. Rather than nest quotes inside the WMI command line
+    (three levels deep, and one stray quote silently launches the wrong thing),
+    a small .cmd is uploaded next to the target and Create runs that. Nothing
+    persists on the machine beyond that file, unlike a Machine-scope variable.
     """
+    if env:
+        lines = ['@echo off']
+        for k, v in env.items():
+            lines.append(f'set "{k}={v}"')
+        lines.append(f'start "" /b "{exe}" {args}')
+        cmd_path = workdir + chr(92) + '_launch_env.cmd'
+        crlf = chr(13) + chr(10)
+        upload_file(client, cmd_path,
+                    (crlf.join(lines) + crlf).encode('ascii'))
+        target = f'cmd.exe /c "{cmd_path}"'
+    else:
+        target = f'{exe} {args}'
     script = (
-        f"$r = ([wmiclass]'Win32_Process').Create('{exe} {args}', '{workdir}'); "
+        f"$r = ([wmiclass]'Win32_Process').Create('{target}', '{workdir}'); "
         f"if ($r.ReturnValue -ne 0) {{ throw 'Win32_Process.Create failed: return value ' + $r.ReturnValue }}"
     )
     _, err = run_ps(client, script)
     if err:
         raise RuntimeError(f'start_detached: {err}')
+
+
+def download_file(client: paramiko.SSHClient, remote_path: str,
+                  local_path: str) -> int:
+    """Fetch `remote_path` to `local_path` via SFTP. Returns bytes written.
+
+    The counterpart to upload_file, for pulling a raw capture back to the
+    master after a run.
+    """
+    os.makedirs(os.path.dirname(os.path.abspath(local_path)), exist_ok=True)
+    sftp = client.open_sftp()
+    try:
+        sftp.get(remote_path, local_path)
+    finally:
+        sftp.close()
+    return os.path.getsize(local_path)
 
 
 def start_interactive(client: paramiko.SSHClient, exe: str, args: str,
@@ -354,12 +391,19 @@ def kill_sender(client: paramiko.SSHClient) -> str:
 def launch_node(host: str, username: str,
                 mask_filename: str, log_fn,
                 lspad_port: int = SPAD_PORT,
-                mask_pixel: int | None = None) -> float:
+                mask_pixel: int | None = None,
+                raw_dump: str | None = None) -> float:
     """
     Full launch sequence for one sender node.
     log_fn receives plain text lines (already newline-terminated).
     `mask_pixel` (a physical sensor location, not a pix ID) generates a
     single-pixel mask and takes priority over `mask_filename`.
+    `raw_dump`, if given, enables sender_backend's verbatim lSPAD capture
+    (SII_WIS_RAW_DUMP) — the Stage 2a replay oracle. It has to be set in the
+    sender's own environment at launch, which is why start_detached takes an env
+    at all. Prefer a RELATIVE path (spad_data then the filename): it resolves
+    against this node's own repo, whereas an absolute path from the master would
+    name a home directory that does not exist under the other node's username.
     Returns the dwell clock frequency (Hz) from the R command.
     Raises RuntimeError on fatal errors.
     """
@@ -450,7 +494,18 @@ def launch_node(host: str, username: str,
             log_fn(f'Killed stale sender.py (pid {killed.replace(chr(10), ", ")}).\n')
         pythonw = sii_dir + r'\.venv\Scripts\pythonw.exe'
         sender  = sii_dir + r'\sender.py'
-        start_detached(client, pythonw, sender, sii_dir)
+        env = None
+        if raw_dump:
+            # A relative path is resolved against THIS node's repo. The two
+            # nodes run under different usernames, so an absolute path from the
+            # master would point at a home directory that does not exist here.
+            if not os.path.splitdrive(raw_dump)[0]:
+                raw_dump = sii_dir + chr(92) + raw_dump.lstrip(chr(92) + '/')
+            env = {'SII_WIS_RAW_DUMP': raw_dump}
+            run_ps(client, f"New-Item -ItemType Directory -Force "
+                           f"'{os.path.dirname(raw_dump)}' | Out-Null")
+            log_fn(f'RAW CAPTURE enabled -> {raw_dump}\n')
+        start_detached(client, pythonw, sender, sii_dir, env=env)
         log_fn('sender.py launched.\n')
 
         return dwell_freq

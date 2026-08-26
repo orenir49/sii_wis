@@ -607,9 +607,17 @@ class NodePanel:
                         else f'[N{self.node_id}] {msg}\n')
 
         try:
+            # SII_WIS_RAW_DUMP on the MASTER means "capture on the nodes":
+            # the sender's dump has to be enabled in its own environment at
+            # launch, and there is no other moment to do it. One variable here
+            # beats a UI field nobody would remember to clear.
+            raw_dump = os.environ.get('SII_WIS_RAW_DUMP')
+            if raw_dump:
+                stem, ext = os.path.splitext(raw_dump)
+                raw_dump = f'{stem}_node{self.node_id}{ext or ".raw"}'
             self._dwell_freq = ssh_launcher.launch_node(
                 host=host, username=username,
-                mask_pixel=mask_pixel,
+                mask_pixel=mask_pixel, raw_dump=raw_dump,
                 mask_filename=mask, log_fn=_log)
             time.sleep(3)           # give sender.py command server time to start
             self._gui(self._connect)
