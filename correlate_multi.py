@@ -44,6 +44,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tools'))
 
 import pair_map
+from scipy.stats import poisson
+
 from correlate import _mark_peak_bin, _prewarm, pick_unit
 from correlate_engine import PS_PER_S, ChannelGraph
 from correlate_kernel import PairPool, bin_edges, prewarm, suggest_n_shift, tau_coverage_ps
@@ -239,15 +241,35 @@ class MultiCorrelateWindow(tk.Toplevel):
         ttk.Button(cfg, text='Compute R…', width=12,
                    command=self._open_r_calculator).grid(row=2, column=5, sticky='w')
 
+        # View selector rather than a second axes. The SNR-vs-pair panel was
+        # removed for taking space on every run to answer an occasional
+        # question; a permanent distribution panel would repeat that.
+        ttk.Label(cfg, text='View:').grid(row=3, column=0, padx=6, pady=4, sticky='w')
+        vf = ttk.Frame(cfg)
+        vf.grid(row=3, column=1, columnspan=3, sticky='w')
+        self.view_var = tk.StringVar(value='g2')
+        ttk.Radiobutton(vf, text='g² histogram', variable=self.view_var,
+                        value='g2').pack(side='left', padx=(0, 12))
+        ttk.Radiobutton(vf, text='Count distribution', variable=self.view_var,
+                        value='distribution').pack(side='left')
+        self.view_var.trace_add('write', self._on_display_change)
+
+        ttk.Label(cfg, text='Expected rate (R):').grid(row=3, column=4,
+                                                      padx=(16, 6), sticky='w')
+        self.expected_var = tk.StringVar(value='')
+        ttk.Entry(cfg, textvariable=self.expected_var, width=10).grid(
+            row=3, column=5, sticky='w')
+        self.expected_var.trace_add('write', self._on_display_change)
+
         self.cover_var = tk.StringVar(value='')
         ttk.Label(cfg, textvariable=self.cover_var, anchor='w',
-                  foreground='#555555').grid(row=3, column=0, columnspan=6,
+                  foreground='#555555').grid(row=4, column=0, columnspan=6,
                                              sticky='w', padx=6)
         for v in (self.bw_var, self.tmax_var, self.nshift_var):
             v.trace_add('write', lambda *_: self._update_coverage())
 
         btn = ttk.Frame(cfg)
-        btn.grid(row=4, column=0, columnspan=6, padx=6, pady=(2, 6), sticky='w')
+        btn.grid(row=5, column=0, columnspan=6, padx=6, pady=(2, 6), sticky='w')
         self.enable_btn = ttk.Button(btn, text='Enable', width=8,
                                      command=self._enable, state='disabled')
         self.enable_btn.grid(row=0, column=0, padx=3)
@@ -535,7 +557,7 @@ class MultiCorrelateWindow(tk.Toplevel):
 
     def _open_r_calculator(self) -> None:
         SIICalculatorWindow(self, initial_td_ps=self.bw_var.get(),
-                            on_apply=lambda r: None)
+                            on_apply=lambda r: self.expected_var.set(r))
 
     # ------------------------------------------------------------------
     # Enable / disable / reset
@@ -806,6 +828,65 @@ class MultiCorrelateWindow(tk.Toplevel):
         s = c.std()
         return (c.max() - c.mean()) / s if s > 0 else np.nan
 
+    def _draw_distribution(self, hist) -> None:
+        """Counts-per-bin against a Poisson of the same mean, with a local AND a
+        Lee-corrected p-value. Ported from CorrelateWindow (Stage 4) unchanged.
+
+        The Lee correction is the reason this view exists. A g2 histogram is
+        thousands of bins, so the tallest bin is a multiple-comparisons result:
+        `p_local` is the chance of THAT bin alone exceeding its value, while
+        `p_lee` is the chance of ANY of the N searched bins doing so. Quoting the
+        local number for a peak found by scanning overstates it by orders of
+        magnitude, and nothing else in the codebase makes the correction.
+        """
+        counts   = hist.astype(float)
+        mean     = counts.mean()
+        std      = counts.std()
+        pois     = poisson(mean)
+        p_local  = pois.sf(counts.max())
+        N_trials = len(counts)
+        # NOT 1 - (1 - p)**N, which is how CorrelateWindow computed it and which
+        # underflows to exactly 0 for any p below ~1e-16: (1 - p) rounds to 1.0,
+        # 1.0**N is 1.0, and a genuinely significant peak is then reported as
+        # INFINITELY significant -- wrong in the flattering direction, and only
+        # on the peaks worth caring about. log1p/expm1 stay exact down the tail,
+        # where the answer tends to N * p_local.
+        p_lee    = -np.expm1(N_trials * np.log1p(-p_local))
+
+        self.ax.hist(counts, bins=50, density=True, alpha=0.6,
+                     color='steelblue', edgecolor='black')
+        self.ax.set_xlabel('counts per bin')
+        self.ax.set_ylabel('Probability density')
+
+        self.ax.axvline(mean, color='k', linestyle='solid', linewidth=1,
+                        label=f'Mean = {mean:.1f}')
+        self.ax.axvline(mean + std, color='k', linestyle='dashed', linewidth=1,
+                        label=f'±1σ = {std:.1f}')
+        self.ax.axvline(mean - std, color='k', linestyle='dashed', linewidth=1)
+
+        x = np.arange(max(0, int(mean - 4 * std)), int(mean + 4 * std) + 1)
+        self.ax.plot(x, pois.pmf(x), 'r-', linewidth=1.5, label='Poisson PMF')
+
+        expected_str = self.expected_var.get().strip()
+        if expected_str:
+            try:
+                R  = float(expected_str)
+                Nc = mean * R
+                self.ax.axvline(Nc, color='red', linestyle='dashed', linewidth=1,
+                                label=f'Nc = {Nc:.1f}  (mean×{R})')
+            except ValueError:
+                pass
+
+        self.ax.text(
+            0.97, 0.97,
+            f'Mean: {mean:.2f}\nStd: {std:.2f}\n'
+            f'P (local): {p_local:.2e}\nP (LEE, N={N_trials:,}): {p_lee:.2e}',
+            transform=self.ax.transAxes, fontsize=9,
+            verticalalignment='top', horizontalalignment='right',
+            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8),
+        )
+        self.ax.legend(loc='upper left', fontsize=8)
+
     def _redraw(self) -> None:
         if self._bins is None:
             return
@@ -819,9 +900,15 @@ class MultiCorrelateWindow(tk.Toplevel):
         key = self._selected_key()
         hist = self._hist.get(key)
 
+        dist = self.view_var.get() == 'distribution'
         self.ax.clear()
         if hist is None:
-            self.ax.set_title('g² — selected pair has no data yet')
+            self.ax.set_title('selected pair has no data yet')
+        elif dist:
+            n1, n2 = self._counts.get(key, (0, 0))
+            self.ax.set_title(f'Count distribution — pixel {key[0]} × {key[1]}   '
+                              f'({n1:,} × {n2:,} events)')
+            self._draw_distribution(hist)
         else:
             self.ax.step(centers / scale, hist.astype(float), where='mid',
                          color='steelblue', linewidth=1)
@@ -829,8 +916,8 @@ class MultiCorrelateWindow(tk.Toplevel):
             self.ax.set_title(f'g² — pixel {key[0]} × {key[1]}   '
                               f'({n1:,} × {n2:,} events)')
             _mark_peak_bin(self.ax, centers, hist, scale)
-        self.ax.set_xlabel(f'τ ({unit})')
-        self.ax.set_ylabel('Counts')
+            self.ax.set_xlabel(f'τ ({unit})')
+            self.ax.set_ylabel('Counts')
         self.canvas.draw_idle()
 
         if key is not None:

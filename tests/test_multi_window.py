@@ -374,6 +374,81 @@ def test_file_mode_still_flags_masked_off_pairs():
         root.destroy()
 
 
+def test_count_distribution_view():
+    """Stage 4 port: the count-distribution view moved here from CorrelateWindow.
+
+    Checks the statistics, not just that something renders. The Lee correction is
+    the reason the view exists -- a g2 histogram is thousands of bins, so the
+    tallest bin is a multiple-comparisons result and the local p-value overstates
+    it. If p_lee ever equals p_local the view is worthless while still looking
+    fine, so that inequality is the assertion that matters.
+    """
+    from scipy.stats import poisson
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        w, tmp = masked_window(root, range(150, 152), range(150, 152))
+        w._show_preview = lambda *a, **k: None
+        w.mode_var.set('identity')
+        w._derive()
+
+        # A flat Poisson-ish histogram with one planted spike.
+        rng = np.random.default_rng(11)
+        h = rng.poisson(20.0, 4000).astype(np.int64)
+        h[1234] = 90
+        w._bins = np.arange(len(h) + 1, dtype=float)
+        w._hist[(150, 150)] = h
+        w._counts[(150, 150)] = (1000, 1000)
+        w.pair_var.set('150 × 150')
+
+        w.view_var.set('distribution')
+        w._redraw()
+        check('the distribution view renders and titles itself',
+              'Count distribution' in w.ax.get_title(), w.ax.get_title())
+        check('x axis is counts per bin, not tau',
+              w.ax.get_xlabel() == 'counts per bin', w.ax.get_xlabel())
+
+        # Recompute the statistics independently and compare to the annotation.
+        c = h.astype(float)
+        p_local = poisson(c.mean()).sf(c.max())
+        # log1p/expm1, not 1 - (1 - p)**N: the naive form underflows to 0 below
+        # p ~ 1e-16 and reports a significant peak as infinitely significant.
+        p_lee = -np.expm1(len(c) * np.log1p(-p_local))
+        texts = [t.get_text() for t in w.ax.texts]
+        box = next((t for t in texts if 'P (local)' in t), '')
+        check('the box reports both p-values and the number of bins searched',
+              f'{p_local:.2e}' in box and f'{p_lee:.2e}' in box
+              and f'N={len(c):,}' in box, repr(box))
+        check(f'the Lee correction is strictly larger (local {p_local:.2e} -> '
+              f'LEE {p_lee:.2e})', p_lee > p_local)
+        check('and does not underflow to zero on a significant peak',
+              p_lee > 0.0 and 1.0 - (1.0 - p_local) ** len(c) == 0.0,
+              f'naive form gives {1.0 - (1.0 - p_local) ** len(c)}')
+
+        # The R field: Compute R had nowhere to put its answer before this.
+        w.expected_var.set('1.5')
+        w._redraw()
+        labels = [t.get_text() for t in w.ax.get_legend().get_texts()]
+        check('an expected R draws the Nc = mean x R line',
+              any('Nc =' in t for t in labels), str(labels))
+        w.expected_var.set('not a number')
+        w._redraw()
+        check('a non-numeric R is ignored rather than raising',
+              not any('Nc =' in t for t in
+                      [t.get_text() for t in w.ax.get_legend().get_texts()]))
+
+        # And back: the view must be a toggle, not a one-way door.
+        w.expected_var.set('')
+        w.view_var.set('g2')
+        w._redraw()
+        check('switching back gives the g² view with its tau axis',
+              w.ax.get_xlabel().startswith('τ') and 'g²' in w.ax.get_title(),
+              f'{w.ax.get_xlabel()!r} / {w.ax.get_title()!r}')
+        shutil.rmtree(tmp, ignore_errors=True)
+    finally:
+        root.destroy()
+
+
 def test_only_the_relevant_input_widget_is_shown():
     root = tk.Tk()
     root.withdraw()

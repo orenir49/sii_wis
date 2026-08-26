@@ -1073,9 +1073,24 @@ Two ways, and the choice should be deliberate:
   `correlate_kernel.py`'s docstring reference. One correlator, one module. **Preferred** — the whole
   point of the stage is that there is no second correlator to share with.
 
-### Port first: the count-distribution view
+### Port first: the count-distribution view — DONE 2026-08-26
 
-**Decided 2026-08-26 — port it, do not drop it.** `correlate.py:_draw_distribution` is the one thing
+Landed in `correlate_multi.py` as a **view radio** (`g²` / `Count distribution`) on the selected
+pair, plus the `Expected rate (R)` entry it needs — which also gives the **Compute R…** button
+somewhere to put its answer for the first time (it was wired to `on_apply=lambda r: None`).
+`tests/test_multi_window.py` gained 8 checks, 45 -> 53.
+
+**The port found a real bug in the original, which the tests were written to catch.**
+`CorrelateWindow` computed the Lee correction as `1 - (1 - p_local)**N_trials`. Below
+`p_local ~ 1e-16`, `1 - p_local` rounds to exactly `1.0` in float64, `1.0**N` is `1.0`, and the
+corrected p-value comes out **exactly 0** — so a genuinely significant peak was reported as
+*infinitely* significant. Wrong in the flattering direction, and only on the peaks worth caring
+about. On the test histogram: `p_local = 3.9e-31` gave `p_lee = 0`, where the correct value is
+`1.6e-27`. Now `-expm1(N * log1p(-p_local))`, which stays exact down the tail (tending to
+`N * p_local`), with a check asserting both that the fixed form is non-zero and that the naive form
+would have underflowed.
+
+Original decision, kept for the record: **port it, do not drop it.** `correlate.py:_draw_distribution` is the one thing
 the single-pair window does that the multi-pair window cannot, and it exists nowhere else in the
 codebase. It must move BEFORE `CorrelateWindow` is deleted, or the capability is gone with it.
 
