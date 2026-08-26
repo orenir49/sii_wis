@@ -38,6 +38,7 @@ change**; the whole suite takes ~2 minutes, most of it numba compiling.
 .venv\Scripts\python.exe tests\test_multi_window.py      # 45  end-to-end
 .venv\Scripts\python.exe tools\pair_map.py --selftest    # 44  pair derivation
 .venv\Scripts\python.exe tools\raw_dump.py --selftest    # 12  raw-capture format
+.venv\Scripts\python.exe run_log.py                     # 16  per-run log capture
 .venv\Scripts\python.exe correlate_kernel.py             # 25  kernel equivalence
 .venv\Scripts\python.exe synthetic_source.py             #  8  generator + comb
 ```

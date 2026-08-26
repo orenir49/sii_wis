@@ -42,6 +42,7 @@ python tools\raw_dump.py --info spad_data\capture.raw
 
 # Test suite (plain asserts; no pytest in requirements.txt)
 .venv\Scripts\python.exe tests\test_epoch_fix.py
+.venv\Scripts\python.exe run_log.py
 .venv\Scripts\python.exe tests\test_hook_fanout.py
 .venv\Scripts\python.exe tests\test_channel_graph.py
 .venv\Scripts\python.exe tests\test_multi_window.py
