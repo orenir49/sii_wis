@@ -8,14 +8,18 @@
 
 ## STATUS — 2026-08-26
 
-**Branch `feat/multipair-correlation`, pushed to `origin`. `main` is untouched.**
+**MERGED. `main` is `f6ca861`**, 44 commits past the `v1-single-pair` tag, and both sender nodes are
+back on `main` at that commit — clean, verified as carrying the merged code with `correlate.py`
+absent. The whole plan is delivered except Stage 2, which stays deferred on merit.
 
-**Both sender nodes were checked out onto this branch on 2026-08-26** (`git checkout main` reverts
-them). That was needed because the launcher's `git pull` only ever pulls the checked-out branch, so
-sender-side work on a feature branch simply never reaches the nodes — two capture runs produced
-nothing before this was spotted. It also means `main` is no longer the code the hardware is running,
-so it is a *fallback on paper* until either the nodes go back or this branch merges — which is what
-Stage 5 resolves.
+The 1v1 fallback is the annotated tag **`v1-single-pair`** (`759288c`), pushed and visible on both
+nodes. It is the only route back to a single-pair correlator GUI: nothing after `f4c4413` has one.
+
+Lesson kept from the branch phase: the launcher's `git pull` only ever pulls the **checked-out**
+branch, so sender-side work on a feature branch never reaches the nodes. Two capture runs produced
+nothing before that was spotted, and the fix was to check the nodes out onto the branch. Now that the
+work is on `main` the problem is gone, but it will recur for the next feature branch that touches
+`sender_backend.py`.
 
 | stage | state |
 |---|---|
@@ -24,7 +28,7 @@ Stage 5 resolves.
 | **2** sender throughput | **DEFERRED, and now PROVABLE** — Phase 0 complete 2026-08-26: real captures taken from both nodes and `tools/replay.py` reproduces each acquisition byte-for-byte across all 326 files, `epoch_fixes` included. Still deferred on merit: 2.97 M rec/s runs clean at 40 pixels against the ~80 M/s that would make 2a bind |
 | **3** multi-pair correlator | **COMPLETE** 2026-08-26 — validated on hardware from 8 to 40 pairs, 10 and 40 MHz, up to 15 min, comb on every pair in every run; 80 pairs covered synthetically; `QuadCorrelateWindow` deleted |
 | **4** retire the single-pair correlator | **COMPLETE** 2026-08-26 — distribution view ported (and its Lee correction fixed), synthetic GUI surface out, `CorrelateWindow` and `correlate.py` deleted. `MultiCorrelateWindow` is the only correlator |
-| **5** tag the 1v1 fallback, then merge to `main` | **NOT STARTED** — do it in that order; see Stage 5 |
+| **5** tag the 1v1 fallback, then merge to `main` | **COMPLETE** 2026-08-26 — `v1-single-pair` tagged and pushed, 43 commits merged `--no-ff` into `main` (`f6ca861`), suite green on `main`, both nodes moved back |
 
 ```
 ed842df  Stage 3: multi-pair live correlator with a synthetic pulsed-laser source
@@ -143,10 +147,11 @@ comparison, and the sender's O(chunk x N_active_pixels) bucketing loop is what w
 
 ## RESUME HERE — next session
 
-In priority order. **Items 1-3 are done as of 2026-08-26** — the hardware gate is cleared, the
-write-to-disk flag is complete, and Quad is deleted. **Nothing left on this plan needs bench time.**
-Item 4 (retire the last duplicate correlator) is next, then item 5 tags the 1v1 fallback and merges
-this branch into `main`. Item 6 (Stage 2) stays deferred on merit.
+**Items 1-5 are done as of 2026-08-26.** The multi-pair correlator is validated on hardware, the
+write-to-disk flag is complete, both older correlators are deleted, and the work is merged to `main`
+with the 1v1 fallback tagged. **Only item 6 (Stage 2) remains, and it stays deferred on merit** — the
+sender sustains 2.97 M rec/s at 40 pixels against the ~80 M/s that would make it bind, and it is now
+provable rather than arguable whenever it is wanted.
 
 1. ~~**Validate on hardware with the pulsed laser.**~~ **DONE 2026-08-26 — the gating item is
    cleared.** 8 identity pairs (locs 295-302, `.claude/masks/mask_laser_8.txt`), laser at 10 MHz,
@@ -202,10 +207,9 @@ this branch into `main`. Item 6 (Stage 2) stays deferred on merit.
    or an independent duplicate. `BACKLOG_WARN_S` and `SIICalculatorWindow` needed no move at all:
    `correlate_multi.py` already had its own copy of the first and imported the second straight from
    `tools/sii_calculator.py`.
-5. **Stage 5 — tag the 1v1 fallback, then merge this branch into `main`.** In that order, and only
-   after Stage 4. See the Stage 5 section: after Stage 4 there is no single-pair window left anywhere
-   on this branch, so the tag is the only route back to one.
-6. **Stage 2**, when pair count x rate actually demands it. Start with its Phase 0 scaffolding (the
+5. ~~**Stage 5 — tag the 1v1 fallback, then merge into `main`.**~~ **DONE 2026-08-26.** Tag first,
+   then the merge, then the nodes — the order held. See the Stage 5 section for what was verified.
+6. **Stage 2**, when pair count x rate actually demands it. **The only thing left on this plan.** Start with its Phase 0 scaffolding (the
    env-gated raw-stream dump), which needs detector time and therefore wants to be captured during a
    bench session you are already having.
 
@@ -1204,6 +1208,29 @@ digging through the reflog for a commit nobody wrote down.
 4. **Re-run the full suite** on `main` after the merge, and re-take one short acquisition. The merge
    itself cannot break anything the branch did not already break, but the *nodes changing branch* is
    the part that has bitten twice.
+
+### Done 2026-08-26 — what actually happened
+
+| step | result |
+|---|---|
+| tag | `v1-single-pair` annotated on `759288c`, pushed, visible on both nodes |
+| merge | `--no-ff` into `main` -> `f6ca861`, 43 commits, no conflicts |
+| suite on `main` | 298 checks pass; `correlate.py` absent; every module imports |
+| nodes | both on `main` at `f6ca861`, `dirty=0`, merged code and dump code confirmed present |
+
+Two things worth keeping:
+
+- **A pre-merge smoke run was added to the sequence and was worth it.** Stage 4 had reshaped the
+  window (correlator deleted, synthetic source removed, view radio added, layout moved) and only
+  headless tests had seen it — and headless tests are exactly what missed the grid collision that
+  made the buttons unclickable. One 60 s run on the branch confirmed 4 pairs, 10 teeth each, period
+  100.0003 ns / sd 1.3 ps, `synthetic` absent from the meta. Fixing that on the branch beat fixing it
+  on `main` with the nodes already switched over.
+- **`_launch_env.cmd` had to be cleared from both nodes' repo roots** before they would pull. It was
+  left by the first version of `start_detached(env=...)`, which wrote into the repo; untracked, it
+  made `ensure_repo_clean()` refuse. Already fixed at source (`2778e8d` writes to the lSPAD dir), but
+  the strays outlived the fix — worth remembering that a launcher artifact inside the repo breaks the
+  launcher.
 
 ### What the tag is worth
 
