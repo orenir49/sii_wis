@@ -249,6 +249,12 @@ class ChannelGraph:
 
         self.accumulating = False
         self._t_start = None
+        # True when nothing at all has arrived for stall_grace_s. Exclusion is a
+        # RELATIVE judgement, so this gates it -- see _refresh_exclusions.
+        self.stream_idle = False
+        # Exclusions that happened while the stream was live, kept so going idle
+        # cannot erase the audit trail: {(node, pixel): reason}.
+        self.exclusion_history: dict = {}
 
     # -- wiring ------------------------------------------------------------
 
@@ -282,6 +288,8 @@ class ChannelGraph:
             c.reset()
         self.accumulating = True
         self._t_start = self.clock()
+        self.stream_idle = False
+        self.exclusion_history.clear()
 
     def stop(self) -> None:
         self.accumulating = False
@@ -305,6 +313,22 @@ class ChannelGraph:
         """
         leader = self._leader_ts()
         since_start = (now - self._t_start) if self._t_start is not None else 0.0
+
+        # "This channel is losing us coincidences" only means anything while its
+        # partners are still delivering. Once the whole array has gone quiet the
+        # acquisition has simply ended (or the link is down) -- excluding every
+        # channel then turns a normal stop into a permanent red alarm that never
+        # clears, which is what it used to do. Nothing is being lost because
+        # nothing is arriving. Genuine exclusions stay in exclusion_history.
+        arrivals = [c.last_arrival for c in self.channels if c.last_arrival is not None]
+        newest = max(arrivals) if arrivals else None
+        self.stream_idle = newest is not None and (now - newest) > self.stall_grace_s
+        if self.stream_idle:
+            for c in self.channels:
+                c.excluded = False
+                c.exclude_reason = ''
+            return []
+
         out = []
         for c in self.channels:
             reason = ''
@@ -326,6 +350,7 @@ class ChannelGraph:
             c.exclude_reason = reason
             if reason:
                 out.append((c.node, c.pixel, reason))
+                self.exclusion_history[(c.node, c.pixel)] = reason
             elif was:
                 # Recovered -- worth not leaving a stale red line in the UI.
                 pass
@@ -495,7 +520,13 @@ class ChannelGraph:
         return out
 
     def status(self) -> str:
-        """One line for the UI. Says which of the three states we are in."""
+        """One line for the UI. Says which of the four states we are in."""
+        if self.stream_idle:
+            buf = self.nbytes
+            past = (f'; {len(self.exclusion_history)} channel(s) were excluded '
+                    f'during the run' if self.exclusion_history else '')
+            return (f'idle — no data arriving, {len(self.pairs)} pairs, '
+                    f'{buf / 1e6:.1f} MB held{past}')
         exc = [c for c in self.channels if c.excluded]
         if exc:
             names = ', '.join(f'n{c.node}px{c.pixel}' for c in exc[:4])

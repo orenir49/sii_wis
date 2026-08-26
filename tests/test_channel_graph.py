@@ -461,8 +461,9 @@ def test_masked_off_pixel_stalls_then_is_excluded():
                (2, 150): poisson_stream(rng, 1e6, 0.002),
                (1, 151): poisson_stream(rng, 1e6, 0.002)}
     # (2, 151) is masked off: never fed.
-    for feed in _interleaved_feed(streams, 12):
-        drv.step(feed, dt=0.5)
+    feeds = list(_interleaved_feed(streams, 12))
+    for feed in feeds[:6]:
+        drv.step(feed, dt=0.5)          # 3 s -- well inside the 30 s grace
 
     bytes_at_grace = g.ch1[151].nbytes
     check('masked pair accumulates nothing before the grace expires',
@@ -470,7 +471,12 @@ def test_masked_off_pixel_stalls_then_is_excluded():
           f'{len(drv.taus[(151, 151)])} taus, {bytes_at_grace} B held')
     check('no exclusion reported inside the grace period', not drv.excluded_seen)
 
-    clock.advance(40.0)                 # past stall_grace_s
+    # Push past the grace with the other three channels STILL DELIVERING. That
+    # matters: exclusion is a relative judgement, so starving every channel to
+    # make the clock run out would instead look like the run ending, and the
+    # stream-idle gate would (correctly) exclude nothing.
+    for feed in feeds[6:]:
+        drv.step(feed, dt=5.0)          # 30 more s, array live throughout
     rel = drv.step(None, dt=0.0)
     excluded = [(n, p) for n, p, _ in rel.excluded]
     check('masked pixel is excluded once the grace expires',
@@ -489,6 +495,69 @@ def test_masked_off_pixel_stalls_then_is_excluded():
           sorted(drv.taus[(150, 150)]) == want)
 
 
+def test_acquisition_stopping_is_not_coincidence_loss():
+    """When the whole array goes quiet the run has ended -- that must not read
+    as "LOSING COINCIDENCES". Exclusion is a relative judgement: it only means
+    something while a channel's partners are still delivering. Before this gate
+    every channel got excluded a grace period after the last START and the
+    status line stayed red forever, which is what the bench actually saw."""
+    rng = np.random.default_rng(41)
+    clock = FakeClock()
+    pl, g, clock, drv = build('identity', lo=150, hi=152, clock=clock,
+                              stall_grace_s=10.0)
+    streams = {(n, p): poisson_stream(rng, 1e6, 0.002)
+               for n in (1, 2) for p in (150, 151, 152)}
+    for feed in _interleaved_feed(streams, 8):
+        drv.step(feed, dt=0.5)
+    check('nothing excluded while every channel is live', not drv.excluded_seen)
+
+    clock.advance(60.0)                  # 6x the grace, nothing fed
+    rel = drv.step(None, dt=0.0)
+    check('acquisition stopping excludes nothing', rel.excluded == [],
+          str(rel.excluded))
+    check('the graph reports itself idle', g.stream_idle)
+    check('status says idle, not LOSING COINCIDENCES',
+          'idle' in g.status() and 'LOSING' not in g.status(), g.status())
+    check('no channel is left flagged excluded',
+          not any(c.excluded for c in g.channels))
+
+    clock.advance(60.0)
+    check('and it stays that way -- the alarm never reappears',
+          'LOSING' not in g.status(), g.status())
+
+
+def test_exclusion_history_survives_going_idle():
+    """A channel that genuinely stalled mid-run must stay on the record after
+    the stream stops, or the .npz saved afterwards would claim a clean run."""
+    rng = np.random.default_rng(42)
+    clock = FakeClock()
+    pl, g, clock, drv = build('identity', lo=150, hi=151, clock=clock,
+                              stall_grace_s=10.0)
+    live = {(1, 150): poisson_stream(rng, 1e6, 0.002),
+            (2, 150): poisson_stream(rng, 1e6, 0.002),
+            (1, 151): poisson_stream(rng, 1e6, 0.002)}
+    # (2, 151) never delivers -- a real stall while the rest of the array runs.
+    for feed in _interleaved_feed(live, 30):
+        drv.step(feed, dt=0.5)
+    check('the genuine stall was excluded while the array was live',
+          (2, 151) in g.exclusion_history, str(g.exclusion_history))
+    check('and reported loudly at the time', 'LOSING COINCIDENCES' in g.status(),
+          g.status())
+
+    clock.advance(60.0)                  # acquisition stops
+    drv.step(None, dt=0.0)
+    check('going idle clears the live flag', not any(c.excluded for c in g.channels))
+    check('but the history keeps the genuine exclusion',
+          (2, 151) in g.exclusion_history, str(g.exclusion_history))
+    check('and the idle line still says it happened',
+          'idle' in g.status() and 'excluded during the run' in g.status(),
+          g.status())
+
+    g.start()
+    check('a fresh start wipes the history', g.exclusion_history == {}
+          and not g.stream_idle)
+
+
 def test_channel_that_stops_mid_run():
     rng = np.random.default_rng(17)
     clock = FakeClock()
@@ -496,12 +565,15 @@ def test_channel_that_stops_mid_run():
                               stall_grace_s=10.0)
     s1 = poisson_stream(rng, 1e6, 0.002)
     s2 = poisson_stream(rng, 1e6, 0.002)
-    p1c, p2c = chunk(s1, 8), chunk(s2, 8)
-    for i in range(8):
-        feed = {(1, 150): p1c[i]}
-        if i < 4:
-            feed[(2, 150)] = p2c[i]     # node 2 stops halfway
-        drv.step(feed, dt=1.0)
+    # Node 2 delivers only the first half of its stream, so node 1 running on
+    # to the end of s1 ends up past node 2's watermark and genuinely backlogs.
+    p1c, p2c = chunk(s1, 12), chunk(s2, 8)
+    for i in range(4):
+        drv.step({(1, 150): p1c[i], (2, 150): p2c[i]}, dt=1.0)
+    # Node 2 stops here. Four more node-1-only polls, still inside the 10 s
+    # grace, so node 1 has a backlog to show and nothing is excluded yet.
+    for i in range(4, 8):
+        drv.step({(1, 150): p1c[i]}, dt=1.0)
 
     held = g.ch1[150].nbytes
     check('node-1 channel backlogs while its partner is silent (nothing lost yet)',
@@ -510,7 +582,11 @@ def test_channel_that_stops_mid_run():
     check('status names the lagging node while still gated',
           'waiting on node 2' in g.status() or 'ok' in g.status(), g.status())
 
-    clock.advance(20.0)
+    # Node 2 has stopped; node 1 keeps delivering. The array being demonstrably
+    # live is what makes this a stall rather than the end of the run -- starve
+    # both and the stream-idle gate reads it as a normal stop instead.
+    for i in range(8, 12):
+        drv.step({(1, 150): p1c[i]}, dt=2.0)
     rel = drv.step(None, dt=0.0)
     check('grace trips and the message names the channel',
           any(n == 2 and p == 150 for n, p, _ in rel.excluded)
