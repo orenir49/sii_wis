@@ -1,4 +1,4 @@
-"""Tests for sender_backend.correct_boundary_epochs().
+"""Tests for node_backend.correct_boundary_epochs().
 
 No pytest in requirements.txt, so this is plain asserts:
     .venv\\Scripts\\python.exe tests\\test_epoch_fix.py
@@ -15,7 +15,7 @@ import sys
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from sender_backend import RESET_ID, TOP_COARSE, correct_boundary_epochs
+from node_backend import RESET_ID, TOP_COARSE, correct_boundary_epochs
 
 MASTER, SLAVE = 1, 0
 PHOTON = 42          # any ordinary pixel id

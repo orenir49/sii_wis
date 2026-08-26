@@ -4,10 +4,10 @@
     python tools\\fetch_capture.py --remote spad_data\\cap.raw --outdir spad_data\\captures
 
 The capture is written on the node (SII_WIS_RAW_DUMP, enabled at launch by
-setting that variable on the MASTER before starting receiver.py). It has to come
+setting that variable on the MASTER before starting master.py). It has to come
 back here before tools\\replay.py can use it.
 
-Node names and usernames match receiver.py's NodePanel defaults; override with
+Node names and usernames match master.py's NodePanel defaults; override with
 --host/--user if they change. Nothing is deleted from the node -- a capture is
 expensive to retake, so removing it is a deliberate act, not a side effect.
 """
@@ -43,7 +43,7 @@ def fetch(node_id, host, user, remote_rel, outdir, log=print):
         except IOError as exc:
             log(f'node{node_id}: {remote} not there ({exc}) — was the capture '
                 f'enabled at launch? SII_WIS_RAW_DUMP must be set on the master '
-                f'BEFORE receiver.py starts, since the sender reads it at launch.')
+                f'BEFORE master.py starts, since the node reads it at launch.')
             return None
         log(f'node{node_id}: {remote}  ->  {local}  ({n:,} B)')
         return local

@@ -23,7 +23,7 @@ Three design constraints, each of which rules something out:
 
 2. **The code under test must not be refactored to make it testable.** The parse
    loop is the reference; touching it defeats the exercise. Only the *handshake*
-   was extracted (sender_backend.open_lspad_stream), which the parse loop does
+   was extracted (node_backend.open_lspad_stream), which the parse loop does
    not participate in.
 
 3. **select.select needs a real socket handle on Windows.** ReplaySocket holds a
@@ -132,28 +132,28 @@ class ReplaySocket:
 
 
 def replay(chunks, outdir: str, log_fn=None, duration: float = 1.0) -> dict:
-    """Feed `chunks` through sender_backend.run() into `outdir`.
+    """Feed `chunks` through node_backend.run() into `outdir`.
 
     Returns the stats dict run() produced. The receiver side is the real
     run_session_loop, so outdir is populated exactly as an acquisition would.
     """
-    import receiver_backend
-    import sender_backend
+    import master_backend
+    import node_backend
 
     logs = []
     log = log_fn or logs.append
     os.makedirs(outdir, exist_ok=True)
 
     rsock = ReplaySocket(chunks)
-    real_open = sender_backend.open_lspad_stream
-    sender_backend.open_lspad_stream = lambda *_a, **_k: rsock
+    real_open = node_backend.open_lspad_stream
+    node_backend.open_lspad_stream = lambda *_a, **_k: rsock
 
     srv, cli = socket.socketpair()
     recv_done = threading.Event()
 
     def receiver_side():
         try:
-            receiver_backend.run_session_loop(conn=srv, log_fn=lambda *_a: None)
+            master_backend.run_session_loop(conn=srv, log_fn=lambda *_a: None)
         except Exception:
             pass
         finally:
@@ -163,11 +163,11 @@ def replay(chunks, outdir: str, log_fn=None, duration: float = 1.0) -> dict:
     th.start()
     try:
         stop = threading.Event()
-        stats = sender_backend.run(
+        stats = node_backend.run(
             sock=cli, output_dir=outdir, duration=duration, test_mode=False,
             stop_event=stop, log_fn=log)
     finally:
-        sender_backend.open_lspad_stream = real_open
+        node_backend.open_lspad_stream = real_open
         rsock.close()
         try:
             cli.close()
@@ -316,7 +316,7 @@ def _selftest() -> int:
         # settle staleness is in the next one. So the same bytes cut differently
         # give different timestamps -- which is the entire reason the capture is
         # length-prefixed instead of a flat blob.
-        import sender_backend as sb
+        import node_backend as sb
         pre = bytes([0, 10, 0x00, 0x11, 0, 0, 1]) * 3
         mark = bytes([0, sb.RESET_ID, 0xFF, 0xFF, 0, 0, 0])
         top = bytes([0, 10, 0xFF, 0xFF, 0, 0, 1])       # stale: epoch over-counted

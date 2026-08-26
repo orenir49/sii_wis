@@ -19,7 +19,7 @@ Lesson kept from the branch phase: the launcher's `git pull` only ever pulls the
 branch, so sender-side work on a feature branch never reaches the nodes. Two capture runs produced
 nothing before that was spotted, and the fix was to check the nodes out onto the branch. Now that the
 work is on `main` the problem is gone, but it will recur for the next feature branch that touches
-`sender_backend.py`.
+`node_backend.py`.
 
 | stage | state |
 |---|---|
@@ -203,7 +203,7 @@ provable rather than arguable whenever it is wanted.
    in `correlate_kernel` at module level so it was never per-window. Full suite re-run green.
 4. ~~**Stage 4 — retire `CorrelateWindow`.**~~ **DONE 2026-08-26.** `correlate.py` is deleted;
    `_correlators` is a 1-tuple. The blast radius turned out to be exactly two executable imports
-   (`receiver.py:31`, `correlate_multi.py:49`) — everything else naming `correlate` was documentation
+   (`master.py:31`, `correlate_multi.py:49`) — everything else naming `correlate` was documentation
    or an independent duplicate. `BACKLOG_WARN_S` and `SIICalculatorWindow` needed no move at all:
    `correlate_multi.py` already had its own copy of the first and imported the second straight from
    `tools/sii_calculator.py`.
@@ -216,7 +216,7 @@ provable rather than arguable whenever it is wanted.
 **Smaller open items**, none blocking:
 
 - **Stage 2 Phase 0 scaffolding LANDED 2026-08-26**, ahead of the 80-pixel run so one bench session
-  serves both. `sender_backend.py` writes a verbatim capture of lSPAD's stream when
+  serves both. `node_backend.py` writes a verbatim capture of lSPAD's stream when
   `SII_WIS_RAW_DUMP` names a file (off otherwise), length-prefixed per `recv()` so a replay
   reproduces the *original* chunk boundaries — the parser carries a partial record across them, so
   they are part of the input. `SII_WIS_RAW_DUMP_MAX_MB` caps it (2048 default): it stops, logs once,
@@ -225,7 +225,7 @@ provable rather than arguable whenever it is wanted.
   captures, which are expected rather than corrupt.
 
 - **The replay harness LANDED 2026-08-26** — `tools/replay.py`, 17 checks. `replay(chunks, outdir)`
-  feeds a capture through `sender_backend.run()` into the receiver's own `run_session_loop`, so the
+  feeds a capture through `node_backend.run()` into the receiver's own `run_session_loop`, so the
   output is `px_*.bin` produced end to end through the real wire protocol rather than a
   harness-specific intermediate; `compare()` then diffs two replays byte-for-byte plus every
   input-derived stat. Three things it gets right, each of which rules an easier design out:
@@ -234,7 +234,7 @@ provable rather than arguable whenever it is wanted.
     returns each captured chunk verbatim, holding a real socketpair purely so `select.select` has a
     handle (on Windows it needs one).
   - **The code under test was not refactored to make it testable.** Only the handshake came out, as
-    `sender_backend.open_lspad_stream()`; the parse loop — the actual reference — is untouched.
+    `node_backend.open_lspad_stream()`; the parse loop — the actual reference — is untouched.
   - **Timing stats are excluded by name** (`lag_s`, `lag_max_s`, `queue_max`, `queue_blocks`), since
     they depend on machine speed rather than input. A harness that flags those produces false alarms
     that then get explained away, which is worse than no harness.
@@ -355,15 +355,15 @@ toggle which pair is shown.
 Three obstacles, addressed in that order:
 
 1. **Disk writes are unsustainable.** `run_session_loop()` opens 326 handles and writes every
-   payload (`receiver_backend.py:150-156, 186-195`). At 160 active pixels x 1 MHz that is
+   payload (`master_backend.py:150-156, 186-195`). At 160 active pixels x 1 MHz that is
    ~1.28 GB/s, which no single disk sustains — so this is a *throughput* fix, not just a space fix.
-   The comment at `receiver_backend.py:187-190` already names the failure mode: the write stalls,
+   The comment at `master_backend.py:187-190` already names the failure mode: the write stalls,
    the sender's TCP window closes, and the loss resurfaces as detector FIFO overflow.
    **Partly addressed** by `8ec3c10`'s `write_hooked` flag, but only for *hooked* pixels — see 1b.
 2. **Sender throughput.** Absolute-picosecond int64 forces 8 bytes/timestamp on the wire, and the
    per-pixel bucketing loop is O(chunk x N_pixels).
 3. **The tap is single-consumer.** `pixel_hooks` is `dict[key_id, Queue]`; two consumers of one
-   pixel silently clobber each other (admitted at `receiver.py:705-709`).
+   pixel silently clobber each other (admitted at `master.py:705-709`).
 
 **Decisions taken:** Stage 1 (disk checkbox + tap fan-out) lands first, self-contained. `px_NNN.bin`
 stays absolute int64 so offline tools are untouched. Diagonal supports two modes — identity
@@ -400,11 +400,11 @@ disagree on a sparse or bursty channel, the **new** one is right. Quad results t
   fix returns 2 on a 1-partner diagonal. A test pins that both rules stay bit-identical on busy
   channels, so this cannot have changed existing 1v1 results.
 
-- **Latent calibration clobber** (`receiver.py:441-442`). `hooks[320] = ...` overwrites any
+- **Latent calibration clobber** (`master.py:441-442`). `hooks[320] = ...` overwrites any
   correlator that had asked for key 320. **FIXED** by `merge_hooks` in `d049f36`; covered by
   `tests/test_hook_fanout.py`.
 - **Timestamps are already non-monotonic, occasionally.** The residual documented at
-  `sender_backend.py:557-561` (the last record of each chip in a chunk has no successor, so a
+  `node_backend.py:557-561` (the last record of each chip in a chunk has no successor, so a
   `coarse == 0xFFFF` record keeps an over-counted epoch) leaves a timestamp **+6.5536 ms in the
   future**; the next event on that pixel then lands *earlier*. At ~122 chunks/s x 2 chips x 1/65536
   this fires every few minutes. Both `spad_new.ipynb` and the correlator call `np.searchsorted` on
@@ -426,7 +426,7 @@ disagree on a sparse or bursty channel, the **new** one is right. Quad results t
 ### 1a. `pixel_hooks` fan-out — LANDED
 
 Implemented as specified below, on `feat/multipair-correlation`. `merge_hooks()` sits at
-`receiver.py:44-64`; the normalization and fan-out are at `receiver_backend.py:134-139` and the
+`master.py:44-64`; the normalization and fan-out are at `master_backend.py:134-139` and the
 `for q in subs.get(key_id, ())` loop replacing the old single-`put`. The `self._correlators` tuple
 landed with it, and all four per-window sites (both `get_hooks_fn` lambdas, the `is_enabled`
 calibration gate, both `start_with_offset` paths) now iterate it instead of naming windows.
@@ -439,9 +439,9 @@ fan-out composes with `write_hooked=False` (no `px_*.bin`, both subscribers stil
 intact). Confirmed in the real GUI: with `CorrelateWindow` and `QuadCorrelateWindow` both on pixel
 147, `get_hooks_fn()` returns 2 subscribers for key 147 where the old dict-merge returned 1.
 
-`receiver_backend.py` — hooks become `dict[int, list[Queue]]`:
+`master_backend.py` — hooks become `dict[int, list[Queue]]`:
 
-- Normalize **once per session**, just after the handles are opened (~`receiver_backend.py:157`), so
+- Normalize **once per session**, just after the handles are opened (~`master_backend.py:157`), so
   the inner loop stays branch-light and legacy `{key: Queue}` callers keep working:
   ```python
   subs: dict[int, tuple] = {}
@@ -449,16 +449,16 @@ intact). Confirmed in the real GUI: with `CorrelateWindow` and `QuadCorrelateWin
       for kid, v in pixel_hooks.items():
           subs[kid] = tuple(v) if isinstance(v, (list, tuple)) else (v,)
   ```
-- Replace `receiver_backend.py:200-201` with `for q in subs.get(key_id, ()): q.put(payload)`.
-- Update the docstring at `receiver_backend.py:108-111`.
+- Replace `master_backend.py:200-201` with `for q in subs.get(key_id, ()): q.put(payload)`.
+- Update the docstring at `master_backend.py:108-111`.
 
-`payload` is an immutable `bytes` from `readall()` (`receiver_backend.py:57-67`), so fan-out at the
+`payload` is an immutable `bytes` from `readall()` (`master_backend.py:57-67`), so fan-out at the
 queue is genuinely zero-copy — but note the copy reappears downstream at `correlate.py:439` and
 `correlate.py:725` (`np.frombuffer(raw).copy()`), so two windows watching one pixel each hold their own int64 array.
 Cost of the loop itself is unmeasurable (a `Queue.put` is sub-microsecond, and only *hooked* keys
 pay it); the real per-chunk ceiling is the pre-existing Python overhead in that loop.
 
-`receiver.py` — replace the clobbering dict-merge with an append-merge helper (~`receiver.py:41`):
+`master.py` — replace the clobbering dict-merge with an append-merge helper (~`master.py:41`):
 
 ```python
 def merge_hooks(*hook_maps) -> dict[int, list]:
@@ -477,43 +477,43 @@ def merge_hooks(*hook_maps) -> dict[int, list]:
     return merged
 ```
 
-- `receiver.py:737-738` / `749-750` → `merge_hooks(*(c.hooks_node1 for c in self._correlators))`
-  (and `hooks_node2`), introducing a `self._correlators` tuple at `receiver.py:704-710` so adding a
+- `master.py:737-738` / `749-750` → `merge_hooks(*(c.hooks_node1 for c in self._correlators))`
+  (and `hooks_node2`), introducing a `self._correlators` tuple at `master.py:704-710` so adding a
   third window does not mean editing four call sites. Note `8ec3c10` added a third lambda
   (`get_write_hooked_fn`) to each of these two call sites, so there are now **six** places a new
   window touches — more reason to do the `self._correlators` refactor before Stage 3.
-- `receiver.py:440-442` → `merge_hooks(self._get_hooks_fn() ..., {320: self._master_dwell_q, 323: self._dwell_q})`,
+- `master.py:440-442` → `merge_hooks(self._get_hooks_fn() ..., {320: self._master_dwell_q, 323: self._dwell_q})`,
   which also fixes the latent clobber noted above.
 - Each window keeps returning plain `{px: queue}` (`correlate.py:378-399`, `961-980`) — **no change
   to `CorrelateWindow` or `QuadCorrelateWindow`.** `merge_hooks` does the normalization.
-- Delete the now-false comment at `receiver.py:705-709`. The `CLAUDE.md` "enqueued instead of
+- Delete the now-false comment at `master.py:705-709`. The `CLAUDE.md` "enqueued instead of
   written to disk" fix is **done** in `8ec3c10` — `CLAUDE.md:95` now reads "in addition to".
   `correlate.py:4-8` was already correct ("The tap is a copy, not a diversion") and needs no change.
 
 ### 1b. Write-to-disk checkbox — LANDED IN `8ec3c10`; deviation 1 CLOSED 2026-08-26
 
-Shipped as `write_hooked: bool = True` on `run_session_loop()` (`receiver_backend.py:99`), plus a
+Shipped as `write_hooked: bool = True` on `run_session_loop()` (`master_backend.py:99`), plus a
 global **"Write timestamps to disk (uncheck: live correlation only)"** `Checkbutton` in the
 `ReceiverGUI` `acq` frame, on by default.
 
 **What matches this spec:**
 
-- Only the 320-pixel loop is guarded (`receiver_backend.py:151-154`); the 6 sync files are always
+- Only the 320-pixel loop is guarded (`master_backend.py:151-154`); the 6 sync files are always
   opened (`155-156`). Keys 320-325 can never be suppressed — enforced by the `k < 320` filter when
   `skipped_keys` is built (now `set(range(320))`, still pixel-only), which matters because `NodePanel` hooks
   320 and 323 on *every* run, so a naive "skip anything hooked" rule would have deleted the dwell
   files that `estimate_offset` needs.
 - The `else: unknown += 1` branch no longer fires for deliberately-skipped keys — there is an
-  `elif key_id in skipped_keys: skipped += n_bytes` arm at `receiver_backend.py:196-197`, so no
+  `elif key_id in skipped_keys: skipped += n_bytes` arm at `master_backend.py:196-197`, so no
   spurious "unrecognised key_id" warning (`212-214`).
-- The session summary reports the un-written megabytes (`receiver_backend.py:215-220`), and a
+- The session summary reports the un-written megabytes (`master_backend.py:215-220`), and a
   once-per-session line up front names the hooked pixels (i.e. what the session *does* keep).
 - Suppressed pixels get **no file at all** rather than an empty one, so an absent `px_147.bin` reads
   as "not recorded" instead of "this pixel saw nothing".
-- `event_accum` (`receiver_backend.py:204-205`) is handle-independent, so the count-rate display
+- `event_accum` (`master_backend.py:204-205`) is handle-independent, so the count-rate display
   keeps working — verified.
-- `NodePanel.__init__` gained `get_write_hooked_fn`, passed at `receiver.py:739` / `751` alongside
-  `get_hooks_fn`, read once per session in `_accept_data_thread` (`receiver.py:444-447`) and passed
+- `NodePanel.__init__` gained `get_write_hooked_fn`, passed at `master.py:739` / `751` alongside
+  `get_hooks_fn`, read once per session in `_accept_data_thread` (`master.py:444-447`) and passed
   through at `463`.
 
 **Three deviations — 1 is now CLOSED, 2 and 3 still open:**
@@ -535,17 +535,17 @@ global **"Write timestamps to disk (uncheck: live correlation only)"** `Checkbut
    analysis. Refreshed at build, on every 2 s health check, and synchronously inside `_start_all`
    before any accept. An on-screen reason says why it is greyed out and where to change it, and each
    transition logs once (not once per health check). `tests/test_write_lock.py`, 17 checks.
-3. **Not recorded in `session_stats.json`.** `_record_session_stats` (`receiver.py:357-409`) does not
+3. **Not recorded in `session_stats.json`.** `_record_session_stats` (`master.py:357-409`) does not
    carry the flag, so a directory with no `px_*.bin` is only explicable from the log. Note the stats
    dict itself originates on the *sender*, which has no idea about this receiver-side choice — so
    this has to be injected on the receiver side, not plumbed through the wire.
 
 **Safety check (traced, still valid):** dwell calibration is 100% live-hook driven —
-`receiver.py:441-442` → `_drain` (`477-488`) → `_poll_sparse_cal` (`1169-1203`) →
+`master.py:441-442` → `_drain` (`477-488`) → `_poll_sparse_cal` (`1169-1203`) →
 `_apply_sparse_dwell_offset` (`1205-1296`) never touches a file. Disabling pixel writes cannot break
 it, and the sync files still allow offline re-derivation.
 
-Note `root.resizable(False, False)` (`receiver.py:694`) — the `acq` frame absorbed the new checkbox
+Note `root.resizable(False, False)` (`master.py:694`) — the `acq` frame absorbed the new checkbox
 row without trouble, but a second added row is worth re-checking.
 
 ---
@@ -554,11 +554,11 @@ row without trouble, but a second added row is worth re-checking.
 
 ### 2a. Kill the O(chunk x N_pixels) bucketing loop
 
-`sender_backend.py:615-626` does a full boolean scan of the chunk *per active pixel* — 80 passes
+`node_backend.py:615-626` does a full boolean scan of the chunk *per active pixel* — 80 passes
 over every chunk at 80 pixels.
 
 **The sort key must be `uint16`, and this is the whole ballgame.** numpy's `kind='stable'` takes the
-fast radix path only for narrow integer types; `pixel_nr` is `int32` (`sender_backend.py:512`), which
+fast radix path only for narrow integer types; `pixel_nr` is `int32` (`node_backend.py:512`), which
 falls back to timsort. Measured on 8192 elements: `uint16` 0.021 ms vs `int32` **0.266 ms** — 12x
 worse. So fuse chip and pixel id into one 16-bit slot key,
 `slot = raw[:,1].astype(np.uint16) | (is_mast.astype(np.uint16) << 8)` (0-255 slave, 256-511 master),
@@ -571,17 +571,17 @@ collapses several other per-chunk full-array passes into table lookups — the o
 (`:521`), the recognised-key / abnormal test (`:603-611`), the 6 marker mask scans (`:628-633`), and
 the `events_since_flush` sum (`:626`).
 
-**New since the first draft:** `20a058a` added the abnormal-id detection at `sender_backend.py:601-611`
+**New since the first draft:** `20a058a` added the abnormal-id detection at `node_backend.py:601-611`
 — `phys_ok`, an `np.isin` against `NORMAL_MARKER_IDS`, and a second `np.isin` against
 `KNOWN_MARKER_IDS` inside the `abnormal.any()` branch. That is 2-3 more full-array passes per chunk
 than the draft accounted for, and it is *exactly* the shape the 512-bin histogram subsumes: every
 one of those tests becomes a lookup over 512 slot counts instead of a scan over the chunk. Fold it
 in rather than leaving it as a parallel code path. `report_abnormal` itself
-(`sender_backend.py:284-321`) already works from `np.nonzero` indices and needs no change beyond
+(`node_backend.py:284-321`) already works from `np.nonzero` indices and needs no change beyond
 being handed slot-derived indices.
 
 Measured end-to-end on the grouping step: 5.6x faster at 80 pixels, 6.2x at 170, and **flat in pixel
-count** — which is the actual point. The comment at `sender_backend.py:478-481` justifying the recv
+count** — which is the actual point. The comment at `node_backend.py:478-481` justifying the recv
 size ("one numpy call per active pixel regardless of array length") becomes false and must be
 rewritten.
 
@@ -595,8 +595,8 @@ hole is preserved (slave 150-169 are valid pixels; master ids there are not).
 
 ### 2b. Delta-encode the wire
 
-The arithmetic at `sender_backend.py:575` is already vectorized and is *not* the bottleneck; the cost
-is that absolute ps forces int64 (8 bytes/event at `sender_backend.py:251-255`).
+The arithmetic at `node_backend.py:575` is already vectorized and is *not* the bottleneck; the cost
+is that absolute ps forces int64 (8 bytes/event at `node_backend.py:251-255`).
 
 **Use explicit-length segments, not a sentinel.** A `0xFFFFFFFF` sentinel is actively unsafe:
 `np.int64(-1).astype(np.uint32)` is `4294967295` with **no warning**, so a real delta of −1 ps is
@@ -631,12 +631,12 @@ stresses the link it is a clean 2.00x, and the pessimal regime (50 Hz/pixel acro
 ~45 kB/s. The encoding is worst exactly where volume is nil.
 
 **Markers (320-325) stay absolute** — a few hundred events/s, nothing to save, and it keeps the
-`estimate_offset` / sparse-cal path (`receiver.py:488`) entirely out of the blast radius. The rule is
+`estimate_offset` / sparse-cal path (`master.py:488`) entirely out of the blast radius. The rule is
 one comparison, `key_id < 320`, derived from a single shared constant and commented at both sites.
 
 Put the codec in a **new shared `wire_format.py`** imported by both backends, with an adversarial
 round-trip self-test under `__main__` as the verification artifact. Duplicated constants with a "must
-match" comment (`receiver_backend.py:26`) are tolerable for five integers and intolerable for a
+match" comment (`master_backend.py:26`) are tolerable for five integers and intolerable for a
 codec — a one-sided edit is exactly how this corrupts data. `ssh_launcher.git_update()` pulls the
 whole repo, so a new module reaches the senders automatically.
 
@@ -644,7 +644,7 @@ whole repo, so a new module reaches the senders automatically.
 protects nothing — a stale receiver would happily write the delta payload into `px_NNN.bin`,
 producing a file that is structurally valid int64 and numerically meaningless, and that survives all
 the way to the notebook. The only frame a stale receiver *cannot* ignore is the setup frame, because
-`receiver_backend.py:142-143` hard-raises on anything that is not `KEY_SETUP`. So add
+`master_backend.py:142-143` hard-raises on anything that is not `KEY_SETUP`. So add
 `KEY_SETUP_V2 = 0xFFFFFFFD` carrying JSON `{"dir": ..., "fmt": ...}`; the receiver accepts plain
 `KEY_SETUP` as `fmt='abs'` (a pre-pull sender keeps working correctly) and a stale receiver fails at
 `:143` at session start, before a byte hits disk. This matters because skew is plausible in **both**
@@ -654,20 +654,20 @@ receiver is a manual checkout, and `ssh_launcher.py:445-447` already documents p
 Decode goes in `run_session_loop()`'s inner loop, after `readall` and after the skip decision.
 Resolve "is this key wanted" **once per session** into a flat lookup, so a pixel that is neither
 persisted nor hooked costs one socket read plus a segment-header walk — `skipped_keys`
-(`receiver_backend.py:131-133`) is the natural place to hang that resolution, since it is already
+(`master_backend.py:131-133`) is the natural place to hang that resolution, since it is already
 computed once per connection. That walk (`scan_deltas`,
 0.33 µs/payload) also gives the exact event count for `event_accum` — `n_bytes // 8`
-(`receiver_backend.py:204-205`) is wrong by ~2x for delta payloads — and validates structure on every
+(`master_backend.py:204-205`) is wrong by ~2x for delta payloads — and validates structure on every
 pixel frame, including ones never decoded. With disk-writing on, decode-then-write keeps
 `px_NNN.bin` absolute int64: confirmed necessary, since `spad_new.ipynb` memmaps it as
 `dtype=np.int64` and calls `np.searchsorted`. `tools/plot_g2_result.py` never touches `.bin` at all.
 
 Knock-on: hook queues now carry `np.ndarray` int64 rather than `bytes`, so the receiver decodes
 uniformly and consumers never need to know which format a key uses. Three mechanical edits —
-`correlate.py:439`, `correlate.py:725`, `receiver.py:488` — and a mutation audit confirms nothing
+`correlate.py:439`, `correlate.py:725`, `master.py:488` — and a mutation audit confirms nothing
 mutates dequeued arrays in place, so the existing `.copy()` calls can go.
 
-Finally, `recv(57344)` (`sender_backend.py:470`) is `7 x 8192`; keep any change a multiple of 7 to
+Finally, `recv(57344)` (`node_backend.py:470`) is `7 x 8192`; keep any change a multiple of 7 to
 preserve the empty-`carry` property. Decide from the already-instrumented `stats['recv_mean_b']`
 (`:682-683`) rather than up front: if it sits at ~57344 the socket is saturated and `7 x 65536` will
 help. `FLUSH_EVERY` needs **no** change — it counts events across all pixels, so cadence is
@@ -779,7 +779,7 @@ The new window must also absorb what `CorrelateWindow` has and Quad lacked, sinc
 primary tool: the count-distribution view (`correlate.py:636-678`), the **Compute R…** button into
 `SIICalculatorWindow` (`correlate.py:245-247`, `319-321`), and the backlog note
 (`correlate.py:465-499`). Keep `CorrelateWindow` itself — it is the simple single-pair path,
-`set_correlate_pixel_fn` (`receiver.py:549-550`, `740`, `752`) targets it, and it stays useful as an
+`set_correlate_pixel_fn` (`master.py:549-550`, `740`, `752`) targets it, and it stays useful as an
 independent cross-check against the new engine.
 
 **Also now required, from `3b6a53a`:** the `Mark τ (ns)` marker and its counts/excess/SNR/mean±σ box.
@@ -811,9 +811,9 @@ optional polish — 80 pairs derived from two floats is exactly where a sign err
 correlates the wrong pixels all night, and with disk writes off the run is unrepeatable (and the
 checkbox from 1b now makes that state one click away). Partners
 outside 0-319 are **dropped, not clamped**, and listed. Cross-check against the node's mask file
-(path already in the panel at `receiver.py:120-122`; per `gen_mask.py:40-43` — at the repo root, not
+(path already in the panel at `master.py:120-122`; per `gen_mask.py:40-43` — at the repo root, not
 under `.claude/` — the file lists
-*masked-off* locations, so active = `set(range(320)) - file`; `receiver.py:120-122`) and flag any derived pixel that is
+*masked-off* locations, so active = `set(range(320)) - file`; `master.py:120-122`) and flag any derived pixel that is
 masked off — that is a guaranteed permanent stall, and catching it at Derive time is far better than
 discovering it an hour in.
 
@@ -1017,8 +1017,8 @@ commit deletes `correlate.py:737-1214`. Promote `_pick_unit` from a `CorrelateWi
 (`correlate.py:593-603`) to module level (Quad reaches for it at `correlate.py:1171`, so keep the
 staticmethod alias until Quad is gone); the marked-τ helpers at `correlate.py:62-127` are already
 module-level and are the precedent for where shared plotting code belongs.
-Refactor `receiver.py` to a `self._correlators` list — `is_enabled` is
-checked at `receiver.py:893` and `start_with_offset` called at `1241-1242` and `1293-1294`, and
+Refactor `master.py` to a `self._correlators` list — `is_enabled` is
+checked at `master.py:893` and `start_with_offset` called at `1241-1242` and `1293-1294`, and
 missing one of those sites is the classic "new window never receives its offset, histogram silently
 stays empty" bug.
 
@@ -1056,8 +1056,8 @@ costs nothing new.
 ### What comes out
 
 - `CorrelateWindow` from `correlate.py`.
-- `receiver.py`: the import, `_correlate_win`, and `_correlators` drops to one entry.
-- `set_correlate_pixel_fn` and its plumbing (`NodePanel.__init__`, `receiver.py:88`, `:591-592`) —
+- `master.py`: the import, `_correlate_win`, and `_correlators` drops to one entry.
+- `set_correlate_pixel_fn` and its plumbing (`NodePanel.__init__`, `master.py:88`, `:591-592`) —
   the "generating a 1-pixel mask fills in the correlator's pixel field" convenience. Obsolete by
   construction: the multi-pair window reads the mask itself, so there is nothing to fill in.
 
@@ -1265,7 +1265,7 @@ that would justify widening the flag to all pixels.
 "run it twice and diff" is unavailable. Build two mechanisms instead, and build them *first*:
 
 - **Phase 0 scaffolding, before touching anything.** Add an env-gated raw-stream dump right after
-  `sender_backend.py:470-477` (~4 lines, off by default) and capture one real 30 s / 80-active-pixel
+  `node_backend.py:470-477` (~4 lines, off by default) and capture one real 30 s / 80-active-pixel
   session **with the current code**. Replaying that capture through the old and new parse paths
   offline must produce **byte-identical** `px_*.bin` and identical
   `stats['records'/'overflow'/'unknown'/'epoch_fixes']` — and now also `stats['abnormal']`, added by
@@ -1282,11 +1282,11 @@ that would justify widening the flag to all pixels.
   time. **The three rows to guard forever:** delta `== 2**32 - 1` (must stay one segment), delta
   `== 2**32` (must split), and delta `== -1` (the case a sentinel scheme cannot distinguish).
 
-Then measure before/after: `overflow` and `lag_max_s` (`sender_backend.py:583-592`) are the outcome;
+Then measure before/after: `overflow` and `lag_max_s` (`node_backend.py:583-592`) are the outcome;
 `records` and total `px_*.bin` bytes are the invariants proving nothing was lost or double-counted.
 Add a `raw_b`/`wire_b` ratio to `stats` and expect ~2.00x at the rates that matter. Also track
 `queue_blocks`/`queue_max` (`:695-700`, expect blocks → 0) and the receiver's `write_s`
-(`receiver_backend.py:215-220`). With the 1b checkbox off, `write_s` collapses for hooked pixels, so
+(`master_backend.py:215-220`). With the 1b checkbox off, `write_s` collapses for hooked pixels, so
 **measure with writes on** or the comparison flatters the codec.
 
 **Stage 3.**
@@ -1347,11 +1347,11 @@ Add a `raw_b`/`wire_b` ratio to `stats` and expect ~2.00x at the rates that matt
   sync files growing, backlog quiet, RAM plateauing at the predicted level. Since deviation 1 closed
   (2026-08-26) the flag suppresses **every** pixel key, so "disk flat" means literally no `px_*.bin`
   at all, regardless of which pixels any window happens to be watching.
-- *After Quad is deleted:* re-run the full suite with `receiver.py`'s `_correlators` list down to two
+- *After Quad is deleted:* re-run the full suite with `master.py`'s `_correlators` list down to two
   windows, and confirm the prewarm once-lock, `start_with_offset` fan-out
-  (`receiver.py:1241-1242`, `1293-1294`), and `is_enabled` check (`receiver.py:893`) all still cover
+  (`master.py:1241-1242`, `1293-1294`), and `is_enabled` check (`master.py:893`) all still cover
   every remaining window — a missed site there is the silent "histogram never fills" failure. Add
-  `get_write_hooked_fn` (`receiver.py:739`, `751`) to that list of per-window wiring sites.
+  `get_write_hooked_fn` (`master.py:739`, `751`) to that list of per-window wiring sites.
 - *A synthetic source mode* (a debug button filling all channels from a Poisson generator with a
   planted correlated peak) makes the whole derive → accumulate → display → save → `plot_g2_result`
   path testable on a laptop without burning detector time. Cheap, and it unlocks every test above.

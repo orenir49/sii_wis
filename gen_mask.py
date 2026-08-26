@@ -2,7 +2,7 @@ import os, sys, argparse
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-from sender_backend import PIXMAP
+from node_backend import PIXMAP
 
 DEFAULT_OUT_DIR = r'C:\Program Files (x86)\SPADlambda\lSPAD_standalone_win64'
 

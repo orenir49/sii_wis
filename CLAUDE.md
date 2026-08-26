@@ -11,16 +11,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # Install dependencies
 pip install -r requirements.txt
 
-# Run master receiver GUI (on master PC)
-python receiver.py
+# Run the master GUI (on the master PC)
+python master.py
 
-# Run sender GUI (on each SPAD detector PC)
-python sender.py
+# Run the node GUI (on each SPAD detector PC)
+python node.py
 
 # Standalone single-node data receiver
-python receiver_backend.py [--port 50007]
+python master_backend.py [--port 50007]
 
-# One-shot sender node setup (run as Administrator on sender PC)
+# One-shot node setup (run as Administrator on each node PC)
 .\setup_node.ps1
 
 # Offline analysis
@@ -37,7 +37,7 @@ python tools\pair_map.py --mode affine --lo 120 --hi 200 -a 1.037 -b -2.4
 python tools\pair_map.py --selftest
 
 # Raw lSPAD capture (Stage 2 Phase 0) -- off by default
-# Set on the MASTER before launching receiver.py; forwarded to each node as
+# Set on the MASTER before launching master.py; forwarded to each node as
 # <that node repo>\<value>_node{1,2}. Relative is preferred: the two nodes have
 # different usernames, so an absolute master-side path names a missing home dir.
 $env:SII_WIS_RAW_DUMP = 'spad_data\cap.raw'   # optional: SII_WIS_RAW_DUMP_MAX_MB (2048)
@@ -70,27 +70,27 @@ python tools\analyze_g2_pairs_offline.py --base spad_data\<dir> 147x147 147x168 
 
 ## Architecture
 
-This is a **SPAD (Single Photon Avalanche Diode) multi-node acquisition system** for two-detector quantum optics experiments. It runs across a small LAN: one master PC (receiver) controls two sender PCs (each connected to a SPAD detector).
+This is a **SPAD (Single Photon Avalanche Diode) multi-node acquisition system** for two-detector quantum optics experiments. It runs across a small LAN: one **master** PC controls two **node** PCs, each connected to a SPAD detector. (Note: master/slave elsewhere in this codebase refer to the two detector *chips* inside one lSPAD unit, not to PCs — see the pixel-mapping section. The PC roles are master and node.)
 
 ### Two-role design
 
-**Receiver (master PC)** — `receiver.py`  
-Controls up to 2 sender nodes. Each node gets a `NodePanel` instance that manages both channels:
-- **Control channel**: receiver → sender, JSON commands over TCP (connect, start, stop, shutdown)
-- **Data channel**: sender → receiver, binary timestamp stream over TCP
+**Master PC** — `master.py`  
+Controls up to 2 nodes. Each node gets a `NodePanel` instance that manages both channels:
+- **Control channel**: master → node, JSON commands over TCP (connect, start, stop, shutdown)
+- **Data channel**: node → master, binary timestamp stream over TCP
 
-**Sender (detector PC)** — `sender.py` + `sender_backend.py`  
-Minimal GUI that starts a command server thread on launch. Receives JSON commands from the receiver, talks to the local `lSPAD.exe` hardware driver over TCP (port 9999), and streams timestamped pixel data back to the receiver.
+**Node PC (one per detector)** — `node.py` + `node_backend.py`  
+Minimal GUI that starts a command server thread on launch. Receives JSON commands from the master, talks to the local `lSPAD.exe` hardware driver over TCP (port 9999), and streams timestamped pixel data back to the master.
 
 ### Key files
 
 | File | Role |
 |---|---|
-| `receiver.py` | Master GUI; `NodePanel` per sender node |
-| `receiver_backend.py` | TCP data server: `start_server()`, `run_session_loop()`, `check_connection()` |
+| `master.py` | Master GUI; `NodePanel` per node |
+| `master_backend.py` | TCP data server: `start_server()`, `run_session_loop()`, `check_connection()` |
 | `run_log.py` | Per-run capture of the live log to `spad_data/log/<stamp>.log` — buffered during integration, flushed at the end; `--selftest` |
-| `sender.py` | Sender GUI shell; starts command server thread |
-| `sender_backend.py` | Command server + lSPAD TCP client; contains `PIXMAP` (320-pixel array mapping); logs abnormal marker ids live (see below) |
+| `node.py` | Node GUI shell; starts command server thread |
+| `node_backend.py` | Command server + lSPAD TCP client; contains `PIXMAP` (320-pixel array mapping); logs abnormal marker ids live (see below) |
 | `correlate_multi.py` | `MultiCorrelateWindow` — **the only correlator**. Up to ~320 pairs, one plot + pair selector, `g²`/count-distribution views, `Compute R…`. `QuadCorrelateWindow` and `CorrelateWindow` were both retired into it 2026-08-26; it also owns the shared `pick_unit`/`_mark_peak_bin` display helpers |
 | `correlate_engine.py` | `ChannelGraph` — which events are safe to correlate and which must be kept. No Tk; 59 tests |
 | `correlate_kernel.py` | `_pair_kernel` (`nogil`) + `PairPool`, and the reference `_multistart_multistop` it is proved bitwise identical to — moved here from `correlate.py` so the reference and the proof have one owner; `prewarm()` warms both; `--selftest` |
@@ -100,11 +100,11 @@ Minimal GUI that starts a command server thread on launch. Receives JSON command
 | `tools/plot_g2_result.py` | Peak-annotated g² histogram + count-distribution PNGs from a saved `{px1}_{px2}_{suffix}.txt` |
 | `tools/analyze_g2_pairs_offline.py` | Offline g² for arbitrary pixel pairs with the robust slave-dwell clock offset (matches the live correlator) |
 | `tools/raw_dump.py` | Reader + `--selftest` for the sender's env-gated raw lSPAD capture (`SII_WIS_RAW_DUMP`); length-prefixed chunks so a replay reproduces the original recv() boundaries |
-| `tools/replay.py` | Replays a capture through `sender_backend.run()` into the real receiver loop, and diffs two replays (`px_*.bin` bytes + input-derived stats). The check a parser rewrite has to pass; `--selftest` |
+| `tools/replay.py` | Replays a capture through `node_backend.run()` into the real receiver loop, and diffs two replays (`px_*.bin` bytes + input-derived stats). The check a parser rewrite has to pass; `--selftest` |
 | `tools/fetch_capture.py` | Pulls both nodes' raw captures back to the master over SFTP and summarizes them (chunks, records, truncation) |
 | `tools/pair_map.py` | Pure (node-1, node-2) pair derivation — identity / grid (both mask-driven) and file for the GUI, plus affine for `align_arc --emit-pairs`; mask cross-check, `--selftest` |
 | `ssh_launcher.py` | Paramiko-based remote automation for launching sender nodes |
-| `setup_node.ps1` | One-shot sender node setup: OpenSSH, firewall, git clone, venv |
+| `setup_node.ps1` | One-shot node setup: OpenSSH, firewall, git clone, venv |
 | `spad_new.ipynb` | Offline g² analysis notebook |
 | `LSPAD_CLI.md` | Reference for `lSPAD.exe`'s own TCP command protocol (port 9999) |
 | `.claude/skills/spectral-align/align_arc.py` | Arc-line peak matching + affine pixel-mapping fit between two SPAD spectra |
@@ -118,11 +118,11 @@ Frames: 8-byte header `(key_id: uint32 big-endian, n_bytes: uint32 big-endian)` 
 - `0xFFFFFFFF` (KEY_SETUP): payload is UTF-8 output directory path — opens one acquisition session
 - `0xFFFFFFFE` (KEY_END): empty payload — closes the session; `run_session_loop()` loops back for the next
 
-Pixel mapping: `PIXMAP` in `sender_backend.py` maps lSPAD pixel indices to output keys. Slave pixels occupy indices 0–169, master pixels 170–319.
+Pixel mapping: `PIXMAP` in `node_backend.py` maps lSPAD pixel indices to output keys. Slave pixels occupy indices 0–169, master pixels 170–319.
 
 ### Abnormal marker logging (sender)
 
-A healthy timestream carries only photons (lSPAD ids `<150` master / `<170` slave), the coarse-counter reset `234`, and the dwell/line/frame markers `225`/`226`/`228` (`NORMAL_MARKER_IDS`). `sender_backend.py` reports every other id live over the control channel — FIFO overflow `247`, file-start `239`, and any id no pixel on that chip can emit (usually 7-byte record framing having slipped) — with the session record index and detector-relative timestamp, so a misplaced marker is distinguishable from an expected one.
+A healthy timestream carries only photons (lSPAD ids `<150` master / `<170` slave), the coarse-counter reset `234`, and the dwell/line/frame markers `225`/`226`/`228` (`NORMAL_MARKER_IDS`). `node_backend.py` reports every other id live over the control channel — FIFO overflow `247`, file-start `239`, and any id no pixel on that chip can emit (usually 7-byte record framing having slipped) — with the session record index and detector-relative timestamp, so a misplaced marker is distinguishable from an expected one.
 
 Throttled deliberately: `log_fn` writes to the control socket from the parser thread, so a flood would stall the parser and cost real photons. First sighting of each `(chip, id)` logs at once, then one rollup line per id per `ANOM_LOG_S`; past `ANOM_MAX_FIRST` distinct ids it stops opening new lines. Per-id totals land in `stats['abnormal']` → `session_stats.json`.
 
@@ -130,7 +130,7 @@ Throttled deliberately: `log_fn` writes to the control socket from the parser th
 
 `correlate.py` integrates with `run_session_loop()` via `pixel_hooks: dict[key_id, list[queue.Queue]]`. Matching chunks are enqueued **in addition to** being written to disk — a read tap, not a diversion. `CorrelateWindow` accumulates int64 timestamps from two pixel queues and calls the Numba JIT `_multistart_multistop()` kernel in a background thread. The kernel is pre-warmed at startup to avoid the first-call JIT delay.
 
-Each key fans out to **every** subscriber. `merge_hooks()` (`receiver.py`) composes the per-window `{key_id: Queue}` maps by appending rather than overwriting, so two windows watching one pixel both get every chunk, and a correlator watching key 320/323 is no longer clobbered by the dwell-calibration tap. The payload is an immutable `bytes`, so fan-out is zero-copy — subscribers must treat it as read-only. A bare `Queue` value is still accepted and normalized once per connection, so the correlator windows keep returning plain `{px: Queue}`. `ReceiverGUI._correlators` is the single list of windows (now two: `CorrelateWindow` and `MultiCorrelateWindow`): hook merging, the `is_enabled` calibration gate, and both `start_with_offset` paths all iterate it, so adding a window means editing one line.
+Each key fans out to **every** subscriber. `merge_hooks()` (`master.py`) composes the per-window `{key_id: Queue}` maps by appending rather than overwriting, so two windows watching one pixel both get every chunk, and a correlator watching key 320/323 is no longer clobbered by the dwell-calibration tap. The payload is an immutable `bytes`, so fan-out is zero-copy — subscribers must treat it as read-only. A bare `Queue` value is still accepted and normalized once per connection, so the correlator windows keep returning plain `{px: Queue}`. `ReceiverGUI._correlators` is the single list of windows (now two: `CorrelateWindow` and `MultiCorrelateWindow`): hook merging, the `is_enabled` calibration gate, and both `start_with_offset` paths all iterate it, so adding a window means editing one line.
 
 ### Multi-pair correlator (`correlate_multi.py`)
 
@@ -181,7 +181,7 @@ Automates sender node startup via paramiko password auth:
 1. Find and start `lSPAD.exe` detached via WMI `Win32_Process.Create` (survives SSH disconnect)
 2. Wait for lSPAD port 9999 to open
 3. Apply pixel mask (`M,<path>`), run TDC calibration (`T,v,1` → `T,c,1`)
-4. Git pull the repo, launch `sender.py` detached via venv `pythonw.exe`
+4. Git pull the repo, launch `node.py` detached via venv `pythonw.exe`
 
 `start_detached()` takes an optional `env`. It cannot be done by exporting over SSH: a `Win32_Process.Create` child inherits the **WMI service's** environment, not the session's, so `$env:X = …` is invisible to it. Rather than nest quotes three deep in the WMI command line — where one stray quote silently launches the wrong thing — a small `_launch_env.cmd` is uploaded beside the target and `Create` runs that; nothing persists on the node beyond that file, unlike a Machine-scope variable. This is what lets `SII_WIS_RAW_DUMP` reach the sender at all, since the capture has to be enabled in the sender's own environment at launch. `download_file()` is the counterpart to `upload_file()`, used by `tools/fetch_capture.py`.
 

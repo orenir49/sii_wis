@@ -5,12 +5,12 @@ No pytest in requirements.txt, so this is plain asserts:
 
 Two things are under test and they fail in different places:
 
-  * merge_hooks() in receiver.py -- composing per-window {key: Queue} maps
+  * merge_hooks() in master.py -- composing per-window {key: Queue} maps
     without letting a later window overwrite an earlier one. The old
     {**a, **b} merge dropped the loser silently, which is also how a
     correlator watching key 320 or 323 lost its subscription to the dwell
     calibration tap.
-  * run_session_loop() in receiver_backend.py -- delivering one payload to
+  * run_session_loop() in master_backend.py -- delivering one payload to
     every subscriber of a key, and doing it without copying.
 
 The fan-out test drives a real socketpair through the real protocol rather
@@ -27,8 +27,8 @@ import tempfile
 import threading
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from receiver import merge_hooks
-from receiver_backend import KEY_SETUP, KEY_END, run_session_loop
+from master import merge_hooks
+from master_backend import KEY_SETUP, KEY_END, run_session_loop
 
 PASSED = []
 
@@ -82,7 +82,7 @@ def test_merge_of_nothing_is_empty():
 
 
 def test_calibration_tap_no_longer_clobbers():
-    """The latent bug at receiver.py:441-442. A window asking for key 320
+    """The latent bug at master.py:441-442 (pre-rename receiver.py). A window asking for key 320
     used to be overwritten by hooks[320] = self._master_dwell_q, so it got
     nothing for the whole session and looked merely idle."""
     win, cal = queue.Queue(), queue.Queue()

@@ -12,7 +12,7 @@ import tkinter as tk
 from tkinter import ttk
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from sender_backend import run_command_server, DEFAULT_CMD_PORT
+from node_backend import run_command_server, DEFAULT_CMD_PORT
 
 
 class SpadSenderGUI:

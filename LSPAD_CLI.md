@@ -1,7 +1,7 @@
 # lSPAD command guide
 
 Reference for the TCP command protocol `lSPAD.exe` exposes on port 9999 (see
-`sender_backend.py`'s `spad_sock` and `ssh_launcher.py`'s `send_lspad_cmd`).
+`node_backend.py`'s `spad_sock` and `ssh_launcher.py`'s `send_lspad_cmd`).
 Not derivable from this repo's code — this is the hardware/driver's own
 command set, provided by the user from lSPAD's documentation.
 
@@ -80,7 +80,7 @@ coarse counter value | 3 bytes (24-bit int) TDC value.
 
 (See the pixel look-up table for converting the master/slave pixel number to
 the actual pixel number for S/SB modes — this is `PIXMAP`/`master_loc`/
-`slave_loc` in `sender_backend.py`.)
+`slave_loc` in `node_backend.py`.)
 
 `SH,<measurement time in ms>,<histogram bin width in ps>,<split dwells>` —
 `<split dwells>`: 0 for no splitting, 1 to split the histogram at each
@@ -114,7 +114,7 @@ clock frequencies. Format:
 For systems with a humidity sensor:
 `<FPGA master temp>,<FPGA slave temp>,<main PCB temp>,<main PCB temp 2>,<chip PCB temp>,<relative humidity %>,<laser freq>,<frame freq>,<line freq>,<dwell freq>`
 (this is the 10-field format `ssh_launcher.py`'s `query_r`/`get_dwell_freq`
-and `sender_backend.py`'s `run()` parse).
+and `node_backend.py`'s `run()` parse).
 
 ## Get system information
 

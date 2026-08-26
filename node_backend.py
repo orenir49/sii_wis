@@ -3,10 +3,10 @@
 Live SPAD acquisition module.
 
 Importable by a GUI:
-    from spad_sender import connect_receiver, check_connection, run
+    from node_backend import connect_receiver, check_connection, run
 
 Or run standalone:
-    python spad_sender.py --target-host <IP> --duration <s> [--test]
+    python node_backend.py --target-host <IP> --duration <s> [--test]
 """
 
 import argparse
@@ -922,7 +922,7 @@ def run_command_server(cmd_port: int = DEFAULT_CMD_PORT,
 def _build_id() -> str:
     """Identify the running code: git HEAD + pid.
 
-    A stale sender.py can keep the command port after a git pull, so the
+    A stale node.py can keep the command port after a git pull, so the
     receiver needs to see which build is actually answering.
     """
     sha = '?'

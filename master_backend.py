@@ -3,10 +3,10 @@
 SPAD data receiver module.
 
 Importable by a GUI:
-    from spad_receiver import start_server, check_connection, run_session_loop
+    from master_backend import start_server, check_connection, run_session_loop
 
 Or run standalone (single node):
-    python spad_receiver.py [--port 50007] [--output-dir ./spad_data]
+    python master_backend.py [--port 50007] [--output-dir ./spad_data]
 """
 
 import argparse
@@ -23,7 +23,7 @@ DEFAULT_PORT       = 50007
 DEFAULT_OUTPUT_DIR = './spad_data'
 
 # ---------------------------------------------------------------------------
-# Wire protocol keys  (must match spad_sender.py)
+# Wire protocol keys  (must match node_backend.py)
 # ---------------------------------------------------------------------------
 KEY_SETUP     = 0xFFFFFFFF
 KEY_END       = 0xFFFFFFFE

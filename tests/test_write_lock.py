@@ -25,7 +25,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, 'tools'))
 
-import receiver
+import master
 
 PASSED = []
 
@@ -43,7 +43,7 @@ class FakeNode:
         self._data_conn = data_conn
         self._session_active = session_active
 
-    write_flag_is_committed = receiver.NodePanel.write_flag_is_committed
+    write_flag_is_committed = master.NodePanel.write_flag_is_committed
 
 
 def test_predicate_covers_both_commit_points():
@@ -76,7 +76,7 @@ def test_gui_locks_and_unlocks_the_widget():
     root = tk.Tk()
     root.withdraw()
     try:
-        g = object.__new__(receiver.ReceiverGUI)
+        g = object.__new__(master.ReceiverGUI)
         g.node1, g.node2 = FakeNode(), FakeNode()
         g.write_disk_var = tk.BooleanVar(value=True)
         g._write_lock_var = tk.StringVar(value='')
@@ -134,7 +134,7 @@ def test_the_locked_line_reaches_the_run_log():
     root.withdraw()
     tmp = tempfile.mkdtemp(prefix='wl_')
     try:
-        g = object.__new__(receiver.ReceiverGUI)
+        g = object.__new__(master.ReceiverGUI)
         g.node1, g.node2 = FakeNode(), FakeNode()
         g.write_disk_var = tk.BooleanVar(value=False)
         g._write_lock_var = tk.StringVar(value='')
@@ -158,7 +158,7 @@ def test_the_locked_line_reaches_the_run_log():
 
         # The old order, to show the test would have caught it.
         rl = RunLog(tmp)
-        g2 = object.__new__(receiver.ReceiverGUI)
+        g2 = object.__new__(master.ReceiverGUI)
         g2.node1, g2.node2 = FakeNode(session_active=True), FakeNode()
         g2.write_disk_var = tk.BooleanVar(value=False)
         g2._write_lock_var = tk.StringVar(value='')

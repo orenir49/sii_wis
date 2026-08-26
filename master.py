@@ -27,7 +27,7 @@ from tkinter import ttk, scrolledtext, messagebox
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from receiver_backend import start_server, check_connection, run_session_loop, run_intensity_session
+from master_backend import start_server, check_connection, run_session_loop, run_intensity_session
 from correlate_multi import MultiCorrelateWindow
 from run_log import RunLog
 from offset_tools import estimate_offset
@@ -614,7 +614,7 @@ class NodePanel:
                 host=host, username=username,
                 mask_pixel=mask_pixel, raw_dump=raw_dump,
                 mask_filename=mask, log_fn=_log)
-            time.sleep(3)           # give sender.py command server time to start
+            time.sleep(3)           # give node.py command server time to start
             self._gui(self._connect)
         except ssh_launcher.UncommittedChangesError as exc:
             changes = str(exc)
@@ -735,7 +735,7 @@ class NodePanel:
 class ReceiverGUI:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
-        self.root.title('SPAD Receiver — Master Controller')
+        self.root.title('SPAD Master Controller')
         self.root.resizable(False, False)
 
         self._log_queue: queue.Queue = queue.Queue()

@@ -9,7 +9,7 @@ Sequence per node:
   5. Apply pixel mask via direct-tcpip tunnel  → M,<path>
   6. Check / run TDC calibration              → T,v,1  [→ T,c,1]
   7. Find sii_wis project directory
-  8. Start sender.py via venv pythonw.exe (detached, window visible)
+  8. Start node.py via venv pythonw.exe (detached, window visible)
 """
 
 import base64
@@ -376,12 +376,12 @@ def shutdown_lspad(host: str, username: str) -> None:
         client.close()
 
 
-def kill_sender(client: paramiko.SSHClient) -> str:
+def kill_node(client: paramiko.SSHClient) -> str:
     """
-    Kill any detached sender.py still running on the node. Returns the killed
+    Kill any detached node.py still running on the node. Returns the killed
     PIDs as text (empty if none).
 
-    Launch leaves the previous sender.py alive, and the command server binds
+    Launch leaves the previous node.py alive, and the command server binds
     with SO_REUSEADDR — on Windows a second process may bind an already-listening
     port, so a stale sender can keep answering the receiver with old code even
     after a successful git pull.
@@ -389,7 +389,17 @@ def kill_sender(client: paramiko.SSHClient) -> str:
     out, _ = run_ps(client, (
         "Get-CimInstance Win32_Process -Filter "
         "\"Name='pythonw.exe' or Name='python.exe'\" | "
-        "Where-Object { $_.CommandLine -like '*sender.py*' } | "
+        # BOTH names, permanently. This string lives on the master, so it became
+        # the new one the instant the module was renamed -- while the process
+        # actually running on the node was still started from sender.py. A
+        # matcher that only saw node.py would find nothing, kill nothing, and
+        # start a SECOND process; the command server binds SO_REUSEADDR, so on
+        # Windows it takes an already-listening port without error and the
+        # master then talks to the pre-rename code. Nothing raises. A sender.py
+        # will never exist again, so the extra clause costs nothing and also
+        # covers a launch from an older checkout.
+        "Where-Object { $_.CommandLine -like '*node.py*' "
+        "-or $_.CommandLine -like '*sender.py*' } | "
         "ForEach-Object { Stop-Process -Id $_.ProcessId -Force; $_.ProcessId }"
     ))
     return out.strip()
@@ -405,7 +415,7 @@ def launch_node(host: str, username: str,
     log_fn receives plain text lines (already newline-terminated).
     `mask_pixel` (a physical sensor location, not a pix ID) generates a
     single-pixel mask and takes priority over `mask_filename`.
-    `raw_dump`, if given, enables sender_backend's verbatim lSPAD capture
+    `raw_dump`, if given, enables node_backend's verbatim lSPAD capture
     (SII_WIS_RAW_DUMP) — the Stage 2a replay reference. It has to be set in the
     sender's own environment at launch, which is why start_detached takes an env
     at all. Prefer a RELATIVE path (spad_data then the filename): it resolves
@@ -493,14 +503,14 @@ def launch_node(host: str, username: str,
         # 7. Fetch + pull repo (aborts if uncommitted changes present)
         git_update(client, sii_dir, log_fn)
 
-        # 8. Kill any stale sender.py, then start a fresh one using venv pythonw.exe
+        # 8. Kill any stale node.py, then start a fresh one using venv pythonw.exe
         #    (window visible on remote desktop). Without the kill, the old process
         #    keeps the command port and the receiver talks to pre-pull code.
-        killed = kill_sender(client)
+        killed = kill_node(client)
         if killed:
-            log_fn(f'Killed stale sender.py (pid {killed.replace(chr(10), ", ")}).\n')
+            log_fn(f'Killed stale node.py (pid {killed.replace(chr(10), ", ")}).\n')
         pythonw = sii_dir + r'\.venv\Scripts\pythonw.exe'
-        sender  = sii_dir + r'\sender.py'
+        node_py = sii_dir + r'\node.py'
         env = None
         if raw_dump:
             # A relative path is resolved against THIS node's repo. The two
@@ -513,9 +523,9 @@ def launch_node(host: str, username: str,
                            f"'{os.path.dirname(raw_dump)}' | Out-Null")
             log_fn(f'RAW CAPTURE enabled -> {raw_dump}\n')
         # lspad_dir, not sii_dir: the .cmd must not land in the git repo.
-        start_detached(client, pythonw, sender, sii_dir, env=env,
+        start_detached(client, pythonw, node_py, sii_dir, env=env,
                        script_dir=lspad_dir)
-        log_fn('sender.py launched.\n')
+        log_fn('node.py launched.\n')
 
         return dwell_freq
 

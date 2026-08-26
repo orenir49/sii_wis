@@ -1,6 +1,6 @@
 """Reader for the sender's env-gated raw lSPAD capture (Stage 2 Phase 0).
 
-The capture is written by `sender_backend.py` when SII_WIS_RAW_DUMP names a
+The capture is written by `node_backend.py` when SII_WIS_RAW_DUMP names a
 file: for every `recv()` off the lSPAD stream socket, a little-endian uint32
 length followed by exactly those bytes.
 
