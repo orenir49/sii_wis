@@ -1,0 +1,25 @@
+# Dim-channel retention test, for mask_laser_8_dim.txt (locs 295-302 + 200, 250).
+# Load with the multi-pair window's "file" pair mode.
+#
+# Rows 1-8   the bright diagonal, same pairs as the mask_laser_8 reference run.
+# Rows 9-10  the two off-band pixels against themselves: expect a flat g2 with
+#            no comb (negative control -- background is not laser-correlated).
+# Rows 11-12 loc 298 against both dim pixels. This is the point of the run: it
+#            gives node-1 pixel 298 THREE partners, two of them sparse, so its
+#            release point becomes a min over a mixed-brightness partner set.
+#            That is the exact shape of the dim-channel coincidence-loss bug --
+#            and pair 298x298 must come out unchanged by the two dim partners
+#            being there, which is the invariant worth checking.
+pix1,pix2
+295,295
+296,296
+297,297
+298,298
+299,299
+300,300
+301,301
+302,302
+200,200
+250,250
+298,200
+298,250

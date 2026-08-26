@@ -26,6 +26,12 @@ HEADER_ROWS = 3
 ACTIVE_RANGE = (118, 216)  # pixel span covered by /gen_mask's default sparse mask
 FIT_CENTER = 160  # same center /gen_mask picks pixels closest to; keeps b near 0
 
+# This script lives at <repo>/.claude/skills/spectral-align/, four levels down.
+# Skill tooling is not on the app import path, so --emit-pairs reaches back to
+# tools/pair_map.py explicitly rather than the correlator importing from here.
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__)))))
+
 
 def load_trace(path):
     """Read a classical photon counting .txt into a per-pixel count array.
@@ -191,6 +197,40 @@ def write_matches_table(x1, x2, a, b_centered, path, top=5):
             y_pred = a * (p2 - FIT_CENTER) + b_centered
             diff   = abs((p1 - FIT_CENTER) - y_pred)
             f.write(f'{p1},{p2},{diff:.3f}\n')
+
+
+def write_pair_list(a, b_centered, span, path, which):
+    """Emit the (node-1, node-2) pair list this fit implies, as a pix1,pix2 CSV
+    the multi-pair correlator loads in "file" mode.
+
+    Delegates to tools/pair_map.affine_partner rather than inverting the fit
+    here. Two places owning the same inversion is how the fit and the
+    correlator end up disagreeing about a, b, FIT_CENTER, or the tie-rounding
+    rule -- and one flipped tie silently repoints a whole pair.
+    """
+    sys.path.insert(0, os.path.join(REPO_ROOT, 'tools'))
+    import pair_map
+
+    assert pair_map.FIT_CENTER == FIT_CENTER, (
+        f'FIT_CENTER disagrees: align_arc {FIT_CENTER} vs pair_map '
+        f'{pair_map.FIT_CENTER}. The pair list would be systematically shifted.')
+
+    lo, hi = span
+    pl = pair_map.derive('affine', lo=lo, hi=hi, a=a, b=b_centered)
+    with open(path, 'w') as f:
+        f.write(f'# node1,node2 pairs from the {which} fit: '
+                f'(ref-{FIT_CENTER}) = {a:.6f}*(other-{FIT_CENTER}) + {b_centered:.3f}\n')
+        f.write('pix1,pix2\n')
+        for p in pl.pairs:
+            f.write(f'{p.p1},{p.p2}\n')
+    print(f'wrote {path}  ({pl.summary()}, {which} fit)')
+    for p1, p2, reason in pl.dropped:
+        print(f'  dropped {p1} -> {p2}: {reason}')
+    shared = pl.shared_node2()
+    if shared:
+        print(f'  note: a = {a:.4f} != 1, so {len(shared)} node-2 pixel(s) serve '
+              f'two pairs each: ' + ', '.join(f'{k}<-{v}' for k, v in
+                                              list(shared.items())[:5]))
 
 
 def analyze(t1, t2, lo, hi, label, args, prom_override=(None, None)):
@@ -382,6 +422,11 @@ def main():
                     default=list(ACTIVE_RANGE),
                     help='pixel span to additionally fit in isolation, e.g. the sparse '
                          f'mask\'s active-pixel range (default {ACTIVE_RANGE[0]} {ACTIVE_RANGE[1]})')
+    ap.add_argument('--emit-pairs', type=int, nargs=2, metavar=('LO', 'HI'),
+                    default=None,
+                    help='write a pix1,pix2 CSV over node-1 pixels LO..HI using the '
+                         'active-range fit, for the multi-pair correlator to load in '
+                         '"file" mode')
     args = ap.parse_args()
 
     name1 = os.path.splitext(os.path.basename(args.ref))[0]
@@ -423,6 +468,12 @@ def main():
         matches_path = os.path.join(args.outdir, f'{prefix}_active_range_matches.txt')
         write_matches_table(rng['x1'], rng['x2'], rng['a'], rng['b_centered'], matches_path)
         print(f'wrote {matches_path}')
+
+    if args.emit_pairs is not None:
+        fit = rng if rng is not None else full
+        which = 'active-range' if rng is not None else 'full-detector'
+        write_pair_list(fit['a'], fit['b_centered'], args.emit_pairs,
+                        os.path.join(args.outdir, f'{prefix}_pairs.csv'), which)
 
 
 if __name__ == '__main__':

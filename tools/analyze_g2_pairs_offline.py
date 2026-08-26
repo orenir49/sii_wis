@@ -145,6 +145,8 @@ def main():
     ap.add_argument('--tmax', type=float, default=500_000.0, help='+-tau window, ps')
     ap.add_argument('--n-shift', type=int, default=20)
     ap.add_argument('--chunk', type=int, default=2_000_000)
+    ap.add_argument('--suffix', default='mask_two_offline',
+                    help=r'output file name suffix: spad_data\{px1}_{px2}_{suffix}.txt')
     args = ap.parse_args()
 
     offset = estimate_slave_offset(args.base)
@@ -172,7 +174,7 @@ def main():
         print(f'peak: tau={centers[peak_idx]:.0f} ps, count={hist[peak_idx]:,}, '
               f'excess={excess_pct:.4f}%, SNR={snr:.2f}')
 
-        out_path = fr'spad_data\{px1_s}_{px2_s}_mask_two_offline.txt'
+        out_path = fr'spad_data\{px1_s}_{px2_s}_{args.suffix}.txt'
         with open(out_path, 'w') as f:
             f.write('tau_ps\tcounts\n')
             for tau, count in zip(centers, hist):

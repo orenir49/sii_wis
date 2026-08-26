@@ -28,7 +28,8 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from receiver_backend import start_server, check_connection, run_session_loop, run_intensity_session
-from correlate import CorrelateWindow, QuadCorrelateWindow
+from correlate_multi import MultiCorrelateWindow
+from run_log import RunLog
 from offset_tools import estimate_offset
 import ssh_launcher
 
@@ -38,6 +39,28 @@ LAG_ALERT_S   = 2.0               # parser this far behind is worth reporting
 CAL_ARM_TIMEOUT_MS = 20_000       # give up waiting for a node's first chunk
 CAL_POLL_MS   = 250               # how often to check collected dwell span
 CAL_MAX_WAIT_S = 30.0             # backstop if a period never accumulates
+
+
+def merge_hooks(*hook_maps) -> dict:
+    """Compose per-window {key_id: Queue} maps into {key_id: [Queue, ...]}.
+
+    Append, never overwrite: two windows asking for the same (node, pixel) both
+    get every chunk. The old {**a, **b} dict-merge silently starved the loser,
+    and did the same to any window that asked for key 320/323 alongside the
+    dwell-calibration tap.
+
+    Accepts a bare Queue or a list/tuple of them as a value, so a caller that
+    has already merged can be composed again. Dedupe is by identity: the same
+    queue passed twice must not receive the payload twice.
+    """
+    merged: dict = {}
+    for m in hook_maps:
+        for kid, v in (m or {}).items():
+            qs = merged.setdefault(kid, [])
+            for q in (v if isinstance(v, (list, tuple)) else (v,)):
+                if all(q is not seen for seen in qs):
+                    qs.append(q)
+    return merged
 
 
 # ---------------------------------------------------------------------------
@@ -54,14 +77,12 @@ class NodePanel:
                  log_fn=None,
                  get_hooks_fn=None,
                  get_write_hooked_fn=None,
-                 set_correlate_pixel_fn=None,
                  on_first_data_fn=None) -> None:
         self.root          = root
         self.node_id       = node_id
         self.log_fn        = log_fn
         self._get_hooks_fn = get_hooks_fn
         self._get_write_hooked_fn = get_write_hooked_fn
-        self._set_correlate_pixel_fn = set_correlate_pixel_fn
         self._on_first_data_fn = on_first_data_fn
 
         self._ctrl_sock:   socket.socket | None = None
@@ -296,6 +317,19 @@ class NodePanel:
     def is_ready(self) -> bool:
         return self._state in ('ready', 'streaming')
 
+    def write_flag_is_committed(self) -> bool:
+        """True once this node's write-to-disk choice can no longer change.
+
+        `_accept_data_thread` reads get_write_hooked_fn() at the moment the data
+        connection is accepted, and run_session_loop keeps that value for every
+        back-to-back session on the connection. So the flag is fixed from the
+        accept -- and `_session_active` is included because START is sent
+        synchronously, seconds before the sender connects back: without it there
+        is a window where node 1 has committed and node 2 has not, which is the
+        exact desync this is meant to prevent.
+        """
+        return self._data_conn is not None or self._session_active
+
     # ------------------------------------------------------------------
     # Background threads
     # ------------------------------------------------------------------
@@ -437,9 +471,14 @@ class NodePanel:
                     except queue.Empty:
                         break
 
-            hooks = dict(self._get_hooks_fn() if self._get_hooks_fn else {})
-            hooks[320] = self._master_dwell_q  # master_dwell — offset diagnostics
-            hooks[323] = self._dwell_q         # slave_dwell — needed for clock-offset calibration
+            # Append-merge, so a correlator that also watches key 320 or 323
+            # keeps its subscription instead of being overwritten by the
+            # calibration tap (and vice versa).
+            hooks = merge_hooks(
+                self._get_hooks_fn() if self._get_hooks_fn else {},
+                {320: self._master_dwell_q,   # master_dwell — offset diagnostics
+                 323: self._dwell_q},         # slave_dwell — clock-offset calibration
+            )
 
             # Read once per session, not per chunk: toggling the checkbox
             # mid-run must not leave half a pixel's timestamps on disk.
@@ -546,8 +585,6 @@ class NodePanel:
             if not (0 <= mask_pixel <= 319):
                 self.log_fn(f'Node {self.node_id}: pixel must be between 0 and 319.\n')
                 return
-            if self._set_correlate_pixel_fn:
-                self._set_correlate_pixel_fn(mask_pixel)
         threading.Thread(
             target=self._ssh_launch,
             args=(host, username, mask, mask_pixel),
@@ -565,9 +602,17 @@ class NodePanel:
                         else f'[N{self.node_id}] {msg}\n')
 
         try:
+            # SII_WIS_RAW_DUMP on the MASTER means "capture on the nodes":
+            # the sender's dump has to be enabled in its own environment at
+            # launch, and there is no other moment to do it. One variable here
+            # beats a UI field nobody would remember to clear.
+            raw_dump = os.environ.get('SII_WIS_RAW_DUMP')
+            if raw_dump:
+                stem, ext = os.path.splitext(raw_dump)
+                raw_dump = f'{stem}_node{self.node_id}{ext or ".raw"}'
             self._dwell_freq = ssh_launcher.launch_node(
                 host=host, username=username,
-                mask_pixel=mask_pixel,
+                mask_pixel=mask_pixel, raw_dump=raw_dump,
                 mask_filename=mask, log_fn=_log)
             time.sleep(3)           # give sender.py command server time to start
             self._gui(self._connect)
@@ -694,6 +739,14 @@ class ReceiverGUI:
         self.root.resizable(False, False)
 
         self._log_queue: queue.Queue = queue.Queue()
+        # Every log line also goes to spad_data/log/<stamp>.log. Buffered during
+        # integration and flushed at the end: the master is already writing up
+        # to ~1.3 GB/s of timestamps and the sender's TCP window is what must
+        # not close. With write-to-disk off this file is the run's only record.
+        self._run_log = RunLog()
+        # False, not None: the first _refresh_write_disk_lock() at build time
+        # would otherwise read as a transition and log "unlocked" on every start.
+        self._write_locked_last = False
         self._run_id = 0
         self._cal_waiting: set[int] = set()   # nodes whose first data chunk is still pending
         self._cal_run = -1                    # run_id that opened the current wait
@@ -701,15 +754,34 @@ class ReceiverGUI:
         self._cal_acc: dict = {}              # node_id -> [slave_dwell, master_dwell]
         self._cal_deadline = 0.0
 
-        self._correlate_win = CorrelateWindow(root)
-        # Separate tool for a 2-pixel-per-node mask (e.g. mask_two.txt) --
-        # not unified with the single-pair correlator above. If both are
-        # enabled with an overlapping (node, pixel-loc), the hooks merge
-        # below lets whichever is spread second in the dict win; the other
-        # silently gets no data for that pixel.
-        self._quad_correlate_win = QuadCorrelateWindow(root)
+        # QuadCorrelateWindow is gone (deleted 2026-08-26). Its 2x2 workflow is
+        # the multi-pair window's "grid" pair mode at any size, and the
+        # multi-pair engine is validated on hardware, so its only remaining job
+        # -- transitional cross-check -- was done. Overlapping (node, pixel-loc)
+        # between the two remaining windows is fine: merge_hooks() fans the
+        # payload out to every subscriber.
+        # The mask fields are pulled from the NodePanels rather than retyped:
+        # the mask that matters is the one actually applied to the detector, and
+        # a second copy in the correlator is only ever a chance to disagree.
+        self._multi_correlate_win = MultiCorrelateWindow(
+            root, get_masks_fn=lambda: (self.node1.mask_var.get(),
+                                        self.node2.mask_var.get()))
+        # Every correlator window, in one place. Each one needs its hooks
+        # merged, its is_enabled consulted before calibration, and its
+        # start_with_offset called on every path out of the cal -- four sites
+        # that must never disagree about the set of windows. Adding a window
+        # means adding it here and nowhere else.
+        self._correlators = (self._multi_correlate_win,)
         self._monitor_abort: threading.Event | None = None
         self._build_ui()
+        self._push_write_disk_state()   # correlators start out agreeing with the box
+        self._refresh_write_disk_lock()
+        # Only now do the NodePanels exist, so this is the first moment the
+        # multi-pair window can read their mask fields.
+        for c in self._correlators:
+            refresh = getattr(c, '_refresh_masks', None)
+            if refresh:
+                refresh()
         self._poll_log()
         self._schedule_health_check()
         self.root.protocol('WM_DELETE_WINDOW', self._on_close)
@@ -734,10 +806,9 @@ class ReceiverGUI:
                                default_data_port=50007,
                                default_ssh_user='labcomp1',
                                log_fn=self._enqueue_log,
-                               get_hooks_fn=lambda: {**self._correlate_win.hooks_node1,
-                                                     **self._quad_correlate_win.hooks_node1},
+                               get_hooks_fn=lambda: merge_hooks(
+                                   *(c.hooks_node1 for c in self._correlators)),
                                get_write_hooked_fn=lambda: self.write_disk_var.get(),
-                               set_correlate_pixel_fn=lambda pix: self._correlate_win.px1_var.set(str(pix)),
                                on_first_data_fn=self._on_node_first_data)
         self.node2 = NodePanel(nodes_frame, self.root,
                                node_id=2,
@@ -746,10 +817,9 @@ class ReceiverGUI:
                                default_data_port=50008,
                                default_ssh_user='oreni',
                                log_fn=self._enqueue_log,
-                               get_hooks_fn=lambda: {**self._correlate_win.hooks_node2,
-                                                     **self._quad_correlate_win.hooks_node2},
+                               get_hooks_fn=lambda: merge_hooks(
+                                   *(c.hooks_node2 for c in self._correlators)),
                                get_write_hooked_fn=lambda: self.write_disk_var.get(),
-                               set_correlate_pixel_fn=lambda pix: self._correlate_win.px2_var.set(str(pix)),
                                on_first_data_fn=self._on_node_first_data)
 
         # ── acquisition controls ───────────────────────────────────────
@@ -770,10 +840,16 @@ class ReceiverGUI:
         self._cal_status_lbl = tk.Label(acq, textvariable=self._cal_status_var, anchor='w')
         self._cal_status_lbl.grid(row=2, column=0, columnspan=5, sticky='w', padx=8, pady=(0, 6))
 
-        ttk.Checkbutton(
+        self._write_disk_cb = ttk.Checkbutton(
             acq, text='Write timestamps to disk (uncheck: live correlation only)',
-            variable=self.write_disk_var, command=self._on_write_disk_toggle).grid(
-            row=3, column=0, columnspan=6, sticky='w', padx=8, pady=(0, 6))
+            variable=self.write_disk_var, command=self._on_write_disk_toggle)
+        self._write_disk_cb.grid(row=3, column=0, columnspan=6, sticky='w',
+                                 padx=8, pady=(0, 6))
+        # A greyed-out checkbox with no reason given is worse than a live one.
+        self._write_lock_var = tk.StringVar(value='')
+        tk.Label(acq, textvariable=self._write_lock_var, anchor='w',
+                 fg='#aa6600', wraplength=560, justify='left').grid(
+            row=4, column=0, columnspan=6, sticky='w', padx=8, pady=(0, 6))
 
         ttk.Label(acq, text='Duration (s):').grid(row=0, column=3, sticky='w', padx=(12, 4))
         self.duration_var = tk.StringVar(value='1')
@@ -831,13 +907,49 @@ class ReceiverGUI:
         toggle during a run applies from the next data connection — saying so
         beats leaving someone to wonder why px_*.bin kept growing.
         """
+        self._push_write_disk_state()
         if self.write_disk_var.get():
             self._enqueue_log('Write to disk ON — every pixel is persisted as usual.\n')
         else:
             self._enqueue_log(
-                'Write to disk OFF — live-correlated pixels will be fed to the '
-                'correlator only, with no px_*.bin. Sync markers are still '
-                'written. Applies from the next START.\n')
+                'Write to disk OFF — NOTHING will be written: no px_*.bin, no '
+                'sync files, no output directory. Hooked pixels go to the '
+                'correlator only. Applies from the next data connection.\n')
+
+    def _refresh_write_disk_lock(self) -> None:
+        """Lock the checkbox while the flag is already committed.
+
+        Deviation 2 of Stage 1b. The old mitigation only *said* the toggle
+        applied later; the box still moved, which reads as "this run will not
+        write" when the run had already decided otherwise. Worse, the value is
+        captured per node, so toggling between the two nodes' accepts wrote one
+        node's pixels and not the other's -- half a dataset, found later.
+        """
+        locked = any(n.write_flag_is_committed() for n in (self.node1, self.node2))
+        self._write_disk_cb.configure(state='disabled' if locked else 'normal')
+        self._write_lock_var.set(
+            'Locked: the write choice is fixed when a node\'s data connection '
+            'is accepted and holds for every session on it. Disconnect a node to '
+            'change it.' if locked else '')
+        if locked != getattr(self, '_write_locked_last', False):
+            self._write_locked_last = locked
+            self._enqueue_log(
+                f'Write-to-disk choice {"LOCKED" if locked else "unlocked"} '
+                f'({"ON" if self.write_disk_var.get() else "OFF"}).\n')
+
+    def _push_write_disk_state(self) -> None:
+        """Tell every correlator whether the timestamps are being kept.
+
+        Without this the correlator cannot know, and its overload warning says
+        "raw data is still complete on disk" — which is false the moment the
+        checkbox is unchecked. What an overload MEANS changes with this flag:
+        a recoverable delay, or permanent photon loss.
+        """
+        on = bool(self.write_disk_var.get())
+        for c in self._correlators:
+            setter = getattr(c, 'set_write_to_disk', None)
+            if setter is not None:
+                setter(on)
 
     def _start_all(self) -> None:
         try:
@@ -880,6 +992,24 @@ class ReceiverGUI:
 
         self._run_id += 1
         self._set_cal_status('')
+        writing = self.write_disk_var.get()
+        path = self._run_log.start(header=(
+            f'# sii_wis run log — {time.strftime("%Y-%m-%d %H:%M:%S")}\n'
+            f'# duration={duration} s  nodes={sent}  '
+            f'write_timestamps_to_disk={writing}\n'
+            + ('' if writing else
+               '# NOTHING is written to disk this run: no px_*.bin, no sync '
+               'files. This file is the only record.\n')))
+        if path:
+            self._enqueue_log(f'Run log: {path}\n')
+        # AFTER the run log is open, not before: this call logs the LOCKED
+        # transition, and the whole point of locking is that the run kept what
+        # it said it would. Refreshing first sent that line to the pane while
+        # the file did not exist yet, so RunLog dropped it -- the lock worked
+        # and its record did not, which for a writes-off run is precisely
+        # where the record is the only evidence there was a run at all.
+        # Still before any accept, so the two nodes cannot disagree.
+        self._refresh_write_disk_lock()
         if duration == 0:
             self._enqueue_log(f'START sent to {sent} node(s) (real, indefinite).\n')
             self._start_timer()
@@ -890,7 +1020,7 @@ class ReceiverGUI:
             step_ms = max(1, int(duration / 10 * 1000))
             self._schedule_progress(step_ms, 1, self._run_id)
 
-        if self._correlate_win.is_enabled or self._quad_correlate_win.is_enabled:
+        if any(c.is_enabled for c in self._correlators):
             # Wait for data to actually flow before opening the calibration
             # window. Between START and the first timestamp the sender still has
             # to reach the receiver and negotiate with lSPAD (STOP, drain,
@@ -929,6 +1059,10 @@ class ReceiverGUI:
                 if node.is_finishing():
                     node._set_data_status('draining' if soft else 'stopping')
         self._run_id += 1          # invalidates pending progress/timer/sparse-cal callbacks
+        n = self._run_log.finish()
+        if self._run_log.path:
+            self._enqueue_log(
+                f'Run log flushed: {n} line(s) -> {self._run_log.path}\n')
         self._cal_waiting.clear()
         self._show_progress_bar()
         self._set_progress(0)
@@ -1094,6 +1228,14 @@ class ReceiverGUI:
             self._set_progress(step * 10)
             if step < 10:
                 self._schedule_progress(step_ms, step + 1, run_id)
+            else:
+                # Integration over: stop buffering and flush. Lines that arrive
+                # afterwards (the soft-stop drain, the session summary) append
+                # straight through, which is where they belong.
+                n = self._run_log.finish()
+                if self._run_log.path:
+                    self._enqueue_log(
+                        f'Run log flushed: {n} line(s) -> {self._run_log.path}\n')
         self.root.after(step_ms, tick)
 
     def _start_timer(self) -> None:
@@ -1238,8 +1380,8 @@ class ReceiverGUI:
             self._set_cal_status(
                 f'● Calibration failed ({t1.size}/{t2.size} events) — offset = 0',
                 color='#cc3333')
-            self._correlate_win.start_with_offset(0)
-            self._quad_correlate_win.start_with_offset(0)
+            for c in self._correlators:
+                c.start_with_offset(0)
             self.node1.start_dwell_drain()
             self.node2.start_dwell_drain()
             return
@@ -1290,8 +1432,8 @@ class ReceiverGUI:
         self._set_cal_status(
             f'● Calibrated — offset {slave_offset:+,} ps, acquisition running',
             color='#228822')
-        self._correlate_win.start_with_offset(slave_offset)
-        self._quad_correlate_win.start_with_offset(slave_offset)
+        for c in self._correlators:
+            c.start_with_offset(slave_offset)
         self.node1.start_dwell_drain()
         self.node2.start_dwell_drain()
 
@@ -1305,6 +1447,7 @@ class ReceiverGUI:
     def _health_check(self) -> None:
         self.node1.health_check()
         self.node2.health_check()
+        self._refresh_write_disk_lock()
         self._schedule_health_check()
 
     # ------------------------------------------------------------------
@@ -1327,6 +1470,9 @@ class ReceiverGUI:
 
     def _enqueue_log(self, text: str) -> None:
         self._log_queue.put(text)
+        # Never let the file get in the way of the pane: RunLog swallows its own
+        # OSErrors and counts drops rather than raising.
+        self._run_log.add(text)
 
     def _poll_log(self) -> None:
         try:
