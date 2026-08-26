@@ -646,10 +646,20 @@ Why this shape:
 - **Grid over two 40-pixel masks is 1600 pairs**, which `max_pairs` refuses rather than truncates.
   Grid is for small masks (its original 2x2 Quad workflow); the guard is what keeps that honest.
 
-The affine workflow is now: `align_arc.py --emit-pairs` -> CSV -> file mode. That also means the
-**one hardware gap left for affine is a light source with spectral structure** — the pulsed laser
-illuminates a band uniformly, so any pairing produces a comb and it cannot distinguish a correct
-mapping from a wrong one. That needs the arc lamp.
+The affine workflow is now: `align_arc.py --emit-pairs` -> CSV -> file mode.
+
+**Affine pair-mode is out of scope for live validation, and that is not a gap to close later on this
+bench.** Validating a *mapping* requires a correlated signal that also varies with wavelength, and
+neither source here provides one: the pulsed laser illuminates a band uniformly, so every pixel sees
+the same train and any pairing produces a comb; the arc lamp has the spectral structure but produces
+**no detectable bunching at all** (an hour at 300 kcps with 1 ns bins, 25-8-26 — it is a classical
+alignment source, which is exactly what `align_arc.py` uses it for, on intensity rather than g2).
+A real test needs broadband thermal light, which is separate future work.
+
+What *is* verified, and is the part this plan owns: the CSV round-trips what the affine helper
+derived, `align_arc` and `pair_map` cannot disagree about the inversion because
+`write_pair_list` is the only caller, and a non-bijective mapping's shared node-2 channels are
+accumulated once rather than once per pair (`tests/test_multi_window.py`).
 
 ### Channels and retention
 
