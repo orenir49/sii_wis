@@ -26,14 +26,14 @@ ab9a8c2  Add tools/pair_map.py: pure pair derivation, shared with align_arc
 d049f36  Stage 1a: fan pixel_hooks out to every subscriber
 ```
 
-### Test suite — 226 checks, all passing as of 2026-08-26
+### Test suite — 250 checks, all passing as of 2026-08-26
 
 Plain asserts, no pytest (it is not in `requirements.txt`). **Run all of these before trusting any
 change**; the whole suite takes ~2 minutes, most of it numba compiling.
 
 ```
 .venv\Scripts\python.exe tests\test_epoch_fix.py         # 12  (on main)
-.venv\Scripts\python.exe tests\test_hook_fanout.py       # 21  Stage 1a + 1b
+.venv\Scripts\python.exe tests\test_hook_fanout.py       # 29  Stage 1a + 1b
 .venv\Scripts\python.exe tests\test_channel_graph.py     # 59  retention
 .venv\Scripts\python.exe tests\test_multi_window.py      # 45  end-to-end
 .venv\Scripts\python.exe tools\pair_map.py --selftest    # 44  pair derivation
@@ -126,7 +126,18 @@ Quad is now free to go.** Item 3 is the next thing to do.
   (every window now marks the tallest bin automatically) and the multi-pair SNR-vs-pair sparkline —
   the selected pair's peak SNR moved to the info line, and the window is one plot.
 - Stage 1b deviations 2 and 3 (disable the checkbox while streaming; record it in
-  `session_stats.json`) remain open.
+  `session_stats.json`) remain open — though **deviation 3 is largely answered another way**:
+  every run's log is now captured to `spad_data/log/<stamp>.log` with the flag in its header, so
+  a directory with no `px_*.bin` is explicable from a file rather than only from a live pane.
+
+- **Writes-off now means nothing at all, sync keys included** (2026-08-26). The first version kept
+  keys 320-325 so the offline offset estimate would still have its dwell streams — but with no
+  photons retained that estimate has nothing to serve, and writing them created a sharper failure
+  than not: a 15-minute writes-off run into a REUSED directory left fresh sync streams beside 2.25 GB
+  of the previous run's `px_*.bin`, which `analyze_g2_pairs_offline.py` or `spad_new.ipynb` would read
+  as one dataset and answer confidently from the wrong run. Found while verifying the writes-off run
+  itself. A data directory now either holds a whole run or was never touched, and a pre-existing one
+  is called out in the log.
 - `ReceiverGUI._correlators` is now **two** windows (Quad is no longer instantiated). Adding one means
   editing that one tuple — that was the point of the refactor — but re-check the four consumers if you
   add a window with a different interface.

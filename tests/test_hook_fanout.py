@@ -108,10 +108,16 @@ def drain(q):
             return out
 
 
-def run_stream(frames, hooks, write_hooked=True):
+def run_stream(frames, hooks, write_hooked=True, fresh_dir=False):
     """Feed `frames` through a real run_session_loop over a socketpair.
-    Returns (output_dir, log lines)."""
+    Returns (output_dir, log lines).
+
+    fresh_dir: hand the loop a path that does NOT exist yet, so whether it
+    creates the directory is observable. mkdtemp would otherwise have made it.
+    """
     outdir = tempfile.mkdtemp(prefix='fanout_')
+    if fresh_dir:
+        outdir = os.path.join(outdir, 'session')
     srv, cli = socket.socketpair()
     logs = []
     th = threading.Thread(
@@ -226,11 +232,9 @@ def test_write_hooked_off_with_no_hooks_at_all():
     Before deviation 1 the `and subs` guard made this a silent no-op: the
     label promised nothing would be written and everything was."""
     outdir, _ = run_stream([frame(42, PAYLOAD_A), frame(323, PAYLOAD_B)],
-                           {}, write_hooked=False)
-    n_px = len([f for f in os.listdir(outdir) if f.startswith('px_')])
-    check('writes off with zero hooks: no pixel files, sync still written',
-          n_px == 0 and os.path.exists(os.path.join(outdir, 'slave_dwell.bin')),
-          f'n_px={n_px}')
+                           {}, write_hooked=False, fresh_dir=True)
+    check('writes off with zero hooks: nothing is created at all',
+          not os.path.exists(outdir), outdir)
 
 
 def test_write_hooked_off_log_names_the_hooked_pixels():
@@ -240,18 +244,76 @@ def test_write_hooked_off_log_names_the_hooked_pixels():
                               write_hooked=False)
     msg = [m for m in logs if 'Write to disk OFF' in m]
     check('writes off: one up-front log line naming the hooked pixels',
-          len(msg) == 1 and '[42]' in msg[0] and 'no px_*.bin at all' in msg[0],
+          len(msg) == 1 and '[42]' in msg[0] and 'NOTHING is written' in msg[0],
           f'msg={msg}')
 
 
-def test_sync_keys_never_suppressed_with_list_hooks():
-    """skipped_keys is built from the normalized map, so the k < 320 guard
-    must still hold when the value is a list rather than a bare Queue."""
+def test_writes_off_suppresses_the_sync_keys_too():
+    """Changed 2026-08-26: writes off now means NOTHING, sync files included.
+
+    They cost ~370 B/s against ~13 MB/s of timestamps, so keeping them bought no
+    disk relief -- and with no photons retained the offline offset estimate they
+    existed to serve has nothing to be applied to. Worse, fresh sync streams
+    landing in a directory that still held an earlier run's px_*.bin read as one
+    coherent dataset to any offline tool.
+    """
     q = queue.Queue()
-    outdir, _ = run_stream([frame(323, PAYLOAD_A)], {42: [q], 323: [queue.Queue()]},
-                           write_hooked=False)
-    check('keys 320-325 are written even when hooked and writes are off',
+    outdir, _ = run_stream([frame(42, PAYLOAD_A), frame(323, PAYLOAD_B)],
+                           {42: [q], 323: [queue.Queue()]}, write_hooked=False)
+    check('writes off: no sync files either',
+          not os.path.exists(os.path.join(outdir, 'slave_dwell.bin')))
+    check('writes off: the session directory is left completely empty',
+          os.listdir(outdir) == [], str(os.listdir(outdir)))
+    check('writes off: sync payloads still reach their subscribers',
+          drain(q) == [PAYLOAD_A])
+
+
+def test_writes_off_does_not_even_create_the_directory():
+    outdir, _ = run_stream([frame(42, PAYLOAD_A)], {42: [queue.Queue()]},
+                           write_hooked=False, fresh_dir=True)
+    check('writes off: a non-existent output directory is not created',
+          not os.path.exists(outdir), outdir)
+
+
+def test_writes_on_still_creates_everything():
+    """The other direction has to keep holding: with writes on, a hooked sync key
+    is still persisted (the original latent-clobber bug) and the directory is
+    made even if it did not exist."""
+    outdir, _ = run_stream([frame(323, PAYLOAD_A)], {323: [queue.Queue()]},
+                           write_hooked=True, fresh_dir=True)
+    check('writes on: the output directory is created',
+          os.path.isdir(outdir), outdir)
+    check('writes on: a hooked sync key is still written',
           os.path.exists(os.path.join(outdir, 'slave_dwell.bin')))
+    check('writes on: all 320 px files plus 6 sync files',
+          len([f for f in os.listdir(outdir) if f.startswith('px_')]) == 320
+          and len(os.listdir(outdir)) == 326, str(len(os.listdir(outdir))))
+
+
+def test_writes_off_warns_about_a_stale_directory():
+    """The one way writes-off can still mislead: a directory left over from an
+    earlier run. Its px_*.bin are not this session's data, and an offline tool
+    would happily read them as if they were."""
+    outdir = tempfile.mkdtemp(prefix='fanout_stale_')
+    with open(os.path.join(outdir, 'px_007.bin'), 'wb') as f:
+        f.write(PAYLOAD_A)
+    srv, cli = socket.socketpair()
+    logs = []
+    th = threading.Thread(
+        target=run_session_loop,
+        kwargs=dict(conn=srv, log_fn=logs.append, pixel_hooks={42: queue.Queue()},
+                    write_hooked=False), daemon=True)
+    th.start()
+    cli.sendall(frame(KEY_SETUP, outdir.encode('utf-8')))
+    cli.sendall(frame(42, PAYLOAD_A))
+    cli.sendall(frame(KEY_END))
+    cli.close()
+    th.join(timeout=10)
+    srv.close()
+    check('a stale px_*.bin from an earlier run is called out',
+          any('EARLIER run' in m for m in logs), str(logs)[:200])
+    check('and the stale file is left untouched, not deleted',
+          os.path.exists(os.path.join(outdir, 'px_007.bin')))
 
 
 if __name__ == '__main__':

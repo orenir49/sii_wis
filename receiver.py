@@ -30,6 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from receiver_backend import start_server, check_connection, run_session_loop, run_intensity_session
 from correlate import CorrelateWindow
 from correlate_multi import MultiCorrelateWindow
+from run_log import RunLog
 from offset_tools import estimate_offset
 import ssh_launcher
 
@@ -722,6 +723,11 @@ class ReceiverGUI:
         self.root.resizable(False, False)
 
         self._log_queue: queue.Queue = queue.Queue()
+        # Every log line also goes to spad_data/log/<stamp>.log. Buffered during
+        # integration and flushed at the end: the master is already writing up
+        # to ~1.3 GB/s of timestamps and the sender's TCP window is what must
+        # not close. With write-to-disk off this file is the run's only record.
+        self._run_log = RunLog()
         self._run_id = 0
         self._cal_waiting: set[int] = set()   # nodes whose first data chunk is still pending
         self._cal_run = -1                    # run_id that opened the current wait
@@ -943,6 +949,16 @@ class ReceiverGUI:
 
         self._run_id += 1
         self._set_cal_status('')
+        writing = self.write_disk_var.get()
+        path = self._run_log.start(header=(
+            f'# sii_wis run log — {time.strftime("%Y-%m-%d %H:%M:%S")}\n'
+            f'# duration={duration} s  nodes={sent}  '
+            f'write_timestamps_to_disk={writing}\n'
+            + ('' if writing else
+               '# NOTHING is written to disk this run: no px_*.bin, no sync '
+               'files. This file is the only record.\n')))
+        if path:
+            self._enqueue_log(f'Run log: {path}\n')
         if duration == 0:
             self._enqueue_log(f'START sent to {sent} node(s) (real, indefinite).\n')
             self._start_timer()
@@ -992,6 +1008,10 @@ class ReceiverGUI:
                 if node.is_finishing():
                     node._set_data_status('draining' if soft else 'stopping')
         self._run_id += 1          # invalidates pending progress/timer/sparse-cal callbacks
+        n = self._run_log.finish()
+        if self._run_log.path:
+            self._enqueue_log(
+                f'Run log flushed: {n} line(s) -> {self._run_log.path}\n')
         self._cal_waiting.clear()
         self._show_progress_bar()
         self._set_progress(0)
@@ -1157,6 +1177,14 @@ class ReceiverGUI:
             self._set_progress(step * 10)
             if step < 10:
                 self._schedule_progress(step_ms, step + 1, run_id)
+            else:
+                # Integration over: stop buffering and flush. Lines that arrive
+                # afterwards (the soft-stop drain, the session summary) append
+                # straight through, which is where they belong.
+                n = self._run_log.finish()
+                if self._run_log.path:
+                    self._enqueue_log(
+                        f'Run log flushed: {n} line(s) -> {self._run_log.path}\n')
         self.root.after(step_ms, tick)
 
     def _start_timer(self) -> None:
@@ -1390,6 +1418,9 @@ class ReceiverGUI:
 
     def _enqueue_log(self, text: str) -> None:
         self._log_queue.put(text)
+        # Never let the file get in the way of the pane: RunLog swallows its own
+        # OSErrors and counts drops rather than raising.
+        self._run_log.add(text)
 
     def _poll_log(self) -> None:
         try:

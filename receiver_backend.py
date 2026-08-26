@@ -119,12 +119,10 @@ def run_session_loop(conn: socket.socket, log_fn=print,
                   data chunk arrives. Marks the moment acquisition is genuinely
                   under way — several seconds after START, since the sender
                   still has to reach the receiver and negotiate with lSPAD.
-    write_hooked: when False, NO pixel key is written — hooked ones are fed to
-                  their queue only, un-hooked ones are discarded. Live
-                  correlation without keeping the timestamps. No px_*.bin is
-                  created at all, so an absent file means "deliberately not
-                  recorded" rather than an empty one that reads as "pixel saw
-                  nothing".
+    write_hooked: when False, NOTHING is written -- no px_*.bin, no sync files,
+                  and the output directory is not even created. Hooked keys are
+                  fed to their queues only; everything else is discarded. Live
+                  correlation without keeping any of it.
 
                   The suppression is deliberately NOT limited to hooked keys.
                   At 160 active pixels x 1 MHz the write path is ~1.28 GB/s and
@@ -134,11 +132,17 @@ def run_session_loop(conn: socket.socket, log_fn=print,
                   watches only a subset, which is the normal case, so the flag
                   would not deliver the relief it exists for.
 
-                  Only keys < 320 are ever suppressed. Keys 320–325 carry the
-                  dwell/line/frame markers, which are hooked on every run for
-                  clock calibration and are what the offline offset estimate
-                  needs afterwards; dropping those would make a run
-                  unanalysable rather than merely unrecorded.
+                  The sync keys 320-325 go too, which is a change from the first
+                  version. They cost almost nothing (~370 B/s against ~13 MB/s
+                  of timestamps), and the argument for keeping them was that the
+                  offline offset estimate needs them -- but with no photons kept
+                  there is nothing for that offset to be applied to. Writing
+                  them also created a worse failure than not: fresh sync streams
+                  landing in a directory that still held an EARLIER run's
+                  px_*.bin, which an offline tool reads as one coherent dataset
+                  and then answers confidently from the wrong run. Now a data
+                  directory either holds a whole run or was never touched, and
+                  the run's own account lives in spad_data/log/ (run_log.py).
     """
     # Normalize the hook map once per connection so the inner loop stays
     # branch-light and legacy {key: Queue} callers keep working unchanged.
@@ -152,7 +156,8 @@ def run_session_loop(conn: socket.socket, log_fn=print,
     # the same keys.
     skipped_keys: set = set()
     if not write_hooked:
-        skipped_keys = set(range(320))
+        # Every key, sync included: "write nothing" means nothing.
+        skipped_keys = set(range(320)) | set(SPECIAL_KEY_TO_FILENAME)
 
     session = 0
     stream  = conn.makefile('rb', buffering=1 << 20)
@@ -168,28 +173,40 @@ def run_session_loop(conn: socket.socket, log_fn=print,
             session   += 1
             log_fn(f'[session {session}] Output: {output_dir}')
 
-            os.makedirs(output_dir, exist_ok=True)
             handles: dict = {}
-            for loc in range(320):
-                if loc in skipped_keys:
-                    continue
-                handles[loc] = open(os.path.join(output_dir, f'px_{loc:03d}.bin'), 'wb')
-            for kid, fname in SPECIAL_KEY_TO_FILENAME.items():
-                handles[kid] = open(os.path.join(output_dir, fname), 'wb')
+            if write_hooked:
+                os.makedirs(output_dir, exist_ok=True)
+                for loc in range(320):
+                    handles[loc] = open(
+                        os.path.join(output_dir, f'px_{loc:03d}.bin'), 'wb')
+                for kid, fname in SPECIAL_KEY_TO_FILENAME.items():
+                    handles[kid] = open(os.path.join(output_dir, fname), 'wb')
 
             if skipped_keys:
-                # Say it once per session, up front: a run whose pixels were
-                # never recorded must not look like a normal one. Name the
-                # hooked pixels explicitly — those are the only ones whose
-                # photons survive anywhere, so that list is the session's
-                # entire pixel record.
+                # Say it once per session, up front: a run that recorded nothing
+                # must not look like a normal one. Name the hooked pixels --
+                # those are the only ones whose photons survive anywhere, so
+                # that list is the session's entire record.
                 _hooked = sorted(k for k in subs if k < 320)
                 _shown  = (str(_hooked) if len(_hooked) <= 12
                            else f'{_hooked[:12]}... ({len(_hooked)} total)')
-                log_fn(f'[session {session}] Write to disk OFF — no px_*.bin at all '
-                       f'this session. Live-correlated pixel(s) {_shown} stream to '
-                       f'the correlator only; every other pixel is discarded. Sync '
-                       f'files (keys 320-325) are written as usual.')
+                log_fn(f'[session {session}] Write to disk OFF — NOTHING is written '
+                       f'this session: no px_*.bin, no sync files, and '
+                       f'{output_dir} is not created. Live-correlated pixel(s) '
+                       f'{_shown} stream to the correlator only; everything else '
+                       f'is discarded. This log is the only record of the run.')
+                # A directory left over from an earlier run is the one way this
+                # can still mislead: its px_*.bin are NOT this run's data.
+                try:
+                    _stale = len([f for f in os.listdir(output_dir)
+                                  if f.startswith('px_') and f.endswith('.bin')])
+                except OSError:
+                    _stale = 0
+                if _stale:
+                    log_fn(f'[session {session}] NOTE: {output_dir} already holds '
+                           f'{_stale} px_*.bin from an EARLIER run. Nothing was '
+                           f'written now, so those files are not this session — '
+                           f'do not analyse them against this run.')
 
             chunks    = 0
             unknown   = 0
