@@ -425,6 +425,7 @@ class MultiCorrelateWindow(tk.Toplevel):
         if hasattr(self, 'enable_btn'):
             self.enable_btn.configure(state='disabled')
             self.pairs_var.set('Mode changed - Derive again.')
+            self.status_var.set('Input changed - Derive again.')
 
     def _resolve_mask(self, name: str):
         """Receiver mask name -> local path, or (None, reason).
@@ -506,11 +507,17 @@ class MultiCorrelateWindow(tk.Toplevel):
             self._pairs = None
             self.enable_btn.configure(state='disabled')
             self.pairs_var.set('Derive produced 0 pairs.')
+            self.status_var.set('Derive produced 0 pairs - Enable stays disabled.')
             return
 
         self._pairs = pl
         self.enable_btn.configure(state='normal')
         self.pairs_var.set(pl.summary())
+        # The status line has to move too. It said "Derive a pair list, then
+        # Enable" from the end of the prewarm, and _derive only ever set it on
+        # FAILURE -- so a successful derive left the window telling you to do the
+        # thing you had just done, with the pair count in a different label.
+        self.status_var.set(f'Derived {len(pl)} pairs. Press Enable to start.')
         self.pair_box.configure(values=[f'{p.p1} × {p.p2}' for p in pl.pairs])
         self.pair_var.set(f'{pl.pairs[0].p1} × {pl.pairs[0].p2}')
         self._show_preview(pl, m1, m2)

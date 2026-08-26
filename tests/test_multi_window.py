@@ -161,6 +161,12 @@ def test_end_to_end_comb():
               w._pairs is not None and len(w._pairs) == 8, w.pairs_var.get())
         check('Enable is disabled until Derive succeeds -- and enabled after',
               str(w.enable_btn['state']) == 'normal')
+        # The status line must move too. It sat on the prewarm's "Derive a pair
+        # list, then Enable" after a SUCCESSFUL derive, so the window told you to
+        # do what you had just done and the button looked broken.
+        check('a successful Derive updates the status line, not just the summary',
+              'Derived' in w.status_var.get() and 'Enable' in w.status_var.get(),
+              w.status_var.get())
 
         w._enable()
         check('enable built a channel graph keyed by distinct pixel',
