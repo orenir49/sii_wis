@@ -85,9 +85,17 @@ def main() -> int:
             print(f'  TRUNCATED: {s["truncated_tail"]} trailing byte(s) — the cap '
                   f'tripped or the sender died. Whole chunks above are intact.')
         if s['remainder']:
-            print(f'  NOTE: payload is not a multiple of 7, so the capture ends '
-                  f'mid-record. Expected if it was cut short; the parser handles '
-                  f'it the same way it handles a mid-record recv.')
+            with open(p, 'rb') as f:
+                f.seek(0, 2)
+                f.seek(max(0, f.tell() - 8))
+                tail = f.read()
+            if tail.endswith(b'DONE'):
+                print('  the 4 trailing bytes are the lSPAD DONE trailer, not a '
+                      'truncated record - a complete acquisition ends this way')
+            else:
+                print(f'  NOTE: {s["remainder"]} byte(s) past the last whole '
+                      f'record and no DONE trailer, so this capture really was '
+                      f'cut short. Whole records above are still usable.')
     print(f'\nnext: python tools{chr(92)}replay.py {got[0]} --outdir replay_out')
     return 0
 

@@ -47,15 +47,22 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import raw_dump
 
-# Stats that are NOT invariants of the input, and why. Getting this list wrong
-# is how a harness produces false alarms that get explained away, so it is
-# explicit rather than a filter on substrings.
-TIMING_STATS = {
+# Stats that are NOT invariants of the input, and why. Getting this list wrong is
+# how a harness produces false alarms that then get explained away, so it is
+# explicit and annotated rather than a filter on substrings. Everything NOT here
+# must match, including the per-chip:id `abnormal` dict -- a sharper invariant
+# than the scalar counters, since it pins WHICH ids were seen.
+NON_INVARIANT_STATS = {
     'lag_s',        # wall clock minus reconstructed detector time
     'lag_max_s',    # ditto, peak
     'queue_max',    # send-queue depth: depends on how fast the consumer drains
     'queue_blocks', # ditto
+    'elapsed_s',    # a replay runs ~14x faster than the acquisition did
+    'raw_dump_b',   # the run being replayed had the capture on; the replay does not
+    'recv_calls',   # properties of how the stream was CHUNKED, not of the parse:
+    'recv_mean_b',  # identical chunking gives identical values either way
 }
+TIMING_STATS = NON_INVARIANT_STATS      # old name, kept so callers do not break
 
 
 class ReplaySocket:
@@ -198,7 +205,7 @@ def compare(dir_a: str, dir_b: str, stats_a: dict, stats_b: dict) -> dict:
                          f'first at byte {where})')
         else:
             n_same += 1
-    keys = ((set(stats_a) | set(stats_b)) - TIMING_STATS)
+    keys = ((set(stats_a) | set(stats_b)) - NON_INVARIANT_STATS)
     for k in sorted(k for k in keys if not k.startswith('_')):
         if stats_a.get(k) != stats_b.get(k):
             diffs.append(f'stats[{k!r}]: {stats_a.get(k)!r} vs {stats_b.get(k)!r}')

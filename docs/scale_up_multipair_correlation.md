@@ -15,7 +15,7 @@ stable 1v1 fallback.**
 |---|---|
 | **1a** tap fan-out | **DONE** — `d049f36` |
 | **1b** write-to-disk checkbox | **COMPLETE** 2026-08-26 — deviation 1 closed, semantics widened to write *nothing*, deviation 2 (checkbox locked once committed) fixed, deviation 3 largely answered by `spad_data/log/`. Verified on hardware: a 15-min run wrote 0 bytes of the 11.43 GB it would have, with the buffer plateauing |
-| **2** sender throughput | **DEFERRED, now on hardware evidence** — Phase 0 capture scaffolding landed 2026-08-26; 2.97 M rec/s sustained clean at 40 pixels against the ~80 M/s that would make 2a bind. Replay harness still to write |
+| **2** sender throughput | **DEFERRED, and now PROVABLE** — Phase 0 complete 2026-08-26: real captures taken from both nodes and `tools/replay.py` reproduces each acquisition byte-for-byte across all 326 files, `epoch_fixes` included. Still deferred on merit: 2.97 M rec/s runs clean at 40 pixels against the ~80 M/s that would make 2a bind |
 | **3** multi-pair correlator | **COMPLETE** 2026-08-26 — validated on hardware from 8 to 40 pairs, 10 and 40 MHz, up to 15 min, comb on every pair in every run; 80 pairs covered synthetically; `QuadCorrelateWindow` deleted |
 
 ```
@@ -218,9 +218,29 @@ Quad is now free to go.** Item 3 is the next thing to do.
   timestamp. It also proves it can *detect* a regression: one altered record in one chunk shows up as
   a differing `px_*.bin`.
 
-  **Still needed: one real capture.** The raw dump landed after the 26-8-26 runs, so nothing has been
-  captured from hardware yet. Until then the harness is proven against synthetic records only, and
-  Stage 2a stays argued rather than proved.
+- **Validated against a real capture, 2026-08-26 03:23.** Both nodes captured a 30 s / 40-pixel
+  acquisition with writes ON, so the run's own `px_*.bin` are ground truth — a stronger check than
+  replay-vs-replay, and it validates the harness before it is ever used to judge a rewrite.
+
+  | | node 1 | node 2 |
+  |---|---|---|
+  | capture | 285.4 MB, 13,544 chunks | 376.5 MB, 13,916 chunks |
+  | records | 40,764,709 | 53,787,294 |
+  | `epoch_fixes` original / replay | 0 / 0 | **1 / 1** |
+  | `abnormal` | matches | matches |
+  | **all 326 files** | **byte-identical** | **byte-identical** |
+
+  Node 2's single `epoch_fixes` is the result that matters: that correction is
+  chunk-boundary-sensitive, it fired in the acquisition, and the replay reproduced it exactly. That is
+  the length-prefixed capture doing the job it exists for, on real data. Replay runs ~14x faster than
+  the acquisition (4.4 s for 60.6 s of data), so a rewrite can be checked in seconds.
+
+  Two stats had to be added to `NON_INVARIANT_STATS` once real data reached it: `elapsed_s` (a replay
+  is 14x faster) and `raw_dump_b` (the captured run had the dump on, the replay does not). `recv_calls`
+  and `recv_mean_b` are excluded too — they describe how the stream was *chunked*, not the parse.
+
+  **Stage 2a is now provable.** The capture, the oracle and the ground-truth comparison all exist; what
+  remains is writing the faster parser.
 
 - **The mask-driven pair modes have run on hardware** (2026-08-26): the 15-min writes-off run's saved
   meta reads `mode identity {'from_masks': True, 'lo': 279, 'hi': 318, 'n_active': 40}`, so 40 pairs
