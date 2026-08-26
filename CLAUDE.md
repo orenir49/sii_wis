@@ -36,7 +36,7 @@ python .claude/skills/spectral-align/align_arc.py REF.txt OTHER.txt --emit-pairs
 python tools\pair_map.py --mode affine --lo 120 --hi 200 -a 1.037 -b -2.4
 python tools\pair_map.py --selftest
 
-# Raw lSPAD capture (Stage 2 Phase 0) -- set on the SENDER, off by default
+# Raw lSPAD capture (Stage 2 Phase 0) -- off by default
 # Set on the MASTER before launching receiver.py; forwarded to each node as
 # <that node repo>\<value>_node{1,2}. Relative is preferred: the two nodes have
 # different usernames, so an absolute master-side path names a missing home dir.
