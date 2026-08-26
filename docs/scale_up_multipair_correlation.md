@@ -14,7 +14,8 @@
 them). That was needed because the launcher's `git pull` only ever pulls the checked-out branch, so
 sender-side work on a feature branch simply never reaches the nodes — two capture runs produced
 nothing before this was spotted. It also means `main` is no longer the code the hardware is running,
-so it is a *fallback on paper* until either the nodes go back or this branch merges.
+so it is a *fallback on paper* until either the nodes go back or this branch merges — which is what
+Stage 5 resolves.
 
 | stage | state |
 |---|---|
@@ -23,6 +24,7 @@ so it is a *fallback on paper* until either the nodes go back or this branch mer
 | **2** sender throughput | **DEFERRED, and now PROVABLE** — Phase 0 complete 2026-08-26: real captures taken from both nodes and `tools/replay.py` reproduces each acquisition byte-for-byte across all 326 files, `epoch_fixes` included. Still deferred on merit: 2.97 M rec/s runs clean at 40 pixels against the ~80 M/s that would make 2a bind |
 | **3** multi-pair correlator | **COMPLETE** 2026-08-26 — validated on hardware from 8 to 40 pairs, 10 and 40 MHz, up to 15 min, comb on every pair in every run; 80 pairs covered synthetically; `QuadCorrelateWindow` deleted |
 | **4** retire the single-pair correlator | **NOT STARTED** — the multi-pair window is the only correlator that should remain; see Stage 4 |
+| **5** tag the 1v1 fallback, then merge to `main` | **NOT STARTED** — do it in that order; see Stage 5 |
 
 ```
 ed842df  Stage 3: multi-pair live correlator with a synthetic pulsed-laser source
@@ -143,8 +145,8 @@ comparison, and the sender's O(chunk x N_active_pixels) bucketing loop is what w
 
 In priority order. **Items 1-3 are done as of 2026-08-26** — the hardware gate is cleared, the
 write-to-disk flag is complete, and Quad is deleted. **Nothing left on this plan needs bench time.**
-Item 4 (retire the last duplicate correlator) is the next thing to do; item 5 stays deferred on
-merit.
+Item 4 (retire the last duplicate correlator) is next, then item 5 tags the 1v1 fallback and merges
+this branch into `main`. Item 6 (Stage 2) stays deferred on merit.
 
 1. ~~**Validate on hardware with the pulsed laser.**~~ **DONE 2026-08-26 — the gating item is
    cleared.** 8 identity pairs (locs 295-302, `.claude/masks/mask_laser_8.txt`), laser at 10 MHz,
@@ -197,7 +199,10 @@ merit.
 4. **Stage 4 — retire `CorrelateWindow`.** The multi-pair window already subsumes it: a single pair
    is identity mode over two 1-pixel masks, or a one-row pair CSV. See the Stage 4 section for what
    has to move first and the one feature that is genuinely lost.
-5. **Stage 2**, when pair count x rate actually demands it. Start with its Phase 0 scaffolding (the
+5. **Stage 5 — tag the 1v1 fallback, then merge this branch into `main`.** In that order, and only
+   after Stage 4. See the Stage 5 section: after Stage 4 there is no single-pair window left anywhere
+   on this branch, so the tag is the only route back to one.
+6. **Stage 2**, when pair count x rate actually demands it. Start with its Phase 0 scaffolding (the
    env-gated raw-stream dump), which needs detector time and therefore wants to be captured during a
    bench session you are already having.
 
@@ -1091,6 +1096,54 @@ keep it anyway, since adding a window back is what it exists for.
 Note `tests/test_hook_fanout.py`'s bare-`{px: Queue}` coverage survives: `ChannelGraph.hooks_node1`
 returns a bare `Queue` per key, so the normalization path is still exercised without
 `CorrelateWindow`.
+
+## Stage 5 — Tag the 1v1 fallback, then merge into `main`
+
+**Decided 2026-08-26.** After Stage 4, `main` gets this branch. But the fallback is preserved
+**first**, as an explicit ref, and only then does the merge happen.
+
+### Why the order is not negotiable
+
+Right now `main` is `759288c` and the branch is **35 commits** ahead, 34 files, ~9.5k insertions.
+`main` is also the only place a single-pair correlator survives: this branch already deleted
+`QuadCorrelateWindow`, and Stage 4 deletes `CorrelateWindow`. So after the merge there is **no 1v1
+window anywhere in the history's tip** — the tag stops being ceremony and becomes the only route back
+to a working single-pair GUI.
+
+Tag before merging, because afterwards `main` no longer names `759288c` and recovering it means
+digging through the reflog for a commit nobody wrote down.
+
+### Sequence
+
+1. **Tag `main`'s current tip**, annotated so it carries a reason:
+
+       git tag -a v1-single-pair 759288c -m "Last 1v1 state: CorrelateWindow + QuadCorrelateWindow,
+       hardware-proven through 25-8-26. Fallback for the multi-pair merge."
+       git push origin v1-single-pair
+
+   A tag rather than a branch because nothing should accumulate here — it is a recovery point, not a
+   line of development. Add a branch **as well** only if 1v1 is going to keep receiving fixes;
+   otherwise a branch just invites divergence that never gets merged back.
+
+2. **Merge** `feat/multipair-correlation` into `main` and push. Expect no conflicts (the branch is a
+   fast-forward descendant unless `main` moves first) — but do not squash. The 35 commits carry the
+   reasoning for decisions that will be re-litigated later, and the hardware results are attached to
+   the commits that produced them.
+
+3. **Move both nodes back to `main`** (`git checkout main` on each). This is the step that actually
+   closes the note at the top of this document: until it happens the hardware is running a feature
+   branch, and `main` is a fallback nobody has run.
+
+4. **Re-run the full suite** on `main` after the merge, and re-take one short acquisition. The merge
+   itself cannot break anything the branch did not already break, but the *nodes changing branch* is
+   the part that has bitten twice.
+
+### What the tag is worth
+
+Concretely: `v1-single-pair` is the last state where a 2-pixel or 4-pixel run can be driven from a
+window that takes pixel numbers typed into it, with no mask file involved. Everything after it derives
+pairs from masks. If the mask-driven flow ever proves wrong for a quick diagnostic, that tag is the
+answer — which is exactly why it gets written down before the merge rather than reconstructed after.
 
 ## Verification
 
