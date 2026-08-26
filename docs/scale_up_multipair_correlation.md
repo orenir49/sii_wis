@@ -23,7 +23,7 @@ Stage 5 resolves.
 | **1b** write-to-disk checkbox | **COMPLETE** 2026-08-26 — deviation 1 closed, semantics widened to write *nothing*, deviation 2 (checkbox locked once committed) fixed, deviation 3 largely answered by `spad_data/log/`. Verified on hardware: a 15-min run wrote 0 bytes of the 11.43 GB it would have, with the buffer plateauing |
 | **2** sender throughput | **DEFERRED, and now PROVABLE** — Phase 0 complete 2026-08-26: real captures taken from both nodes and `tools/replay.py` reproduces each acquisition byte-for-byte across all 326 files, `epoch_fixes` included. Still deferred on merit: 2.97 M rec/s runs clean at 40 pixels against the ~80 M/s that would make 2a bind |
 | **3** multi-pair correlator | **COMPLETE** 2026-08-26 — validated on hardware from 8 to 40 pairs, 10 and 40 MHz, up to 15 min, comb on every pair in every run; 80 pairs covered synthetically; `QuadCorrelateWindow` deleted |
-| **4** retire the single-pair correlator | **NOT STARTED** — one correlator only. Port the count-distribution view in first; take the synthetic source's GUI surface out. See Stage 4 |
+| **4** retire the single-pair correlator | **COMPLETE** 2026-08-26 — distribution view ported (and its Lee correction fixed), synthetic GUI surface out, `CorrelateWindow` and `correlate.py` deleted. `MultiCorrelateWindow` is the only correlator |
 | **5** tag the 1v1 fallback, then merge to `main` | **NOT STARTED** — do it in that order; see Stage 5 |
 
 ```
@@ -196,9 +196,12 @@ this branch into `main`. Item 6 (Stage 2) stays deferred on merit.
    paths, and the mask refresh), the only by-name reaches left are `_correlate_win.px1_var`/`px2_var`
    for `set_correlate_pixel_fn` which is single-pair by definition, and the prewarm once-lock lives
    in `correlate_kernel` at module level so it was never per-window. Full suite re-run green.
-4. **Stage 4 — retire `CorrelateWindow`.** The multi-pair window already subsumes it: a single pair
-   is identity mode over two 1-pixel masks, or a one-row pair CSV. See the Stage 4 section for what
-   has to move first and the one feature that is genuinely lost.
+4. ~~**Stage 4 — retire `CorrelateWindow`.**~~ **DONE 2026-08-26.** `correlate.py` is deleted;
+   `_correlators` is a 1-tuple. The blast radius turned out to be exactly two executable imports
+   (`receiver.py:31`, `correlate_multi.py:49`) — everything else naming `correlate` was documentation
+   or an independent duplicate. `BACKLOG_WARN_S` and `SIICalculatorWindow` needed no move at all:
+   `correlate_multi.py` already had its own copy of the first and imported the second straight from
+   `tools/sii_calculator.py`.
 5. **Stage 5 — tag the 1v1 fallback, then merge this branch into `main`.** In that order, and only
    after Stage 4. See the Stage 5 section: after Stage 4 there is no single-pair window left anywhere
    on this branch, so the tag is the only route back to one.
@@ -1136,6 +1139,19 @@ work that way with no Tk in sight, which is the proof this is the right seam:
 
 So the tests move from `w._synth.feed(w._graph, dt)` to feeding the graph directly, and the window
 loses a code path only tests exercised.
+
+### Done 2026-08-26 — where things landed
+
+`pick_unit` and `_mark_peak_bin` went to `correlate_multi.py` (the only window left).
+`_multistart_multistop` went to **`correlate_kernel.py`**, which is the change worth noting: it had no
+executable users outside `correlate.py`, so it looked deletable — but it is the oracle `_pair_kernel`
+is proved equal to, and `correlate_kernel._selftest` held a *verbatim copy* rather than importing it.
+Deleting it would have left the selftest passing forever while the function it claimed equality with
+no longer existed. It is now the module-level reference and `_selftest` uses it directly, so the proof
+has one owner. `prewarm()` warms both kernels, which retired the `also=(_prewarm,)` hook.
+
+`_prewarm` itself did not move — it existed only to trigger the reference kernel's compile, which
+`prewarm()` now does inline.
 
 ### After
 

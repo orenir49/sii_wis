@@ -49,7 +49,34 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
-from numba import njit
+from numba import njit, prange
+
+
+@njit(parallel=True)
+def _multistart_multistop(t1, t2, idx, bin_width, tmax, nbins, n_shift):
+    """The reference g2 kernel: parallel over SHIFTS, one pair at a time.
+
+    Moved here from correlate.py when `CorrelateWindow` was retired (Stage 4).
+    It is kept because it is the oracle `_pair_kernel` is proved equal to, not
+    because anything calls it in production -- `_selftest` below is its only
+    caller.
+
+    It lives here rather than staying a verbatim copy inside `_selftest`: a copy
+    citing provenance from a deleted original is a proof that quietly stops
+    meaning anything, since the selftest would keep passing while the function
+    it claimed equality with no longer existed.
+    """
+    hist_priv = np.zeros((2 * n_shift, nbins), dtype=np.int64)
+    for s in prange(-n_shift, n_shift):
+        si = s + n_shift
+        for i in range(len(t1)):
+            j = idx[i] + s
+            if 0 <= j < len(t2):
+                tau = t2[j] - t1[i]
+                b   = int(np.floor((tau + tmax) / bin_width))
+                if 0 <= b < nbins:
+                    hist_priv[si, b] += 1
+    return hist_priv.sum(axis=0)
 
 
 @njit(nogil=True, cache=True)
@@ -94,15 +121,19 @@ _warmed = False
 def prewarm(also=()) -> None:
     """Compile the kernels once, from a single thread. Idempotent.
 
-    `also`: extra zero-arg callables to warm under the same lock -- pass
-    correlate._prewarm so the two windows do not each spawn their own.
+    Warms both `_pair_kernel` and the reference `_multistart_multistop`, so a
+    caller needs nothing but this. `also` used to carry the window's own warmup
+    callable for exactly that second compile; it is retained only so an
+    out-of-tree caller does not break, and is expected to be empty.
     """
     global _warmed
     with _warm_lock:
         if _warmed:
             return
-        d = np.array([0, 1, 2], dtype=np.int64)
+        d   = np.array([0, 1, 2], dtype=np.int64)
+        idx = np.array([0, 1, 2], dtype=np.int64)
         _pair_kernel(d, d, 100.0, 300.0, 6, 2)
+        _multistart_multistop(d, d, idx, 100.0, 300.0, 6, 2)
         for fn in also:
             fn()
         _warmed = True
@@ -184,22 +215,9 @@ def tau_coverage_ps(n_shift: int, rate_hz: float) -> float:
 # ---------------------------------------------------------------------------
 
 def _selftest() -> int:
-    from numba import prange
-
-    @njit(parallel=True)
-    def reference(t1, t2, idx, bin_width, tmax, nbins, n_shift):
-        """Verbatim copy of correlate._multistart_multistop."""
-        hist_priv = np.zeros((2 * n_shift, nbins), dtype=np.int64)
-        for s in prange(-n_shift, n_shift):
-            si = s + n_shift
-            for i in range(len(t1)):
-                j = idx[i] + s
-                if 0 <= j < len(t2):
-                    tau = t2[j] - t1[i]
-                    b = int(np.floor((tau + tmax) / bin_width))
-                    if 0 <= b < nbins:
-                        hist_priv[si, b] += 1
-        return hist_priv.sum(axis=0)
+    # The module-level _multistart_multistop IS the reference. It used to be a
+    # copy declared here; that copy could not detect the original changing.
+    reference = _multistart_multistop
 
     failed = 0
 

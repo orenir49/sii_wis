@@ -28,7 +28,6 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from receiver_backend import start_server, check_connection, run_session_loop, run_intensity_session
-from correlate import CorrelateWindow
 from correlate_multi import MultiCorrelateWindow
 from run_log import RunLog
 from offset_tools import estimate_offset
@@ -78,14 +77,12 @@ class NodePanel:
                  log_fn=None,
                  get_hooks_fn=None,
                  get_write_hooked_fn=None,
-                 set_correlate_pixel_fn=None,
                  on_first_data_fn=None) -> None:
         self.root          = root
         self.node_id       = node_id
         self.log_fn        = log_fn
         self._get_hooks_fn = get_hooks_fn
         self._get_write_hooked_fn = get_write_hooked_fn
-        self._set_correlate_pixel_fn = set_correlate_pixel_fn
         self._on_first_data_fn = on_first_data_fn
 
         self._ctrl_sock:   socket.socket | None = None
@@ -588,8 +585,6 @@ class NodePanel:
             if not (0 <= mask_pixel <= 319):
                 self.log_fn(f'Node {self.node_id}: pixel must be between 0 and 319.\n')
                 return
-            if self._set_correlate_pixel_fn:
-                self._set_correlate_pixel_fn(mask_pixel)
         threading.Thread(
             target=self._ssh_launch,
             args=(host, username, mask, mask_pixel),
@@ -759,7 +754,6 @@ class ReceiverGUI:
         self._cal_acc: dict = {}              # node_id -> [slave_dwell, master_dwell]
         self._cal_deadline = 0.0
 
-        self._correlate_win = CorrelateWindow(root)
         # QuadCorrelateWindow is gone (deleted 2026-08-26). Its 2x2 workflow is
         # the multi-pair window's "grid" pair mode at any size, and the
         # multi-pair engine is validated on hardware, so its only remaining job
@@ -777,7 +771,7 @@ class ReceiverGUI:
         # start_with_offset called on every path out of the cal -- four sites
         # that must never disagree about the set of windows. Adding a window
         # means adding it here and nowhere else.
-        self._correlators = (self._correlate_win, self._multi_correlate_win)
+        self._correlators = (self._multi_correlate_win,)
         self._monitor_abort: threading.Event | None = None
         self._build_ui()
         self._push_write_disk_state()   # correlators start out agreeing with the box
@@ -815,7 +809,6 @@ class ReceiverGUI:
                                get_hooks_fn=lambda: merge_hooks(
                                    *(c.hooks_node1 for c in self._correlators)),
                                get_write_hooked_fn=lambda: self.write_disk_var.get(),
-                               set_correlate_pixel_fn=lambda pix: self._correlate_win.px1_var.set(str(pix)),
                                on_first_data_fn=self._on_node_first_data)
         self.node2 = NodePanel(nodes_frame, self.root,
                                node_id=2,
@@ -827,7 +820,6 @@ class ReceiverGUI:
                                get_hooks_fn=lambda: merge_hooks(
                                    *(c.hooks_node2 for c in self._correlators)),
                                get_write_hooked_fn=lambda: self.write_disk_var.get(),
-                               set_correlate_pixel_fn=lambda pix: self._correlate_win.px2_var.set(str(pix)),
                                on_first_data_fn=self._on_node_first_data)
 
         # ── acquisition controls ───────────────────────────────────────

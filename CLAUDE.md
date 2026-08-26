@@ -91,10 +91,9 @@ Minimal GUI that starts a command server thread on launch. Receives JSON command
 | `run_log.py` | Per-run capture of the live log to `spad_data/log/<stamp>.log` — buffered during integration, flushed at the end; `--selftest` |
 | `sender.py` | Sender GUI shell; starts command server thread |
 | `sender_backend.py` | Command server + lSPAD TCP client; contains `PIXMAP` (320-pixel array mapping); logs abnormal marker ids live (see below) |
-| `correlate.py` | `CorrelateWindow` (single-pair) live correlator, the reference `_multistart_multistop` kernel, and the shared `_mark_peak_bin`/`pick_unit`/`_prewarm` helpers; "Compute R…" opens `tools/sii_calculator.py`. `QuadCorrelateWindow` deleted 2026-08-26. **`CorrelateWindow` is slated for retirement too** (Stage 4 of the scale-up plan): the multi-pair window subsumes it, since a single pair is `identity` over two 1-pixel masks or a one-row pair CSV |
-| `correlate_multi.py` | `MultiCorrelateWindow` — up to ~320 pairs, one plot + pair selector. Widgets only; the logic lives in the three modules below |
+| `correlate_multi.py` | `MultiCorrelateWindow` — **the only correlator**. Up to ~320 pairs, one plot + pair selector, `g²`/count-distribution views, `Compute R…`. `QuadCorrelateWindow` and `CorrelateWindow` were both retired into it 2026-08-26; it also owns the shared `pick_unit`/`_mark_peak_bin` display helpers |
 | `correlate_engine.py` | `ChannelGraph` — which events are safe to correlate and which must be kept. No Tk; 59 tests |
-| `correlate_kernel.py` | `_pair_kernel` (`nogil`, bitwise identical to `_multistart_multistop`) + `PairPool`; `--selftest` |
+| `correlate_kernel.py` | `_pair_kernel` (`nogil`) + `PairPool`, and the reference `_multistart_multistop` it is proved bitwise identical to — moved here from `correlate.py` so the oracle and the proof have one owner; `prewarm()` warms both; `--selftest` |
 | `synthetic_source.py` | Pulsed-laser / Poisson generator — drives the whole path with no detector attached |
 | `tools/sii_calculator_backend.py` | Pure formulas: `<\|V\|^2>`, coherence time, bunching-excess `R`, required integration time |
 | `tools/sii_calculator.py` | `SIICalculatorWindow` — interactive bunching-excess / integration-time calculator |

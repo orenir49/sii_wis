@@ -1,9 +1,10 @@
 """Multi-pair live g2 correlator — up to ~80 diagonal pairs, one plot, one selector.
 
-Replaces QuadCorrelateWindow, whose 2x2 workflow survives here as the "grid"
-pair mode at any size. CorrelateWindow stays: it is the simple single-pair path,
-`set_correlate_pixel_fn` targets it, and it remains a useful independent
-cross-check against this engine.
+**The only correlator in the codebase.** QuadCorrelateWindow (2x2) and
+CorrelateWindow (single-pair) were both retired into it: the 2x2 workflow is the
+"grid" pair mode at any size, and a single pair is `identity` over two 1-pixel
+masks, or a one-row pair CSV. Since the mask is the input, no separate window is
+needed to correlate one pair.
 
 Separation of concerns, deliberately:
 
@@ -15,9 +16,9 @@ Separation of concerns, deliberately:
 That is why the hard parts have tests and this one does not need them.
 
 WHAT THIS WINDOW PROMISES ABOUT DATA LOSS
-    CorrelateWindow's docstring says "nothing is dropped … raw data is still
-    complete on disk". With the receiver's write-to-disk checkbox off that is
-    simply false, and falling behind becomes permanent photon loss. So this
+    The retired CorrelateWindow's docstring said "nothing is dropped … raw data
+    is still complete on disk". With the receiver's write-to-disk checkbox off
+    that is simply false, and falling behind becomes permanent photon loss. So this
     window is told the flag (`set_write_to_disk`) and says the right thing:
     while writes are on, a backlog is only a delay; while they are off, an
     overload is unrecoverable. On overload the policy is HOLD, not subsample --
@@ -46,7 +47,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'too
 import pair_map
 from scipy.stats import poisson
 
-from correlate import _mark_peak_bin, _prewarm, pick_unit
 from correlate_engine import PS_PER_S, ChannelGraph
 from correlate_kernel import PairPool, bin_edges, prewarm, suggest_n_shift, tau_coverage_ps
 from sii_calculator import SIICalculatorWindow
@@ -55,6 +55,71 @@ MAX_PAIRS = 320           # guard: grid mode is how you ask for 6400 by accident
 DEFAULT_RAM_CAP_MB = 2000
 BACKLOG_WARN_S = 2.0
 
+
+
+# ---------------------------------------------------------------------------
+# Display helpers -- moved here from correlate.py when CorrelateWindow was
+# retired (Stage 4). This is the only window left, so they have one home.
+# ---------------------------------------------------------------------------
+
+def pick_unit(tmax_ps: float) -> tuple[str, float]:
+    """Return (label, scale) such that tmax_ps / scale is in [1, 1000).
+
+    Module-level so correlate_multi.py can share it rather than reimplement the
+    axis convention; kept module-level so every window shares it while
+    every correlator window shares it.
+    """
+    if tmax_ps < 1_000:
+        return 'ps', 1.0
+    elif tmax_ps < 1_000_000:
+        return 'ns', 1_000.0
+    elif tmax_ps < 1_000_000_000:
+        return 'µs', 1_000_000.0
+    else:
+        return 'ms', 1_000_000_000.0
+
+
+def _mark_peak_bin(ax, centers: np.ndarray, hist: np.ndarray,
+                   scale: float, fontsize: int = 8) -> bool:
+    """Mark the tallest bin and annotate its height, excess over mean and SNR.
+
+    Marks wherever the maximum actually lands, the same convention as
+    tools/plot_g2_result.py, so a live window and a replotted saved file agree.
+    Mean and sigma are taken over the entire histogram, peak bin included, so
+    the numbers match the offline tool exactly rather than nearly.
+
+    Returns True if a marker was drawn.
+    """
+    if centers.size == 0:
+        return False
+    counts = hist.astype(float)
+    mean   = counts.mean()
+    std    = counts.std()
+    if mean <= 0:
+        return False        # nothing accumulated yet -- no baseline to compare to
+    i      = int(np.argmax(counts))
+    height = counts[i]
+    excess = (height - mean) / mean * 100
+    snr    = f'{(height - mean) / std:.2f}' if std > 0 else 'n/a'
+
+    ax.plot(centers[i] / scale, height, marker='x', color='red',
+            markersize=12, markeredgewidth=2.5, linestyle='none', zorder=5)
+    ax.annotate(
+        f'peak τ = {centers[i] / 1_000.0:g} ns\n'
+        f'counts = {height:,.0f}\n'
+        f'excess = {excess:.3f}% of mean\n'
+        f'SNR = {snr}\n'
+        f'mean = {mean:.1f} ± {std:.1f}',
+        xy=(centers[i] / scale, height), xycoords='data',
+        # Right-aligned inside the axes rather than at a fixed left edge: the box
+        # is as wide as its longest number, and the live figure gets resized.
+        xytext=(0.99, 0.98), textcoords='axes fraction',
+        fontsize=fontsize, verticalalignment='top', horizontalalignment='right',
+        multialignment='left',   # box anchored right, text inside still ragged-right
+        bbox=dict(boxstyle='round', edgecolor='red', facecolor='white', alpha=0.85),
+        arrowprops=dict(arrowstyle='->', color='red'),
+    )
+    return True
 
 
 def _peak_rss_bytes():
@@ -318,7 +383,7 @@ class MultiCorrelateWindow(tk.Toplevel):
             var.set(p)
 
     def _prewarm_thread(self) -> None:
-        prewarm(also=(_prewarm,))
+        prewarm()
         self.after(0, lambda: self.status_var.set(
             'Ready. Derive a pair list, then Enable.'))
 
