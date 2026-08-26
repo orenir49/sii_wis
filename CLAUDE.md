@@ -77,9 +77,9 @@ Minimal GUI that starts a command server thread on launch. Receives JSON command
 | `receiver_backend.py` | TCP data server: `start_server()`, `run_session_loop()`, `check_connection()` |
 | `sender.py` | Sender GUI shell; starts command server thread |
 | `sender_backend.py` | Command server + lSPAD TCP client; contains `PIXMAP` (320-pixel array mapping); logs abnormal marker ids live (see below) |
-| `correlate.py` | `CorrelateWindow` (single-pair) + `QuadCorrelateWindow` (2 pixels/node, 4 pairwise g² histograms — e.g. mask_two.txt) live correlators, Numba JIT kernel; "Compute R…" button opens `tools/sii_calculator.py` |
+| `correlate.py` | `CorrelateWindow` (single-pair) live correlator, Numba JIT kernel; "Compute R…" button opens `tools/sii_calculator.py`. Also still defines `QuadCorrelateWindow` (2 pixels/node, 4 pairwise g²), which **`receiver.py` no longer instantiates** — the multi-pair window's grid mode subsumes it; pending deletion |
 | `correlate_multi.py` | `MultiCorrelateWindow` — up to ~320 pairs, one plot + pair selector. Widgets only; the logic lives in the three modules below |
-| `correlate_engine.py` | `ChannelGraph` — which events are safe to correlate and which must be kept. No Tk; 41 tests |
+| `correlate_engine.py` | `ChannelGraph` — which events are safe to correlate and which must be kept. No Tk; 53 tests |
 | `correlate_kernel.py` | `_pair_kernel` (`nogil`, bitwise identical to `_multistart_multistop`) + `PairPool`; `--selftest` |
 | `synthetic_source.py` | Pulsed-laser / Poisson generator — drives the whole path with no detector attached |
 | `tools/sii_calculator_backend.py` | Pure formulas: `<\|V\|^2>`, coherence time, bunching-excess `R`, required integration time |
@@ -114,7 +114,7 @@ Throttled deliberately: `log_fn` writes to the control socket from the parser th
 
 `correlate.py` integrates with `run_session_loop()` via `pixel_hooks: dict[key_id, list[queue.Queue]]`. Matching chunks are enqueued **in addition to** being written to disk — a read tap, not a diversion. `CorrelateWindow` accumulates int64 timestamps from two pixel queues and calls the Numba JIT `_multistart_multistop()` kernel in a background thread. The kernel is pre-warmed at startup to avoid the first-call JIT delay.
 
-Each key fans out to **every** subscriber. `merge_hooks()` (`receiver.py`) composes the per-window `{key_id: Queue}` maps by appending rather than overwriting, so two windows watching one pixel both get every chunk, and a correlator watching key 320/323 is no longer clobbered by the dwell-calibration tap. The payload is an immutable `bytes`, so fan-out is zero-copy — subscribers must treat it as read-only. A bare `Queue` value is still accepted and normalized once per connection, so the correlator windows keep returning plain `{px: Queue}`. `ReceiverGUI._correlators` is the single list of windows: hook merging, the `is_enabled` calibration gate, and both `start_with_offset` paths all iterate it, so adding a window means editing one line.
+Each key fans out to **every** subscriber. `merge_hooks()` (`receiver.py`) composes the per-window `{key_id: Queue}` maps by appending rather than overwriting, so two windows watching one pixel both get every chunk, and a correlator watching key 320/323 is no longer clobbered by the dwell-calibration tap. The payload is an immutable `bytes`, so fan-out is zero-copy — subscribers must treat it as read-only. A bare `Queue` value is still accepted and normalized once per connection, so the correlator windows keep returning plain `{px: Queue}`. `ReceiverGUI._correlators` is the single list of windows (now two: `CorrelateWindow` and `MultiCorrelateWindow`): hook merging, the `is_enabled` calibration gate, and both `start_with_offset` paths all iterate it, so adding a window means editing one line.
 
 ### Multi-pair correlator (`correlate_multi.py`)
 
@@ -123,11 +123,13 @@ Each key fans out to **every** subscriber. `merge_hooks()` (`receiver.py`) compo
 | module | owns | tested by |
 |---|---|---|
 | `tools/pair_map.py` | which pixels pair with which | `--selftest`, 29 checks |
-| `correlate_engine.py` | which events are safe to correlate | `tests/test_channel_graph.py`, 41 checks |
+| `correlate_engine.py` | which events are safe to correlate | `tests/test_channel_graph.py`, 53 checks |
 | `correlate_kernel.py` | the histogram | `--selftest`, 25 checks |
-| `correlate_multi.py` | widgets | `tests/test_multi_window.py`, 30 checks |
+| `correlate_multi.py` | widgets | `tests/test_multi_window.py`, 31 checks |
 
 Pair modes: **identity** (`p2 = p1`), **affine** (`p2 = round(((p1-160) - b)/a + 160)`, inverting `align_arc.py`'s fit — `align_arc.py --emit-pairs LO HI` calls the same helper so the two cannot disagree), **grid** (outer product — this is `QuadCorrelateWindow`'s 2×2 workflow at any size), and **file** (`pix1,pix2` CSV). Affine with `a ≠ 1` is *not* bijective, so a node-2 pixel can serve two pairs; channels are therefore keyed by **distinct pixel**, never by pair. **Enable stays disabled until Derive succeeds**, and Derive shows a preview table flagging shared channels, dropped out-of-range partners, and any pixel the mask file has switched off (a guaranteed permanent stall).
+
+Exclusion is a **relative** judgement — a channel is only costing coincidences while its partners are still delivering. When nothing at all has arrived for `stall_grace_s` the graph sets `stream_idle`, clears every exclusion and reports `idle — no data arriving`: a normal end of acquisition must not read as `LOSING COINCIDENCES` forever. Genuine exclusions are kept in `exclusion_history` (cleared on `start()`) so going idle cannot erase the audit trail, and that history — not the live flags — is what the saved `.npz` records, since saving usually happens after the stream has stopped.
 
 Retention (`ChannelGraph`) generalizes the two-pixel logic: a node-1 event is released only once **every** partner has been observed past `t1 + tmax`. The release point is a `last_ts` **watermark** — the newest timestamp ever seen — not `arr[-1]`, so a channel legitimately trimmed to size 0 no longer reads as silent. Genuinely silent partners are excluded only after `stall_grace_s` of wall clock or `stall_tolerance_ps` of detector-time lag, and every exclusion is reported: it means coincidences are being lost *now*, which the status line distinguishes from "waiting on node 2, N s behind (nothing lost)".
 
@@ -135,11 +137,11 @@ Overload policy is **hold**: past the RAM cap the correlator stops draining, fre
 
 Output is one batched `.npz` (`tau_ps`, `hist (N, nbins)`, `px1`, `px2`, counts, JSON `meta`), written `.tmp` then `os.replace()`. **Export pair → .txt** emits the legacy `{px1}_{px2}_{suffix}.txt` that `tools/plot_g2_result.py` reads.
 
-**Synthetic source** (`synthetic_source.py`) drives the entire path with no detector: one pulse train shared by both nodes, so cross-node g² shows a comb at multiples of the repetition period. The comb *period* validates the clock scale on every pair simultaneously and the tooth at τ=0 validates the offset — but only **modulo the repetition period** (12.5 ns at 80 MHz), so it pins the fine offset, not the coarse one. Note the `Mark τ` SNR box reads only a few σ on a comb no matter how long you integrate: it takes σ over the whole histogram, and ~9 equal teeth inside ±tmax inflate it.
+**Synthetic source** (`synthetic_source.py`) drives the entire path with no detector: one pulse train shared by both nodes, so cross-node g² shows a comb at multiples of the repetition period. The comb *period* validates the clock scale on every pair simultaneously and the tooth at τ=0 validates the offset — but only **modulo the repetition period** (12.5 ns at 80 MHz), so it pins the fine offset, not the coarse one. Note the peak-marker SNR does not grow with integration time on a comb: it takes σ over the whole histogram and the teeth inflate σ, so both peak and σ scale with counts and the reading is a shape statistic. Its magnitude is set by bin width — `≈ sqrt(nbins / (n_teeth · tooth_width_bins))`, so ~15 at 20–50 ps bins but ~2 at 5 ns bins. Read the comb by tooth spacing and phase, not from that number.
 
-Both single-pair correlator windows have a `Mark τ (ns)` field (default 14) that puts a marker on that bin and annotates its counts, excess over the mean, SNR and mean ± σ — the same numbers `tools/plot_g2_result.py` reports, but at a τ you name rather than at the argmax.
+Every correlator window marks the **tallest bin** automatically (`_mark_peak_bin` in `correlate.py`, shared by all of them) and annotates its τ, counts, excess over the mean, SNR and mean ± σ. Same bin and same numbers as `tools/plot_g2_result.py`, so a live window and a replotted saved file agree. There is no user-set τ: the old `Mark τ (ns)` entry and the multi-pair window's SNR-vs-pair sparkline were both removed — the multi-pair window is one plot, with the selected pair's peak SNR on its info line.
 
-The receiver's **Write timestamps to disk** checkbox (on by default) sets `run_session_loop(write_hooked=...)`. Unchecked, hooked *pixel* keys go to the correlator queue only and their `px_*.bin` is never created — live correlation without keeping the timestamps. Keys 320–325 are never suppressed: they are hooked on every run for clock calibration, and the offline offset estimate needs them afterwards. The flag is read once per data connection, so toggling mid-run applies from the next START.
+The receiver's **Write timestamps to disk** checkbox (on by default) sets `run_session_loop(write_hooked=...)`. Unchecked, **no `px_*.bin` is created at all**: hooked pixel keys go to the correlator queue only, un-hooked ones are discarded — live correlation without keeping the timestamps. The suppression covers un-hooked pixels deliberately; sparing them would leave the ~1.28 GB/s write path in place whenever the correlator watches a subset, which is the normal case. Keys 320–325 are never suppressed: they are hooked on every run for clock calibration, and the offline offset estimate needs them afterwards. The flag is read once per data connection, so toggling mid-run applies from the next START.
 
 ### SSH remote launch (`ssh_launcher.py`)
 

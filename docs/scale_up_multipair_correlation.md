@@ -6,17 +6,17 @@
 
 ---
 
-## STATUS — 2026-08-23
+## STATUS — 2026-08-26
 
-**Branch `feat/multipair-correlation`, 5 commits ahead of `main`. `main` is untouched and remains
-the stable 1v1 fallback.** Nothing here has been pushed.
+**Branch `feat/multipair-correlation`, pushed to `origin`. `main` is untouched and remains the
+stable 1v1 fallback.**
 
 | stage | state |
 |---|---|
 | **1a** tap fan-out | **DONE** — `d049f36` |
-| **1b** write-to-disk checkbox | **PARTIAL** — shipped in `8ec3c10`; 3 deviations still open, one of which is a Stage 3 prerequisite |
+| **1b** write-to-disk checkbox | **PARTIAL** — shipped in `8ec3c10`; deviation 1 (the Stage 3 prerequisite) closed 2026-08-26; deviations 2 and 3 still open |
 | **2** sender throughput | **NOT STARTED** — deliberately deferred, see below |
-| **3** multi-pair correlator | **DONE in software** — `ab9a8c2`, `2507d7e`, `6476c68`, `ed842df`. **Not yet validated on hardware**, and Quad not yet deleted |
+| **3** multi-pair correlator | **DONE in software and VALIDATED ON HARDWARE** 2026-08-26 (8 pairs, pulsed laser at 10 MHz). Quad not yet deleted |
 
 ```
 ed842df  Stage 3: multi-pair live correlator with a synthetic pulsed-laser source
@@ -26,16 +26,16 @@ ab9a8c2  Add tools/pair_map.py: pure pair derivation, shared with align_arc
 d049f36  Stage 1a: fan pixel_hooks out to every subscriber
 ```
 
-### Test suite — 149 checks, all passing as of `ed842df`
+### Test suite — 179 checks, all passing as of 2026-08-26
 
 Plain asserts, no pytest (it is not in `requirements.txt`). **Run all of these before trusting any
 change**; the whole suite takes ~2 minutes, most of it numba compiling.
 
 ```
 .venv\Scripts\python.exe tests\test_epoch_fix.py         # 12  (on main)
-.venv\Scripts\python.exe tests\test_hook_fanout.py       # 16  Stage 1a
-.venv\Scripts\python.exe tests\test_channel_graph.py     # 41  retention
-.venv\Scripts\python.exe tests\test_multi_window.py      # 30  end-to-end
+.venv\Scripts\python.exe tests\test_hook_fanout.py       # 21  Stage 1a + 1b
+.venv\Scripts\python.exe tests\test_channel_graph.py     # 53  retention
+.venv\Scripts\python.exe tests\test_multi_window.py      # 31  end-to-end
 .venv\Scripts\python.exe tools\pair_map.py --selftest    # 29  pair derivation
 .venv\Scripts\python.exe correlate_kernel.py             # 25  kernel equivalence
 .venv\Scripts\python.exe synthetic_source.py             #  8  generator + comb
@@ -68,22 +68,30 @@ while still drawing a plausible histogram). Keep it.
 
 ## RESUME HERE — next session
 
-In priority order. The first two are the only things standing between the current tree and a real
-80-pixel run.
+In priority order. **Items 1 and 2 are done as of 2026-08-26 — the hardware gate is cleared and
+Quad is now free to go.** Item 3 is the next thing to do.
 
-1. **Validate on hardware with the pulsed laser** (same train split onto both nodes — confirmed).
-   This is the gating item: everything in Stage 3 is proven against a synthetic source only. Start at
-   8–16 pairs, `identity` mode, and read the comb by tooth *spacing* and *position*. Two caveats
-   discovered while building, both now unit tests and both worth re-reading before the bench session:
-   a comb pins the clock offset only **modulo the repetition period** (12.5 ns at 80 MHz), and the
-   `Mark τ` SNR box structurally caps near a few σ on a comb. See the Stage 3 status block.
-2. **Stage 1b deviation 1 — widen `write_hooked` from hooked-only to all pixel keys.** One-line
-   change to the `skipped_keys` comprehension plus a docstring. **This is a Stage 3 prerequisite**:
-   as shipped, an active-but-unhooked pixel is still written, so the flag does not deliver the
-   1.28 GB/s relief that motivated it. Without this, "disk flat at 80 pixels" only holds if every
-   active pixel is in some window's pair list.
+1. ~~**Validate on hardware with the pulsed laser.**~~ **DONE 2026-08-26 — the gating item is
+   cleared.** 8 identity pairs (locs 295-302, `.claude/masks/mask_laser_8.txt`), laser at 10 MHz,
+   20 ps bins, ±250 ns. Live comb period 99.9985-100.0010 ns on all 8 pairs; **live vs offline agree
+   on period to 0.1-1.1 ps, 1 part in 1e8**, which validates `_pair_kernel` and `ChannelGraph` on
+   real data. Retention provably lost nothing (see the Stage 3 block). Remaining hardware work is
+   now scale and the dim-channel case, not correctness:
+   - **`mask_laser_8_dim.txt`** (locs 295-302 + 200, 250 at background only, ~20x contrast) — the
+     dim-channel coincidence-loss fix, bug 1 below, exercised on hardware for the first time. The
+     eight bright pairs must come back matching a `mask_laser_8` run.
+   - **`mask_laser_40.txt`** (locs 279-318) — the scale step. Record kernel s/batch and peak RSS.
+   - **`mask_laser_80.txt`** (locs 240-319) — load only. **The laser band is just 35 px wide at 3x
+     background, so no source on this bench can give 80 pairs of real comb**; the lower half of this
+     mask is background. 80-pair *correctness* stays a synthetic-source claim until starlight.
+2. ~~**Stage 1b deviation 1 — widen `write_hooked` to all pixel keys.**~~ **DONE 2026-08-26.**
+   `skipped_keys = set(range(320))`; "disk flat at 80 pixels" now holds regardless of which pixels
+   are hooked. Note the behaviour change to expect at the bench: unchecking the box with no
+   correlator open now records nothing at all.
 3. **Delete `QuadCorrelateWindow`** (`correlate.py`, the `QuadCorrelateWindow` class and `_Channel`)
-   once (1) passes. It is kept *only* as the transitional cross-check. When it goes, drop the
+   — **unblocked: (1) passed 2026-08-26.** Half-done already: `receiver.py` no longer imports or
+   instantiates it and `_correlators` is down to two windows, so the class is dead code reachable
+   from nothing. What remains is deleting the class itself. It is kept *only* as the transitional cross-check. When it goes, drop the
    `_pick_unit` staticmethod alias, remove it from `ReceiverGUI._correlators`, and re-run the suite.
 4. **Stage 2**, when pair count x rate actually demands it. Start with its Phase 0 scaffolding (the
    env-gated raw-stream dump), which needs detector time and therefore wants to be captured during a
@@ -92,13 +100,15 @@ In priority order. The first two are the only things standing between the curren
 **Smaller open items**, none blocking:
 
 - The count-distribution radio (`correlate.py`'s `_draw_distribution`) was **not** absorbed into the
-  multi-pair window. The marked-τ helpers, the Compute R button, the SNR sparkline and the hold-policy
-  status line all were.
+  multi-pair window. The Compute R button and the hold-policy status line were. The peak-marker helper
+  is shared. **Removed 2026-08-26 at the user's request:** the `Mark τ (ns)` entry in all windows
+  (every window now marks the tallest bin automatically) and the multi-pair SNR-vs-pair sparkline —
+  the selected pair's peak SNR moved to the info line, and the window is one plot.
 - Stage 1b deviations 2 and 3 (disable the checkbox while streaming; record it in
   `session_stats.json`) remain open.
-- `ReceiverGUI._correlators` now has three windows. Adding a fourth means editing that one tuple —
-  that was the point of the refactor — but re-check the four consumers if you add a window with a
-  different interface.
+- `ReceiverGUI._correlators` is now **two** windows (Quad is no longer instantiated). Adding one means
+  editing that one tuple — that was the point of the refactor — but re-check the four consumers if you
+  add a window with a different interface.
 
 ### What Stage 2 is deferred *behind*, and why
 
@@ -265,7 +275,7 @@ def merge_hooks(*hook_maps) -> dict[int, list]:
   written to disk" fix is **done** in `8ec3c10` — `CLAUDE.md:95` now reads "in addition to".
   `correlate.py:4-8` was already correct ("The tap is a copy, not a diversion") and needs no change.
 
-### 1b. Write-to-disk checkbox — LANDED IN `8ec3c10`, NARROWER THAN SPECIFIED
+### 1b. Write-to-disk checkbox — LANDED IN `8ec3c10`; deviation 1 CLOSED 2026-08-26
 
 Shipped as `write_hooked: bool = True` on `run_session_loop()` (`receiver_backend.py:99`), plus a
 global **"Write timestamps to disk (uncheck: live correlation only)"** `Checkbutton` in the
@@ -275,14 +285,14 @@ global **"Write timestamps to disk (uncheck: live correlation only)"** `Checkbut
 
 - Only the 320-pixel loop is guarded (`receiver_backend.py:151-154`); the 6 sync files are always
   opened (`155-156`). Keys 320-325 can never be suppressed — enforced by the `k < 320` filter when
-  `skipped_keys` is built (`receiver_backend.py:131-133`), which matters because `NodePanel` hooks
+  `skipped_keys` is built (now `set(range(320))`, still pixel-only), which matters because `NodePanel` hooks
   320 and 323 on *every* run, so a naive "skip anything hooked" rule would have deleted the dwell
   files that `estimate_offset` needs.
 - The `else: unknown += 1` branch no longer fires for deliberately-skipped keys — there is an
   `elif key_id in skipped_keys: skipped += n_bytes` arm at `receiver_backend.py:196-197`, so no
   spurious "unrecognised key_id" warning (`212-214`).
 - The session summary reports the un-written megabytes (`receiver_backend.py:215-220`), and a
-  once-per-session line up front names the suppressed pixels (`158-163`).
+  once-per-session line up front names the hooked pixels (i.e. what the session *does* keep).
 - Suppressed pixels get **no file at all** rather than an empty one, so an absent `px_147.bin` reads
   as "not recorded" instead of "this pixel saw nothing".
 - `event_accum` (`receiver_backend.py:204-205`) is handle-independent, so the count-rate display
@@ -291,16 +301,17 @@ global **"Write timestamps to disk (uncheck: live correlation only)"** `Checkbut
   `get_hooks_fn`, read once per session in `_accept_data_thread` (`receiver.py:444-447`) and passed
   through at `463`.
 
-**Three deviations, all still open:**
+**Three deviations — 1 is now CLOSED, 2 and 3 still open:**
 
-1. **Scope: hooked-only, not all pixels.** `skipped_keys = {k for k in pixel_hooks if k < 320}`
-   (`receiver_backend.py:133`) suppresses only pixels a correlator is watching. An active but
-   *un-hooked* pixel is still written. With today's 2-pixel mask hooked == active so the two are
-   indistinguishable, but **at 80 pixels this does not deliver the 1.28 GB/s relief that motivated
-   the stage.** Widening it to all pixel keys is a one-line change to that set comprehension plus a
-   docstring edit; the log line and skipped-byte accounting already generalize. Decide whether the
-   flag means "don't keep what I'm correlating" (as shipped) or "don't keep pixel data at all" (as
-   specified) — Stage 3 needs the latter.
+1. **Scope: hooked-only, not all pixels — FIXED 2026-08-26.** The rule is now
+   `skipped_keys = set(range(320))` whenever `write_hooked` is false, so the flag means "don't keep
+   pixel data at all", which is what Stage 3 needs. Two consequences worth knowing at the bench:
+   the `and subs` guard is gone, so **unchecking the box with no correlator open now records
+   nothing** (previously a silent no-op that wrote everything while the label promised otherwise);
+   and the up-front log line no longer dumps 320 keys — it names the *hooked* pixels instead, since
+   with writes off those are the only photons that survive anywhere, making that list the session's
+   entire pixel record. Covered by four new checks in `tests/test_hook_fanout.py` (16 → 21):
+   un-hooked pixel suppressed, zero-hook case, sync files still written, log line shape.
 2. **Not locked during streaming.** The flag is read per node at accept time, seconds apart, so
    toggling in that window still desynchronizes the two nodes. Shipped mitigation is weaker: the
    toggle handler (`receiver.py:827-840`) logs which way it went and says it applies from the next
@@ -472,11 +483,55 @@ unchanged as N grows; framing overhead at N=80/1 MHz is 0.8% of a flush. Also se
 >   exactly what a multi-pair sanity check needs, but it cannot catch a coarse offset error. A
 >   test asserts both directions: a correct offset puts a tooth at tau = 0, and an offset wrong by
 >   half a period moves the comb off it.
-> - **The marked-tau SNR box reads only a few sigma on a comb, no matter how long you integrate.**
->   `_mark_tau_bin` takes mean and sigma over the whole histogram, which assumes a flat background
->   with one peak; a comb has ~9 equal teeth inside +-tmax and they inflate sigma, capping the SNR
->   near sqrt(n_teeth). Read the comb by tooth spacing and position, not from that box — it is
->   correct for the thermal bunching measurement it was built for.
+> - **The marked-tau SNR box does not grow with integration time on a comb.** `_mark_tau_bin` takes
+>   mean and sigma over the whole histogram, which assumes a flat background with one peak; a comb's
+>   equal teeth inflate sigma. Both the peak and sigma scale linearly with counts, so the reading is
+>   a *shape* statistic — integrating longer does not move it. Read the comb by tooth spacing and
+>   position, not from that box; it is correct for the thermal bunching measurement it was built for.
+>
+>   **Corrected 2026-08-26** — the original claim here ("capped near sqrt(n_teeth), only a few
+>   sigma") was measured wrong. The reading is set by the fraction of the histogram the teeth
+>   occupy, `sqrt(nbins / (n_teeth * tooth_width_bins))`, so it depends on **bin width**, not tooth
+>   count. Swept at 20 MHz / 50 ns, tmax +-250 and +-500 ns:
+>
+>   | bin width | teeth | tooth width | SNR box | sqrt(n_teeth) | sqrt(N/nw) |
+>   |---|---|---|---|---|---|
+>   | 20 ps | 10 / 21 | ~13 bins | **15.3** | 3.2 / 4.6 | 13.4 |
+>   | 50 ps | 9 / 19 | ~6.5 bins | **15.1** | 3.0 / 4.4 | 12.8 |
+>   | 200 ps | 9 / 19 | ~2.2 bins | **10.9** | 3.0 / 4.4 | 11.0 |
+>   | 1 ns | 9 / 19 | ~2.2 bins | **4.8** | 3.0 / 4.4 | 4.9 |
+>   | 5 ns | 9 / 19 | ~2.2 bins | **2.0** | 3.0 / 4.4 | 2.2 |
+>
+>   At the 20-50 ps binning the pulsed survey actually uses, the box reads ~15 and is perfectly
+>   legible; it only collapses to "a few sigma" at nanosecond bins. Expect a healthy number at the
+>   bench and do not read a low one as a broken correlator — read it as coarse binning.
+>
+> ### Hardware validation — 2026-08-26, 8 pairs
+>
+> Locs 295-302 (`mask_laser_8.txt`, derived from that evening's intensity scans), pulsed laser at
+> **10 MHz**, identity mode, 20 ps bins, tmax ±250 ns, n_shift 5, writes on. Saved
+> `spad_data/g2multi.npz`; cross-checked against `tools/analyze_g2_pairs_offline.py` on the same
+> `px_*.bin`.
+>
+> | | result |
+> |---|---|
+> | comb period, all 8 pairs live | 99.9985 - 100.0010 ns, fit residual 0-4 ps |
+> | **live vs offline period** | **agree to 0.1-1.1 ps out of 100 ns — 1 part in 1e8** |
+> | live vs offline phase | −322 ps mean, fully explained by the two independent offset estimates differing 298 ps (τ shifts −1 ps per +1 ps of offset) |
+> | tooth amplitude evenness | 3.5 - 8.7 % spread across the 5 teeth |
+>
+> **Retention provably lost nothing.** The saved `meta` lists all 16 channels excluded
+> `"silent for 120 s"`, which fires *after* the stream stops — and the counts prove it was after,
+> not during: 92.4-92.5 % of the on-disk node-1 events were correlated and 92.3-92.4 % of the
+> offline coincidences were found. Events and coincidences proportional to four figures is the
+> signature of a held tail; mid-run exclusion would have dropped coincidences *faster* than events.
+> The missing 7.6 % is the retention tail never released at stream end, which is by design.
+>
+> **Rep-rate choice.** 10 MHz, chosen over 5/20/40/80: the comb pins the offset only modulo the
+> period, so 100 ns catches a coarse error up to ±50 ns against a true offset of ~13.5 ns, while
+> still putting 5 teeth in ±250 ns. Measured: count rate scales linearly with rep rate on this laser
+> (constant pulse energy), so halving the rate from 20 MHz halved the load — but not the background,
+> costing ~6 % of comb contrast. Worth it.
 >
 > **Not yet done in this stage:** deleting Quad (`correlate.py:737-1214`) and the transitional
 > `quad_compat` cross-check; the count-distribution view and the backlog note were absorbed only in
@@ -795,7 +850,7 @@ Add a `raw_b`/`wire_b` ratio to `stats` and expect ~2.00x at the rates that matt
 > | synthetic source mode | **done** — `synthetic_source.py`, and it is what unlocked the rest |
 > | display / save / legacy `.txt` export | **done** — `tests/test_multi_window.py` |
 > | **transitional Quad cross-check (`quad_compat`)** | **NOT DONE** — judged redundant once the golden brute force existed, since it is a strictly better oracle and Quad carries the retention bug. Reinstate only if a hardware discrepancy needs bisecting |
-> | **on hardware — the fan-out proof** | **NOT DONE** — needs detectors. Remember the `suffix` warning below |
+> | **on hardware — the live-vs-offline proof** | **DONE 2026-08-26** — see the hardware block below. Done against `analyze_g2_pairs_offline.py` rather than `CorrelateWindow`: the offline path is a strictly better oracle (independent kernel, independent offset estimate, whole-file rather than streamed) and it sidesteps the `suffix` collision entirely |
 > | **after Quad is deleted: re-run the suite** | **NOT DONE** — Quad still exists |
 > | **kernel s/batch and peak RSS at 4 → 16 → 80 pairs** | **PARTIAL** — timing measured (7.35x, ~5 core-s per data-second at 80 pairs); peak RSS not recorded, and the sustainable `npairs x rate` for this machine is not yet in `CLAUDE.md` |
 

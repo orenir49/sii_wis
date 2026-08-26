@@ -183,3 +183,9 @@ and registration within +0.2/−0.8 px across pixels 118–216. Scans archived i
 **Arclamp g2** tried to replicate Kulkov et al. (2025-2026) with arclamp coupled directly into fiber with a lens (no pinhole). No bunching observed after 1 hour @300kpcs and 1 ns bins.
 
 **Potential issue** 2:1 fiber splitter has 50 micron core; at this size, adjacent resolution elements are blended which potentially decreases the coherence time of broadband sources. A factor 2 in coherence time equals 4 times the observing time which would explain our null results!
+
+## 26-8-26 — Spectral alignment, first multi-pair hardware validation
+
+**Arc alignment.** Routine re-check with the setup untouched since yesterday.  Consistent with the 25-8-26 post-realignment scan.
+
+**Multi-pair correlator — validated on hardware.** 8 identity pairs (locs 295-302), pulsed laser at 10 MHz, 20 ps bins, ±250 ns. Live g2 histogram on all 8 pairs simultaneously, results consistent with expected comb form and with offline histogram. Count rate 19-25 kcps/pixel on node 1 (0.17 Mcps over the 8) and 30-60 on node 2 (0.30 Mcps), 60 s run — within ~15 % of what the intensity scan predicted.
