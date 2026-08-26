@@ -338,7 +338,7 @@ class MultiCorrelateWindow(tk.Toplevel):
 
         self.status_var = tk.StringVar(value='Disabled.')
         self.status_lbl = ttk.Label(cfg, textvariable=self.status_var, anchor='w')
-        self.status_lbl.grid(row=5, column=0, columnspan=6, sticky='w', padx=6, pady=(0, 4))
+        self.status_lbl.grid(row=6, column=0, columnspan=6, sticky='w', padx=6, pady=(0, 4))
 
         # ── plot ──────────────────────────────────────────────────────
         ff = ttk.LabelFrame(self, text='g² Histogram')

@@ -385,6 +385,66 @@ def test_file_mode_still_flags_masked_off_pairs():
         root.destroy()
 
 
+def test_no_widgets_overlap_in_the_grid():
+    """No two widgets may occupy the same grid cell.
+
+    Regression: inserting the View row bumped the button frame from row 4 to 5,
+    where the status label already sat -- same parent, same row, same columnspan.
+    The label drew on top of Enable / Disable / Reset data, so the buttons were
+    simply not clickable. Nothing failed and nothing logged; it was invisible
+    until someone looked at the window, which is exactly the class of bug worth
+    a test.
+
+    Checked geometrically over every container rather than by asserting specific
+    row numbers, so it keeps working as the layout moves.
+    """
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        w, tmp = masked_window(root, range(150, 158), range(150, 158))
+        root.update_idletasks()
+
+        def rect(win):
+            g = win.grid_info()
+            if not g:
+                return None             # grid_remove()d, e.g. the hidden input row
+            r, c = int(g['row']), int(g['column'])
+            return (r, r + int(g.get('rowspan', 1)),
+                    c, c + int(g.get('columnspan', 1)))
+
+        # Every frame that lays children out with grid(), walked from the window.
+        seen, queue, checked = set(), [w], 0
+        overlaps = []
+        while queue:
+            parent = queue.pop()
+            if id(parent) in seen:
+                continue
+            seen.add(id(parent))
+            kids = [(k, rect(k)) for k in parent.grid_slaves()]
+            queue.extend(k for k, _ in kids)
+            kids = [(k, r) for k, r in kids if r]
+            if len(kids) > 1:
+                checked += 1
+            for i, (a, ra) in enumerate(kids):
+                for b, rb in kids[i + 1:]:
+                    if (ra[0] < rb[1] and rb[0] < ra[1]
+                            and ra[2] < rb[3] and rb[2] < ra[3]):
+                        overlaps.append(
+                            f'{a.winfo_class()}@{ra} vs {b.winfo_class()}@{rb} '
+                            f'in {parent.winfo_class()}')
+        check(f'no two widgets share a grid cell ({checked} containers checked)',
+              not overlaps, '; '.join(overlaps[:4]))
+
+        # And the specific thing that broke: the buttons must be reachable.
+        btn_row = int(w.enable_btn.master.grid_info()['row'])
+        status_row = int(w.status_lbl.grid_info()['row'])
+        check('the button frame and the status label are on different rows',
+              btn_row != status_row, f'both on row {btn_row}')
+        shutil.rmtree(tmp, ignore_errors=True)
+    finally:
+        root.destroy()
+
+
 def test_count_distribution_view():
     """Stage 4 port: the count-distribution view moved here from CorrelateWindow.
 
