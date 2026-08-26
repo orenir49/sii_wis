@@ -736,13 +736,12 @@ class ReceiverGUI:
         self._cal_deadline = 0.0
 
         self._correlate_win = CorrelateWindow(root)
-        # QuadCorrelateWindow is NOT opened. Its 2x2 workflow is the multi-pair
-        # window's "grid" pair mode at any size, and the multi-pair engine was
-        # validated on hardware on 2026-08-26, so Quad's only remaining job --
-        # transitional cross-check -- is done. The class still exists in
-        # correlate.py pending its deletion commit; nothing instantiates it.
-        # Overlapping (node, pixel-loc) between the remaining windows is fine:
-        # merge_hooks() fans the payload out to every subscriber.
+        # QuadCorrelateWindow is gone (deleted 2026-08-26). Its 2x2 workflow is
+        # the multi-pair window's "grid" pair mode at any size, and the
+        # multi-pair engine is validated on hardware, so its only remaining job
+        # -- transitional cross-check -- was done. Overlapping (node, pixel-loc)
+        # between the two remaining windows is fine: merge_hooks() fans the
+        # payload out to every subscriber.
         # The mask fields are pulled from the NodePanels rather than retyped:
         # the mask that matters is the one actually applied to the detector, and
         # a second copy in the correlator is only ever a chance to disagree.

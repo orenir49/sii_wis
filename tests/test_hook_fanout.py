@@ -161,8 +161,8 @@ def test_fanout_is_zero_copy():
 
 
 def test_legacy_bare_queue_still_works():
-    """CorrelateWindow and QuadCorrelateWindow still hand out {px: Queue}.
-    Normalization happens inside the loop, so they need no change."""
+    """CorrelateWindow still hands out a bare {px: Queue}. Normalization
+    happens inside the loop, so it needs no change."""
     q = queue.Queue()
     run_stream([frame(42, PAYLOAD_A)], {42: q})
     check('legacy {key: Queue} input still delivers', drain(q) == [PAYLOAD_A])

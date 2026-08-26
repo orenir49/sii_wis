@@ -16,7 +16,7 @@ stable 1v1 fallback.**
 | **1a** tap fan-out | **DONE** — `d049f36` |
 | **1b** write-to-disk checkbox | **DONE and verified on hardware** 2026-08-26 — deviation 1 closed, semantics widened to write *nothing*, and a 15-min run confirmed 11.43 GB not written with the buffer plateauing. Deviation 2 (lock the checkbox while streaming) still open; 3 largely answered by `spad_data/log/` |
 | **2** sender throughput | **DEFERRED, now on hardware evidence** — Phase 0 capture scaffolding landed 2026-08-26; 2.97 M rec/s sustained clean at 40 pixels against the ~80 M/s that would make 2a bind. Replay harness still to write |
-| **3** multi-pair correlator | **DONE in software and VALIDATED ON HARDWARE** 2026-08-26 — 8 to 40 pairs, 10 and 40 MHz, up to 15 min; comb on every pair in every run. Quad class not yet deleted (already unreachable) |
+| **3** multi-pair correlator | **COMPLETE** 2026-08-26 — validated on hardware from 8 to 40 pairs, 10 and 40 MHz, up to 15 min, comb on every pair in every run; 80 pairs covered synthetically; `QuadCorrelateWindow` deleted |
 
 ```
 ed842df  Stage 3: multi-pair live correlator with a synthetic pulsed-laser source
@@ -88,7 +88,40 @@ What the table says:
   O(chunk x N_active_pixels) and 40 active pixels is 8x cheaper per record than 320. So this does
   **not** license 2.97 M/s at 80 or 320 pixels. Killing that loop is Stage 2a.
 
-### Measured with the synthetic source (16 cores)
+### Measured with the synthetic source, 2026-08-26 — the rows the laser cannot give
+
+80 pairs of real signal is not available on this bench: the laser band is ~35 px wide, and filling
+the rest with background would add almost no load, so an 80-pair *hardware* load run was dropped
+rather than done badly. The synthetic source has no such limit and can also push per-pixel rates past
+what the detectors deliver, which is the regime Stage 2 was deferred against. Same modules as the
+live window (`pair_map` -> `ChannelGraph` -> `PairPool`), 20 ps bins, +-250 ns, `n_shift=5`, 10 MHz.
+
+| pairs | load (M rec/s, both nodes) | ms/batch | wall-s per data-s | core-s per data-s | peak buf | peak RSS |
+|---|---|---|---|---|---|---|
+| 16 | 2.24 | 3.1 | 0.006 | 0.10 | 9.0 MB | 147 MB |
+| 40 | 5.60 | 5.1 | 0.010 | 0.16 | 22.4 MB | 200 MB |
+| **80** | **11.20** | **10.1** | **0.020** | **0.32** | **44.8 MB** | **288 MB** |
+| 80 | 24.00 | 17.2 | 0.034 | 0.55 | 96.0 MB | 461 MB |
+| 80 | 40.00 | 26.8 | 0.054 | 0.86 | 160.1 MB | 654 MB |
+
+**Units matter here and are easy to conflate.** `PairPool` is a thread pool over a `nogil` kernel, so
+the measured quantity is **wall** time; the `core-s` column is that times 16 and is the figure
+comparable to the older synthetic estimate below. What governs whether the master keeps up is the
+wall column — the poll must finish before the next one.
+
+- **40 -> 80 pairs at a fixed per-pixel rate is exactly linear**: pairs 2.00x, load 2.00x, kernel
+  1.98x, buffer 2.00x. This is the clean statement of what the hardware table only hinted at, where
+  the added pairs happened to be dim: **cost tracks events, and pairs only matter through them.**
+- **Rate is cheaper than linear**: 3.57x the load on the same 80 pairs cost 2.65x the kernel.
+- **Nothing is close to binding.** The heaviest row is 40 M rec/s across both nodes -- 24x the
+  1.64 M/s the 40-pixel hardware run produced -- and the kernel still occupies 5.4 % of wall time.
+  Buffer scales linearly with rate exactly as the hardware showed, so the 2000 MB cap is not the
+  constraint either.
+
+That is the quantitative reason Stage 2 stays deferred: at 80 pairs the *correlator* is idle by
+comparison, and the sender's O(chunk x N_active_pixels) bucketing loop is what will bind first.
+
+### Earlier synthetic estimate (16 cores)
 
 - Pool vs serial, 80 pairs / 8.76M t1 events / `n_shift=5`: **0.257 s → 0.035 s, 7.35x**,
   bit-identical at 4, 8 and 16 workers.
@@ -126,21 +159,26 @@ Quad is now free to go.** Item 3 is the next thing to do.
      60 s** — 15x the duration for +11%, so retention really is bounded by `tmax` and not by run
      length. That could not be established from a 60 s run, and it is what makes a long acquisition
      safe. Peak RSS and kernel ms/batch were flat.
-   - **`mask_laser_80.txt`** (locs 240-319) — load only, **still to do**. **The laser band is just
-     35 px wide at 3x background, so no source on this bench can give 80 pairs of real comb**; the
-     lower half of this mask is background. 80-pair *correctness* stays a synthetic-source claim
-     until starlight. Worth pairing with `SII_WIS_RAW_DUMP` so one session also serves Stage 2a.
+   - ~~**`mask_laser_80.txt`** (locs 240-319) — load only~~ **DROPPED 2026-08-26, deliberately.**
+     The laser band is ~35 px wide at 3x background, so 43 of those 80 pixels would sit at
+     background and the total load would barely exceed the 40-pair run — it would have measured
+     nothing new while reading like an 80-pair result. 80 pairs is covered synthetically instead
+     (see the table below: exactly linear 40 -> 80, and 24x the hardware load still leaves the
+     kernel at 5 % of wall time). A real 80-pair run waits for a **broadband source**, which is
+     separate future work. `mask_laser_80.txt` stays in the repo for that day.
    - **A short re-run of anything**, to exercise the write-nothing and run-log paths: both landed
      after the runs above, so neither has touched hardware yet.
 2. ~~**Stage 1b deviation 1 — widen `write_hooked` to all pixel keys.**~~ **DONE 2026-08-26.**
    `skipped_keys = set(range(320))`; "disk flat at 80 pixels" now holds regardless of which pixels
    are hooked. Note the behaviour change to expect at the bench: unchecking the box with no
    correlator open now records nothing at all.
-3. **Delete `QuadCorrelateWindow`** (`correlate.py`, the `QuadCorrelateWindow` class and `_Channel`)
-   — **unblocked: (1) passed 2026-08-26.** Half-done already: `receiver.py` no longer imports or
-   instantiates it and `_correlators` is down to two windows, so the class is dead code reachable
-   from nothing. What remains is deleting the class itself. It is kept *only* as the transitional cross-check. When it goes, drop the
-   `_pick_unit` staticmethod alias, remove it from `ReceiverGUI._correlators`, and re-run the suite.
+3. ~~**Delete `QuadCorrelateWindow`**~~ **DONE 2026-08-26.** The class, `_Channel` and the
+   `_pick_unit` staticmethod alias are gone; `correlate.py` is 1207 -> 693 lines. The post-deletion
+   checklist was walked: all six per-window consumers iterate `_correlators`
+   (`hooks_node1`/`hooks_node2` merge, `set_write_to_disk`, `is_enabled`, both `start_with_offset`
+   paths, and the mask refresh), the only by-name reaches left are `_correlate_win.px1_var`/`px2_var`
+   for `set_correlate_pixel_fn` which is single-pair by definition, and the prewarm once-lock lives
+   in `correlate_kernel` at module level so it was never per-window. Full suite re-run green.
 4. **Stage 2**, when pair count x rate actually demands it. Start with its Phase 0 scaffolding (the
    env-gated raw-stream dump), which needs detector time and therefore wants to be captured during a
    bench session you are already having.
@@ -612,7 +650,7 @@ unchanged as N grows; framing overhead at N=80/1 MHz is 0.8% of a flush. Also se
 > (constant pulse energy), so halving the rate from 20 MHz halved the load — but not the background,
 > costing ~6 % of comb contrast. Worth it.
 >
-> **Not yet done in this stage:** deleting Quad (`correlate.py:737-1214`) and the transitional
+> **Quad is deleted** (2026-08-26) and the transitional
 > `quad_compat` cross-check; the count-distribution view and the backlog note were absorbed only in
 > part (the window has the marked-tau helpers, the Compute R button, a per-pair SNR sparkline reusing
 > `_mark_tau_bin`'s statistic, and a hold-policy status line, but not the count-distribution radio).
@@ -971,7 +1009,7 @@ Add a `raw_b`/`wire_b` ratio to `stats` and expect ~2.00x at the rates that matt
 > | display / save / legacy `.txt` export | **done** — `tests/test_multi_window.py` |
 > | **transitional Quad cross-check (`quad_compat`)** | **NOT DONE** — judged redundant once the golden brute force existed, since it is a strictly better oracle and Quad carries the retention bug. Reinstate only if a hardware discrepancy needs bisecting |
 > | **on hardware — the live-vs-offline proof** | **DONE 2026-08-26** — see the hardware block below. Done against `analyze_g2_pairs_offline.py` rather than `CorrelateWindow`: the offline path is a strictly better oracle (independent kernel, independent offset estimate, whole-file rather than streamed) and it sidesteps the `suffix` collision entirely |
-> | **after Quad is deleted: re-run the suite** | **NOT DONE** — Quad still exists |
+> | **after Quad is deleted: re-run the suite** | **DONE 2026-08-26** — suite green, and the four per-window wiring sites re-checked (they all iterate `_correlators`) |
 > | **kernel s/batch and peak RSS at 4 → 16 → 80 pairs** | **DONE to 40 pairs** 2026-08-26 — see the Measured-on-hardware table. 80 pairs outstanding, and it is a load test only |
 
 - *Kernel equivalence:* the new pair-parallel kernel must match `_multistart_multistop` **exactly**

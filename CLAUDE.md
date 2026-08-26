@@ -84,7 +84,7 @@ Minimal GUI that starts a command server thread on launch. Receives JSON command
 | `run_log.py` | Per-run capture of the live log to `spad_data/log/<stamp>.log` — buffered during integration, flushed at the end; `--selftest` |
 | `sender.py` | Sender GUI shell; starts command server thread |
 | `sender_backend.py` | Command server + lSPAD TCP client; contains `PIXMAP` (320-pixel array mapping); logs abnormal marker ids live (see below) |
-| `correlate.py` | `CorrelateWindow` (single-pair) live correlator, Numba JIT kernel; "Compute R…" button opens `tools/sii_calculator.py`. Also still defines `QuadCorrelateWindow` (2 pixels/node, 4 pairwise g²), which **`receiver.py` no longer instantiates** — the multi-pair window's grid mode subsumes it; pending deletion |
+| `correlate.py` | `CorrelateWindow` (single-pair) live correlator, Numba JIT kernel, shared `_mark_peak_bin`/`pick_unit` helpers; "Compute R…" button opens `tools/sii_calculator.py`. `QuadCorrelateWindow` was deleted 2026-08-26 — the multi-pair window's `grid` mode subsumes its 2×2 workflow |
 | `correlate_multi.py` | `MultiCorrelateWindow` — up to ~320 pairs, one plot + pair selector. Widgets only; the logic lives in the three modules below |
 | `correlate_engine.py` | `ChannelGraph` — which events are safe to correlate and which must be kept. No Tk; 59 tests |
 | `correlate_kernel.py` | `_pair_kernel` (`nogil`, bitwise identical to `_multistart_multistop`) + `PairPool`; `--selftest` |
