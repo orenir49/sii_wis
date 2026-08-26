@@ -8,8 +8,13 @@
 
 ## STATUS — 2026-08-26
 
-**Branch `feat/multipair-correlation`, pushed to `origin`. `main` is untouched and remains the
-stable 1v1 fallback.**
+**Branch `feat/multipair-correlation`, pushed to `origin`. `main` is untouched.**
+
+**Both sender nodes were checked out onto this branch on 2026-08-26** (`git checkout main` reverts
+them). That was needed because the launcher's `git pull` only ever pulls the checked-out branch, so
+sender-side work on a feature branch simply never reaches the nodes — two capture runs produced
+nothing before this was spotted. It also means `main` is no longer the code the hardware is running,
+so it is a *fallback on paper* until either the nodes go back or this branch merges.
 
 | stage | state |
 |---|---|
@@ -17,6 +22,7 @@ stable 1v1 fallback.**
 | **1b** write-to-disk checkbox | **COMPLETE** 2026-08-26 — deviation 1 closed, semantics widened to write *nothing*, deviation 2 (checkbox locked once committed) fixed, deviation 3 largely answered by `spad_data/log/`. Verified on hardware: a 15-min run wrote 0 bytes of the 11.43 GB it would have, with the buffer plateauing |
 | **2** sender throughput | **DEFERRED, and now PROVABLE** — Phase 0 complete 2026-08-26: real captures taken from both nodes and `tools/replay.py` reproduces each acquisition byte-for-byte across all 326 files, `epoch_fixes` included. Still deferred on merit: 2.97 M rec/s runs clean at 40 pixels against the ~80 M/s that would make 2a bind |
 | **3** multi-pair correlator | **COMPLETE** 2026-08-26 — validated on hardware from 8 to 40 pairs, 10 and 40 MHz, up to 15 min, comb on every pair in every run; 80 pairs covered synthetically; `QuadCorrelateWindow` deleted |
+| **4** retire the single-pair correlator | **NOT STARTED** — the multi-pair window is the only correlator that should remain; see Stage 4 |
 
 ```
 ed842df  Stage 3: multi-pair live correlator with a synthetic pulsed-laser source
@@ -135,8 +141,10 @@ comparison, and the sender's O(chunk x N_active_pixels) bucketing loop is what w
 
 ## RESUME HERE — next session
 
-In priority order. **Items 1 and 2 are done as of 2026-08-26 — the hardware gate is cleared and
-Quad is now free to go.** Item 3 is the next thing to do.
+In priority order. **Items 1-3 are done as of 2026-08-26** — the hardware gate is cleared, the
+write-to-disk flag is complete, and Quad is deleted. **Nothing left on this plan needs bench time.**
+Item 4 (retire the last duplicate correlator) is the next thing to do; item 5 stays deferred on
+merit.
 
 1. ~~**Validate on hardware with the pulsed laser.**~~ **DONE 2026-08-26 — the gating item is
    cleared.** 8 identity pairs (locs 295-302, `.claude/masks/mask_laser_8.txt`), laser at 10 MHz,
@@ -186,7 +194,10 @@ Quad is now free to go.** Item 3 is the next thing to do.
    paths, and the mask refresh), the only by-name reaches left are `_correlate_win.px1_var`/`px2_var`
    for `set_correlate_pixel_fn` which is single-pair by definition, and the prewarm once-lock lives
    in `correlate_kernel` at module level so it was never per-window. Full suite re-run green.
-4. **Stage 2**, when pair count x rate actually demands it. Start with its Phase 0 scaffolding (the
+4. **Stage 4 — retire `CorrelateWindow`.** The multi-pair window already subsumes it: a single pair
+   is identity mode over two 1-pixel masks, or a one-row pair CSV. See the Stage 4 section for what
+   has to move first and the one feature that is genuinely lost.
+5. **Stage 2**, when pair count x rate actually demands it. Start with its Phase 0 scaffolding (the
    env-gated raw-stream dump), which needs detector time and therefore wants to be captured during a
    bench session you are already having.
 
@@ -1019,6 +1030,67 @@ teach `load_histogram`/`parse_label` an `.npz` + `--pair` branch (and an `--all`
 later.
 
 ---
+
+## Stage 4 — Retire `CorrelateWindow`, leaving one correlator
+
+**Decided 2026-08-26.** `QuadCorrelateWindow` is already gone; `CorrelateWindow` is the last
+duplicate. One correlator in the codebase, and it is the multi-pair one.
+
+**The single-pair case does not need its own window.** It is `identity` mode over two 1-pixel masks,
+or a `file` CSV with one row. The mask *is* the input now, and a 1-pixel mask is what
+`ssh_launcher.generate_mask_content()` and the `pixel-mask` skill already produce — so the fallback
+costs nothing new.
+
+### What comes out
+
+- `CorrelateWindow` from `correlate.py`.
+- `receiver.py`: the import, `_correlate_win`, and `_correlators` drops to one entry.
+- `set_correlate_pixel_fn` and its plumbing (`NodePanel.__init__`, `receiver.py:88`, `:591-592`) —
+  the "generating a 1-pixel mask fills in the correlator's pixel field" convenience. Obsolete by
+  construction: the multi-pair window reads the mask itself, so there is nothing to fill in.
+
+### What must move first, or the deletion breaks the build
+
+`correlate.py` is not only that class. These are imported elsewhere and have to land somewhere before
+it goes:
+
+| symbol | used by |
+|---|---|
+| `pick_unit`, `_mark_peak_bin`, `_prewarm` | `correlate_multi.py:47` |
+| `_multistart_multistop` | the reference kernel `correlate_kernel.py` proves `_pair_kernel` equal to (it holds a verbatim copy, and its docstring points here as canonical) |
+| `BACKLOG_WARN_S` | display threshold |
+
+Two ways, and the choice should be deliberate:
+
+- **(a)** Keep `correlate.py` as a shared-helpers module. Least churn, but the name then lies about
+  what is in it.
+- **(b)** Fold the helpers into `correlate_multi.py` and delete `correlate.py`, updating
+  `correlate_kernel.py`'s docstring reference. One correlator, one module. **Preferred** — the whole
+  point of the stage is that there is no second correlator to share with.
+
+### What is genuinely lost, and the decision that goes with it
+
+**The count-distribution view** (`correlate.py:_draw_distribution`). It histograms counts-per-bin
+against a Poisson of the same mean and reports both a local p-value and a **Lee-effect-corrected**
+p-value over the N bins searched. The multi-pair window has no distribution view at all — this was
+flagged as "not absorbed" when Stage 3 landed and never was.
+
+That is a real statistical tool and it exists nowhere else in the codebase, so retiring
+`CorrelateWindow` either **ports it first** or **deletes it**. It is the only part of this stage that
+is a judgement call rather than a mechanical move: everything else the single-pair window did, the
+multi-pair window does. Port it if the bunching search is still going to use it; drop it if the
+marked-peak SNR plus `tools/plot_g2_result.py` cover the need.
+
+### After
+
+Re-run the suite and re-check the per-window wiring, exactly as the Quad deletion did: every consumer
+must still iterate `_correlators` (`hooks_node1`/`hooks_node2`, `set_write_to_disk`, `is_enabled`,
+both `start_with_offset` paths, `_refresh_masks`). With one window left the list looks redundant —
+keep it anyway, since adding a window back is what it exists for.
+
+Note `tests/test_hook_fanout.py`'s bare-`{px: Queue}` coverage survives: `ChannelGraph.hooks_node1`
+returns a bare `Queue` per key, so the normalization path is still exercised without
+`CorrelateWindow`.
 
 ## Verification
 
