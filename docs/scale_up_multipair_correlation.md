@@ -26,7 +26,7 @@ ab9a8c2  Add tools/pair_map.py: pure pair derivation, shared with align_arc
 d049f36  Stage 1a: fan pixel_hooks out to every subscriber
 ```
 
-### Test suite — 284 checks, all passing as of 2026-08-26
+### Test suite — 287 checks, all passing as of 2026-08-26
 
 Plain asserts, no pytest (it is not in `requirements.txt`). **Run all of these before trusting any
 change**; the whole suite takes ~2 minutes, most of it numba compiling.
@@ -36,7 +36,7 @@ change**; the whole suite takes ~2 minutes, most of it numba compiling.
 .venv\Scripts\python.exe tests\test_hook_fanout.py       # 29  Stage 1a + 1b
 .venv\Scripts\python.exe tests\test_channel_graph.py     # 59  retention
 .venv\Scripts\python.exe tests\test_multi_window.py      # 45  end-to-end
-.venv\Scripts\python.exe tests\test_write_lock.py       # 17  write-flag lock
+.venv\Scripts\python.exe tests\test_write_lock.py       # 20  write-flag lock
 .venv\Scripts\python.exe tools\pair_map.py --selftest    # 44  pair derivation
 .venv\Scripts\python.exe tools\raw_dump.py --selftest    # 12  raw-capture format
 .venv\Scripts\python.exe tools\replay.py --selftest      # 17  replay harness
@@ -168,8 +168,13 @@ Quad is now free to go.** Item 3 is the next thing to do.
      (see the table below: exactly linear 40 -> 80, and 24x the hardware load still leaves the
      kernel at 5 % of wall time). A real 80-pair run waits for a **broadband source**, which is
      separate future work. `mask_laser_80.txt` stays in the repo for that day.
-   - **A short re-run of anything**, to exercise the write-nothing and run-log paths: both landed
-     after the runs above, so neither has touched hardware yet.
+   - ~~**A short re-run to exercise write-nothing and the run log**~~ **DONE 2026-08-26** — covered
+     by the grid run above, along with the stale-directory warning and the run log's writes-off path.
+
+   **Nothing on this plan is now waiting on bench time.** What remains needs either a broadband source
+   (80 real pairs, and validating a `file`-mode affine mapping — see the Pair-list section) or is pure
+   software (Stage 2a's faster parser, which is now provable against the captures in
+   `spad_data/captures/`).
 2. ~~**Stage 1b deviation 1 — widen `write_hooked` to all pixel keys.**~~ **DONE 2026-08-26.**
    `skipped_keys = set(range(320))`; "disk flat at 80 pixels" now holds regardless of which pixels
    are hooked. Note the behaviour change to expect at the bench: unchecking the box with no
@@ -242,10 +247,17 @@ Quad is now free to go.** Item 3 is the next thing to do.
   **Stage 2a is now provable.** The capture, the oracle and the ground-truth comparison all exist; what
   remains is writing the faster parser.
 
-- **The mask-driven pair modes have run on hardware** (2026-08-26): the 15-min writes-off run's saved
-  meta reads `mode identity {'from_masks': True, 'lo': 279, 'hi': 318, 'n_active': 40}`, so 40 pairs
-  were derived from the receiver's own mask files with no range typed anywhere. `file` mode ran
-  earlier the same evening via `pairs_laser_8_dim.csv`. `grid` has not been exercised live.
+- **All three pair modes have now run on hardware** (2026-08-26). `identity` from the masks on the
+  15-min writes-off run (`from_masks: True, n_active: 40`, no range typed anywhere); `file` via
+  `pairs_laser_8_dim.csv`; and **`grid`** on a 4-pixel mask (locs 297-299, 301) giving 16 pairs.
+
+  The grid run is the one that mattered, because it is the first hardware exercise of **shared
+  channels**: 16 pairs over 4 + 4 channels, each pixel serving four pairs. Every pixel reported a
+  *single* event count across its four pairs — node 1: 1,279,972 / 1,363,673 / 1,301,698 / 1,560,965;
+  node 2: 104,686 / 68,786 / 66,293 / 58,835 — which is the observable proof that channels are keyed
+  by **distinct pixel and never by pair**. Keyed by pair, each node-2 pixel would have been drained
+  four times, giving four different counts and silently wrong histograms. Comb on all 16 pairs
+  including every off-diagonal, period 100.00065 ns, sd 1.21 ps. `spad_data/g2multi_grid.npz`.
 
 - **Scale instrumentation LANDED 2026-08-26**, so the outstanding "kernel s/batch and peak RSS at
   4 -> 16 -> 80 pairs" is now a measurement rather than a screenshot: status line and `.npz` meta both
@@ -261,6 +273,22 @@ Quad is now free to go.** Item 3 is the next thing to do.
   `session_stats.json`) remain open — though **deviation 3 is largely answered another way**:
   every run's log is now captured to `spad_data/log/<stamp>.log` with the flag in its header, so
   a directory with no `px_*.bin` is explicable from a file rather than only from a live pane.
+
+- **Writes-off, verified end to end on hardware** 2026-08-26 with the grid run. The log said
+  `./spad_data/node1 is not created`, and only `session_stats.json` was touched on disk for the whole
+  60 s. The stale-directory warning fired for the first time in anger — *"already holds 320 px_*.bin
+  from an EARLIER run … do not analyse them against this run"* — which is exactly the trap that had
+  to be read off mtimes by hand a few hours earlier. The run log carried
+  `write_timestamps_to_disk=False` in its header, flushed 26 lines at integration end and appended the
+  drain messages after, so that file genuinely is the run's only record.
+
+  One flaw the same run exposed and which is now **fixed**: `_start_all` refreshed the write-flag lock
+  *before* opening the run log, so the `LOCKED` transition was enqueued while the file did not exist
+  and `RunLog` dropped it. The log showed `unlocked (OFF)` at the end with no matching `LOCKED` at the
+  start — the lock worked, its record did not, and for a writes-off run that record is the only
+  evidence there was a run. The refresh now happens after the log opens and still before any accept.
+  Pinned by two checks in `tests/test_write_lock.py`, one of which asserts the OLD order loses the
+  line, so the regression cannot come back silently.
 
 - **Writes-off now means nothing at all, sync keys included** (2026-08-26). The first version kept
   keys 320-325 so the offline offset estimate would still have its dwell streams — but with no

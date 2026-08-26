@@ -118,6 +118,64 @@ def test_gui_locks_and_unlocks_the_widget():
         root.destroy()
 
 
+def test_the_locked_line_reaches_the_run_log():
+    """The lock transition must land in spad_data/log, not just the pane.
+
+    Regression: _start_all refreshed the lock BEFORE opening the run log, so the
+    LOCKED line was enqueued while the file did not exist and RunLog correctly
+    dropped it. Observed on hardware -- the 26-8-26 writes-off run logged
+    "unlocked (OFF)" at the end with no matching LOCKED at the start. The lock
+    worked; its record did not, and for a writes-off run that file is the only
+    evidence the run happened at all.
+    """
+    import tempfile, shutil
+    from run_log import RunLog
+    root = tk.Tk()
+    root.withdraw()
+    tmp = tempfile.mkdtemp(prefix='wl_')
+    try:
+        g = object.__new__(receiver.ReceiverGUI)
+        g.node1, g.node2 = FakeNode(), FakeNode()
+        g.write_disk_var = tk.BooleanVar(value=False)
+        g._write_lock_var = tk.StringVar(value='')
+        g._write_disk_cb = tk.Checkbutton(root)
+        g._write_locked_last = False
+        g._run_log = RunLog(tmp)
+        # _enqueue_log's real behaviour: the pane AND the file.
+        g._enqueue_log = lambda t: g._run_log.add(t)
+
+        # The order _start_all uses: open the log, THEN refresh the lock.
+        path = g._run_log.start(stamp='RUN')
+        g.node1._session_active = True          # START committed the flag
+        g._refresh_write_disk_lock()
+        g._run_log.finish()
+
+        body = open(path).read()
+        check('the LOCKED transition is in the run log file',
+              'LOCKED' in body, repr(body))
+        check('and records which way it was locked',
+              'OFF' in body, repr(body))
+
+        # The old order, to show the test would have caught it.
+        rl = RunLog(tmp)
+        g2 = object.__new__(receiver.ReceiverGUI)
+        g2.node1, g2.node2 = FakeNode(session_active=True), FakeNode()
+        g2.write_disk_var = tk.BooleanVar(value=False)
+        g2._write_lock_var = tk.StringVar(value='')
+        g2._write_disk_cb = tk.Checkbutton(root)
+        g2._write_locked_last = False
+        g2._run_log = rl
+        g2._enqueue_log = lambda t: rl.add(t)
+        g2._refresh_write_disk_lock()           # refresh BEFORE start: the bug
+        p2 = rl.start(stamp='RUN_OLD')
+        rl.finish()
+        check('refreshing before the log opens loses the line (the old bug)',
+              'LOCKED' not in open(p2).read(), open(p2).read())
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        root.destroy()
+
+
 def test_the_flag_the_backend_reads_is_unaffected():
     """Locking is a UI guard, not a change of semantics: get_write_hooked_fn must
     still return the variable's value, so a locked-ON run still writes."""

@@ -1000,8 +1000,6 @@ class ReceiverGUI:
 
         self._run_id += 1
         self._set_cal_status('')
-        # Synchronously, before any accept: START has already committed the flag.
-        self._refresh_write_disk_lock()
         writing = self.write_disk_var.get()
         path = self._run_log.start(header=(
             f'# sii_wis run log — {time.strftime("%Y-%m-%d %H:%M:%S")}\n'
@@ -1012,6 +1010,14 @@ class ReceiverGUI:
                'files. This file is the only record.\n')))
         if path:
             self._enqueue_log(f'Run log: {path}\n')
+        # AFTER the run log is open, not before: this call logs the LOCKED
+        # transition, and the whole point of locking is that the run kept what
+        # it said it would. Refreshing first sent that line to the pane while
+        # the file did not exist yet, so RunLog dropped it -- the lock worked
+        # and its record did not, which for a writes-off run is precisely
+        # where the record is the only evidence there was a run at all.
+        # Still before any accept, so the two nodes cannot disagree.
+        self._refresh_write_disk_lock()
         if duration == 0:
             self._enqueue_log(f'START sent to {sent} node(s) (real, indefinite).\n')
             self._start_timer()
