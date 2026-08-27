@@ -6,7 +6,11 @@
 
 ---
 
-## STATUS — 2026-08-26
+## STATUS — 2026-08-26: CLOSED except Stage 2
+
+**Everything in this plan is delivered and merged except Stage 2, which was never
+built — it is deferred on measured evidence, not left half-done.** Stage 2 is the only
+reason this document is still open.
 
 **MERGED. `main` is `f6ca861`**, 44 commits past the `v1-single-pair` tag, and both sender nodes are
 back on `main` at that commit — clean, verified as carrying the merged code with `correlate.py`
@@ -29,6 +33,7 @@ work is on `main` the problem is gone, but it will recur for the next feature br
 | **3** multi-pair correlator | **COMPLETE** 2026-08-26 — validated on hardware from 8 to 40 pairs, 10 and 40 MHz, up to 15 min, comb on every pair in every run; 80 pairs covered synthetically; `QuadCorrelateWindow` deleted |
 | **4** retire the single-pair correlator | **COMPLETE** 2026-08-26 — distribution view ported (and its Lee correction fixed), synthetic GUI surface out, `CorrelateWindow` and `correlate.py` deleted. `MultiCorrelateWindow` is the only correlator |
 | **5** tag the 1v1 fallback, then merge to `main` | **COMPLETE** 2026-08-26 — `v1-single-pair` tagged and pushed, 43 commits merged `--no-ff` into `main` (`f6ca861`), suite green on `main`, both nodes moved back |
+| **6** rename the role modules | **COMPLETE** 2026-08-26 — `receiver{,_backend}.py` -> `master{,_backend}.py`, `sender{,_backend}.py` -> `node{,_backend}.py` (`8d9e541`). Verified from the GUI: the launcher's kill-and-relaunch path works, which was the one thing the suite could not check |
 
 ```
 ed842df  Stage 3: multi-pair live correlator with a synthetic pulsed-laser source
@@ -147,7 +152,7 @@ comparison, and the sender's O(chunk x N_active_pixels) bucketing loop is what w
 
 ## RESUME HERE — next session
 
-**Items 1-5 are done as of 2026-08-26.** The multi-pair correlator is validated on hardware, the
+**Items 1-6 are done as of 2026-08-26.** The multi-pair correlator is validated on hardware, the
 write-to-disk flag is complete, both older correlators are deleted, and the work is merged to `main`
 with the 1v1 fallback tagged. **Only item 6 (Stage 2) remains, and it stays deferred on merit** — the
 sender sustains 2.97 M rec/s at 40 pixels against the ~80 M/s that would make it bind, and it is now
@@ -209,7 +214,25 @@ provable rather than arguable whenever it is wanted.
    `tools/sii_calculator.py`.
 5. ~~**Stage 5 — tag the 1v1 fallback, then merge into `main`.**~~ **DONE 2026-08-26.** Tag first,
    then the merge, then the nodes — the order held. See the Stage 5 section for what was verified.
-6. **Stage 2**, when pair count x rate actually demands it. **The only thing left on this plan.** Start with its Phase 0 scaffolding (the
+6. ~~**Rename the role modules.**~~ **DONE 2026-08-26** (`8d9e541`), and verified from the GUI.
+   `node`, not `slave`: "slave" already names the 170-pixel detector chip in 277 master/slave
+   occurrences, and the slave-*dwell* offset is the one applied to the correlator, so "the slave
+   offset" would have been ambiguous about a load-bearing number. The hazard was `ssh_launcher`
+   killing stale processes by WMI command-line substring — that string lives on the master, so it
+   flipped to the new name while the nodes still ran `sender.py`; it now matches **both** names
+   permanently.
+
+7. **Stage 2 — sender throughput.** **The only thing still open, and deliberately so.** The sender
+   sustains 2.97 M rec/s at 40 active pixels with 0.01 s lag and zero overflow, against the ~80 M/s
+   that would make the `O(chunk x N_active_pixels)` bucketing loop bind. Phase 0 is complete, so it
+   is *provable* whenever it is wanted: real captures from both nodes live in `spad_data/captures/`
+   and `tools/replay.py` reproduces an acquisition byte-for-byte across all 326 files, `epoch_fixes`
+   included. What remains is writing the faster parser and running it through that comparison.
+
+   One housekeeping note for whoever picks it up: those captures exist on **one disk** —
+   `spad_data/` is gitignored. Copying the 660 MB somewhere durable would make the sender-side dump
+   code genuinely redundant, which turns removing it from the hot loop during 2a into a free
+   decision rather than a lossy one. Start with its Phase 0 scaffolding (the
    env-gated raw-stream dump), which needs detector time and therefore wants to be captured during a
    bench session you are already having.
 
