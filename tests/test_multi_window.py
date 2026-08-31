@@ -27,6 +27,7 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, 'tools'))
 
 import correlate_multi
+import pair_map
 from correlate_multi import MultiCorrelateWindow
 from synthetic_source import SyntheticSource
 
@@ -555,16 +556,52 @@ def test_mask_fields_come_from_the_receiver():
         check('and the active count of each is reported',
               '8 active' in w.maskinfo_var.get() and '6 active' in w.maskinfo_var.get(),
               w.maskinfo_var.get())
-        # A name the receiver has but no local copy of must say so, not derive
-        # 320 pairs from a silently-empty mask.
-        w2 = make_window(root, masks=lambda: ('no_such_mask.txt', 'n2.txt'))
+        # A mask name that has not been read off the node must say so, not
+        # derive 320 pairs from a silently-empty mask. It must NOT go looking
+        # for a master-side copy: masks live in the node's lSPAD directory.
+        w2 = make_window(root, masks=lambda: ('mask_sparse.txt', 'n2.txt'))
         w2._show_preview = lambda *a, **k: None
         w2.mode_var.set('identity')
         w2._derive()
-        check('a mask with no local copy fails Derive loudly',
-              w2._pairs is None and 'no local copy' in w2.pairs_var.get(),
-              w2.pairs_var.get())
+        msg = w2.pairs_var.get()
+        check('a mask not yet read from the node fails Derive loudly',
+              w2._pairs is None and 'lSPAD directory' in msg, msg)
+        check('and the failure does not mention a master-side mask directory',
+              '.claude' not in msg, msg)
         shutil.rmtree(tmp, ignore_errors=True)
+    finally:
+        root.destroy()
+
+
+def test_mask_source_carried_by_value_needs_no_local_file():
+    """The normal hardware path: the receiver saw the mask applied on the node
+    and hands over its contents. Nothing on the master is opened -- with the
+    single-pixel option the file only ever existed on the node."""
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        src1 = pair_map.MaskSource(
+            origin=r'node 1: C:\Program Files (x86)\SPADlambda\lSPAD_standalone_win64\mask_147.txt',
+            text='\n'.join(str(i) for i in range(320) if i not in range(150, 158)))
+        src2 = pair_map.MaskSource(
+            origin=r'node 2: C:\...\mask_147.txt',
+            text='\n'.join(str(i) for i in range(320) if i not in range(150, 156)))
+        w = make_window(root, masks=lambda: (src1, src2))
+        w._show_preview = lambda *a, **k: None
+        w._refresh_masks()
+        check('active counts come straight from the node mask contents',
+              '8 active' in w.maskinfo_var.get() and '6 active' in w.maskinfo_var.get(),
+              w.maskinfo_var.get())
+        check('the narrow field shows just the mask file name',
+              w.mask1_var.get() == 'mask_147.txt', w.mask1_var.get())
+        check('the status line stays short - no paths, both nodes',
+              w.maskinfo_var.get() == 'n1 8 active  |  n2 6 active',
+              w.maskinfo_var.get())
+        w.mode_var.set('identity')
+        w._derive()
+        check('identity derives from the node-side masks with no local file',
+              w._pairs is not None and len(w._pairs) == 6,
+              str(w._pairs and len(w._pairs)))
     finally:
         root.destroy()
 

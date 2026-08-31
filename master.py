@@ -27,6 +27,8 @@ from tkinter import ttk, scrolledtext, messagebox
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tools'))
+import pair_map
 from master_backend import start_server, check_connection, run_session_loop, run_intensity_session
 from correlate_multi import MultiCorrelateWindow
 from run_log import RunLog
@@ -95,6 +97,11 @@ class NodePanel:
         self._output_dir: str | None = None
         self._drain_active = False   # periodic discard of the post-calibration dwell tap
         self._ssh_creds: tuple | None = None       # (host, user) set after Launch
+        # The mask this node is actually running, captured at the moment
+        # launch_node applied it. Masks exist only in the node's own lSPAD
+        # directory, so this — not any file on the master — is what the
+        # correlator derives pairs from. None until a Launch through this panel.
+        self._applied_mask: pair_map.MaskSource | None = None
         self._shutdown_thread: threading.Thread | None = None
         self._dwell_freq: float | None = None      # dwell clock Hz from last Launch R command
         self._event_accum: list = [0]              # [int] — incremented by data thread, read by GUI
@@ -613,7 +620,8 @@ class NodePanel:
             self._dwell_freq = ssh_launcher.launch_node(
                 host=host, username=username,
                 mask_pixel=mask_pixel, raw_dump=raw_dump,
-                mask_filename=mask, log_fn=_log)
+                mask_filename=mask, log_fn=_log,
+                mask_sink=self._record_applied_mask)
             time.sleep(3)           # give node.py command server time to start
             self._gui(self._connect)
         except ssh_launcher.UncommittedChangesError as exc:
@@ -629,8 +637,37 @@ class NodePanel:
             self._trigger_remote_shutdown()
             self._gui(lambda: self._set_ctrl_status('idle'))
 
+    def _record_applied_mask(self, remote_path: str, text: str) -> None:
+        """launch_node's mask_sink: remember the mask the detector is running.
+
+        Called from the launch thread. Storing a value (not a path) is the
+        point — the file itself is on the node, and the single-pixel option
+        creates it there, so there is nothing on the master to open. Also
+        mirrored into mask_var so the field names the file that was really
+        applied rather than whatever was typed.
+        """
+        name = os.path.basename(remote_path.replace('\\', '/'))
+        self._applied_mask = pair_map.MaskSource(
+            origin=f'node {self.node_id}: {remote_path}', text=text)
+        self._gui(lambda: self.mask_var.set(name))
+        # The mask is already on the hardware by now, so a parse problem here is
+        # bookkeeping, not a reason to fail the launch this runs inside.
+        try:
+            n_active = f'{len(pair_map.parse_mask_active(text, remote_path))} active'
+        except Exception as exc:
+            n_active = f'UNPARSEABLE — {exc}'
+        self.log_fn(f'Node {self.node_id}: mask in use — {remote_path} ({n_active}).\n')
+
+    def mask_source(self) -> pair_map.MaskSource | None:
+        """The mask this node is running, if the master saw it being applied."""
+        return self._applied_mask
+
     def _trigger_remote_shutdown(self) -> None:
         """If SSH creds are available, start a non-daemon thread to kill lSPAD."""
+        # lSPAD is going away, so the mask it had applied is no longer what any
+        # detector is running. Dropping it makes the next Derive re-read the
+        # node rather than derive pairs from a mask nothing is enforcing.
+        self._applied_mask = None
         if self._ssh_creds:
             creds, self._ssh_creds = self._ssh_creds, None
             self._shutdown_thread = threading.Thread(
@@ -764,8 +801,9 @@ class ReceiverGUI:
         # the mask that matters is the one actually applied to the detector, and
         # a second copy in the correlator is only ever a chance to disagree.
         self._multi_correlate_win = MultiCorrelateWindow(
-            root, get_masks_fn=lambda: (self.node1.mask_var.get(),
-                                        self.node2.mask_var.get()))
+            root,
+            get_masks_fn=lambda: (self.node1.mask_source() or self.node1.mask_var.get(),
+                                  self.node2.mask_source() or self.node2.mask_var.get()))
         # Every correlator window, in one place. Each one needs its hooks
         # merged, its is_enabled consulted before calibration, and its
         # start_with_offset called on every path out of the cal -- four sites

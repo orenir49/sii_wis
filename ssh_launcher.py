@@ -248,6 +248,22 @@ def generate_mask_content(pix: int) -> bytes:
     return ('\n'.join(lines) + '\n').encode('ascii')
 
 
+def read_remote_file(client: paramiko.SSHClient, remote_path: str) -> bytes:
+    """Return the contents of `remote_path` on the node, via SFTP.
+
+    Unlike download_file this keeps nothing on the master. Masks are the
+    reason: they live only in the node's lSPAD directory, and a master-side
+    copy is a second version of the truth waiting to disagree with the one the
+    detector is actually running.
+    """
+    sftp = client.open_sftp()
+    try:
+        with sftp.open(remote_path, 'rb') as f:
+            return f.read()
+    finally:
+        sftp.close()
+
+
 def upload_file(client: paramiko.SSHClient, remote_path: str, content: bytes) -> None:
     """Write `content` to `remote_path` on the host `client` is connected to, via SFTP."""
     sftp = client.open_sftp()
@@ -409,12 +425,20 @@ def launch_node(host: str, username: str,
                 mask_filename: str, log_fn,
                 lspad_port: int = SPAD_PORT,
                 mask_pixel: int | None = None,
-                raw_dump: str | None = None) -> float:
+                raw_dump: str | None = None,
+                mask_sink=None) -> float:
     """
     Full launch sequence for one sender node.
     log_fn receives plain text lines (already newline-terminated).
     `mask_pixel` (a physical sensor location, not a pix ID) generates a
     single-pixel mask and takes priority over `mask_filename`.
+    `mask_sink`, if given, is called `mask_sink(remote_path, text)` once the
+    mask command has succeeded. This is the only moment the master can know
+    what mask the detector is actually running: masks live in the node's own
+    lSPAD directory, so for a manual filename the master never had the file,
+    and for `mask_pixel` it generated the contents but wrote them only there.
+    The correlator needs the active-pixel set, and reading it back from here
+    beats keeping a hand-made master-side duplicate that can silently disagree.
     `raw_dump`, if given, enables node_backend's verbatim lSPAD capture
     (SII_WIS_RAW_DUMP) — the Stage 2a replay reference. It has to be set in the
     sender's own environment at launch, which is why start_detached takes an env
@@ -455,17 +479,30 @@ def launch_node(host: str, username: str,
             generated_filename = f'mask_{mask_pixel}.txt'
             mask_path = lspad_dir + '\\' + generated_filename
             log_fn(f'Generating and uploading {generated_filename} …\n')
-            upload_file(client, mask_path, generate_mask_content(mask_pixel))
+            mask_content = generate_mask_content(mask_pixel)
+            upload_file(client, mask_path, mask_content)
             log_fn(f'Applying mask: {mask_path}\n')
             send_lspad_cmd(client, lspad_port, f'M,{mask_path}',
                           read_timeout=30.0, until='successful',
                           log_fn=lambda s: log_fn(f'  {s}'))
+            if mask_sink is not None:
+                mask_sink(mask_path, mask_content.decode('ascii'))
         elif mask_filename.strip():
             mask_path = lspad_dir + '\\' + mask_filename
             log_fn(f'Applying mask: {mask_path}\n')
             send_lspad_cmd(client, lspad_port, f'M,{mask_path}',
                           read_timeout=30.0, until='successful',
                           log_fn=lambda s: log_fn(f'  {s}'))
+            # Read it back rather than assume: this branch never uploaded
+            # anything, so the file is whatever is on the node. A failure here
+            # must not fail the launch -- the mask is applied either way, and
+            # only the correlator's pair derivation needs the contents.
+            if mask_sink is not None:
+                try:
+                    mask_sink(mask_path,
+                              read_remote_file(client, mask_path).decode('ascii', 'replace'))
+                except Exception as exc:
+                    log_fn(f'Could not read {mask_path} back for the correlator: {exc}\n')
         else:
             log_fn('No mask specified — skipping mask command.\n')
 

@@ -157,8 +157,32 @@ def affine_partner(p1, a: float, b: float):
     return np.round((p1 - FIT_CENTER - b) / a + FIT_CENTER).astype(int)
 
 
-def load_mask_active(path) -> set:
-    """Active pixel locations from an lSPAD mask file.
+@dataclass(frozen=True)
+class MaskSource:
+    """An lSPAD mask as it exists **on the node**, carried by value.
+
+    Masks live in the node's own lSPAD directory and nowhere else -- the
+    single-pixel option has the master generate one and upload it there. So
+    the master usually has no file to open, only the bytes it applied (or
+    just read back over SFTP). Carrying the text plus a label of where it
+    came from keeps `origin` printable in the UI without inventing a
+    master-side copy that could drift from the node's.
+    """
+    origin: str     # e.g. r'node 1: C:\...\lSPAD_standalone_win64\mask_147.txt'
+    text: str       # the mask file's contents, verbatim
+
+    @property
+    def name(self) -> str:
+        """Just the file name, for a narrow UI field. The full node-side path
+        belongs on the info line, where there is room for it."""
+        return self.origin.replace('\\', '/').rstrip('/').rsplit('/', 1)[-1]
+
+    def __str__(self) -> str:
+        return self.origin
+
+
+def parse_mask_active(text: str, origin: str = '<mask>') -> set:
+    """Active pixel locations from the *contents* of an lSPAD mask file.
 
     Per gen_mask.py:38-41 the file lists the *masked-off* physical locations,
     one per line, so active = all - file. Blank lines and '#' comments are
@@ -166,16 +190,29 @@ def load_mask_active(path) -> set:
     silently-misparsed mask would mark good pixels as dead.
     """
     masked = set()
-    with open(path) as f:
-        for lineno, line in enumerate(f, 1):
-            line = line.split('#', 1)[0].strip()
-            if not line:
-                continue
-            try:
-                masked.add(int(line))
-            except ValueError:
-                raise ValueError(f'{path}:{lineno}: not a pixel location: {line!r}')
+    for lineno, line in enumerate(text.splitlines(), 1):
+        line = line.split('#', 1)[0].strip()
+        if not line:
+            continue
+        try:
+            masked.add(int(line))
+        except ValueError:
+            raise ValueError(f'{origin}:{lineno}: not a pixel location: {line!r}')
     return set(range(PIX_LO, PIX_HI + 1)) - masked
+
+
+def load_mask_active(source) -> set:
+    """Active pixel locations from a mask file path or a MaskSource.
+
+    Two callers, two shapes: offline tools have a real file, while the
+    correlator has only what the node applied (see MaskSource). Both land on
+    parse_mask_active, so there is one parser and one place the
+    masked-off-vs-active convention is encoded.
+    """
+    if isinstance(source, MaskSource):
+        return parse_mask_active(source.text, source.origin)
+    with open(source) as f:
+        return parse_mask_active(f.read(), str(source))
 
 
 def derive(mode: str, *, lo=None, hi=None, a=1.0, b=0.0,

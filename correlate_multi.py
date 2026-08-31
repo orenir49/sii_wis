@@ -173,9 +173,15 @@ class MultiCorrelateWindow(tk.Toplevel):
     def __init__(self, parent: tk.Tk, get_masks_fn=None) -> None:
         """get_masks_fn: () -> (node1_mask, node2_mask) as the receiver has
         them, so the correlator cannot be pointed at a different mask than the
-        one actually applied to the hardware. Optional, for standalone use."""
+        one actually applied to the hardware. Each element is a
+        pair_map.MaskSource (the mask the node is running, carried by value) or
+        a path string for standalone/offline use. Optional.
+        """
         super().__init__(parent)
         self._get_masks_fn = get_masks_fn
+        # Whatever get_masks_fn last handed over, per node: a MaskSource or a
+        # path. mask1_var/mask2_var hold only the display string.
+        self._mask_src: dict = {1: None, 2: None}
         self.title('Live g² Correlator — multi-pair')
         self.resizable(True, True)
         self.geometry('+90+90')
@@ -310,8 +316,11 @@ class MultiCorrelateWindow(tk.Toplevel):
                         value='distribution').pack(side='left')
         self.view_var.trace_add('write', self._on_display_change)
 
-        ttk.Label(cfg, text='Expected rate (R):').grid(row=3, column=4,
-                                                      padx=(16, 6), sticky='w')
+        # The value here multiplies the flat mean directly, so it is the total
+        # ratio 1 + R, not the bare bunching excess R. "Compute R..." applies
+        # 1 + R for exactly this reason.
+        ttk.Label(cfg, text='Expected ratio (1+R):').grid(row=3, column=4,
+                                                          padx=(16, 6), sticky='w')
         self.expected_var = tk.StringVar(value='')
         ttk.Entry(cfg, textvariable=self.expected_var, width=10).grid(
             row=3, column=5, sticky='w')
@@ -427,20 +436,36 @@ class MultiCorrelateWindow(tk.Toplevel):
             self.pairs_var.set('Mode changed - Derive again.')
             self.status_var.set('Input changed - Derive again.')
 
-    def _resolve_mask(self, name: str):
-        """Receiver mask name -> local path, or (None, reason).
+    def _resolve_mask(self, node: int):
+        """The mask node `node` is running -> (source, None) or (None, reason).
 
-        The receiver holds the file NAME as the sender sees it; the readable
-        copy lives in .claude/masks/. A full path is accepted too, so a mask
-        kept elsewhere still works.
+        Masks are node-local: they live in that node's lSPAD directory and are
+        created there (the single-pixel option uploads one), so there is no
+        master-side file to look for and the old .claude/masks/ lookup was
+        looking in the wrong machine. Two sources:
+
+          1. what the receiver saw applied at Launch (a MaskSource, by value)
+          2. an explicit path, for offline/standalone use with no receiver
+
+        Nothing falls back to a hand-made copy on the master: one that
+        disagreed with the node would derive plausible pairs for the wrong
+        pixels, which is the failure this ordering exists to prevent.
+
+        `reason` is kept short — it goes on the status line. _derive adds the
+        what-to-do-about-it half, where there is room for it.
         """
-        name = (name or '').strip()
+        src = self._mask_src.get(node)
+        if isinstance(src, pair_map.MaskSource):
+            return src, None
+        name = (src or '').strip() if isinstance(src, str) else ''
         if not name:
-            return None, 'not set in the receiver'
-        for cand in (name, os.path.join('.claude', 'masks', name)):
-            if os.path.isfile(cand):
-                return cand, None
-        return None, f'no local copy of {name!r} (looked in .claude/masks/)'
+            # Standalone use with no receiver: the mask entries are the input.
+            name = (self.mask1_var if node == 1 else self.mask2_var).get().strip()
+        if name and os.path.isfile(name):
+            return name, None
+        if not name:
+            return None, 'no mask set'
+        return None, 'not read from node'
 
     def _refresh_masks(self) -> None:
         """Pull the receiver's mask choice and report what it resolves to."""
@@ -452,19 +477,24 @@ class MultiCorrelateWindow(tk.Toplevel):
         except Exception as exc:
             self.maskinfo_var.set(f'Could not read the receiver mask fields: {exc}')
             return
-        self.mask1_var.set(n1 or '')
-        self.mask2_var.set(n2 or '')
+        self._mask_src = {1: n1, 2: n2}
+        for var, m in ((self.mask1_var, n1), (self.mask2_var, n2)):
+            var.set(m.name if isinstance(m, pair_map.MaskSource) else str(m or ''))
+        # One line, two nodes, no paths: the mask file names are already in the
+        # entries above it and the node-side directory is the same every time.
+        # All this line has to answer is "did each mask resolve, and how many
+        # pixels does it pass".
         bits = []
-        for node, name in ((1, n1), (2, n2)):
-            path, why = self._resolve_mask(name)
-            if path is None:
-                bits.append(f'node {node}: {why}')
+        for node in (1, 2):
+            src, why = self._resolve_mask(node)
+            if src is None:
+                bits.append(f'n{node} {why}')
                 continue
             try:
-                bits.append(f'node {node}: {len(pair_map.load_mask_active(path))} active')
+                bits.append(f'n{node} {len(pair_map.load_mask_active(src))} active')
             except Exception as exc:
-                bits.append(f'node {node}: unreadable ({exc})')
-        self.maskinfo_var.set('   |   '.join(bits))
+                bits.append(f'n{node} unreadable')
+        self.maskinfo_var.set('  |  '.join(bits))
 
     def _derive(self) -> None:
         """Derive the pair list and show it for inspection.
@@ -476,16 +506,23 @@ class MultiCorrelateWindow(tk.Toplevel):
         """
         mode = self.mode_var.get()
         try:
-            if mode != 'file':
-                self._refresh_masks()
+            # Refresh in every mode, file included: file mode still uses the
+            # masks for the masked_off cross-check, and that check is worth
+            # nothing if it runs against the pre-Launch guess.
+            self._refresh_masks()
             m1 = m2 = None
-            for node, var in ((1, self.mask1_var), (2, self.mask2_var)):
-                path, why = self._resolve_mask(var.get())
-                if path is None:
+            for node in (1, 2):
+                src, why = self._resolve_mask(node)
+                if src is None:
                     if mode != 'file':
-                        raise ValueError(f'node-{node} mask {why}')
+                        # The status line carries the short reason; this is the
+                        # loud failure, so it says what to do about it.
+                        raise ValueError(
+                            f'node-{node} mask: {why} — masks live in the '
+                            f"node's lSPAD directory; Launch node {node} "
+                            f'through the receiver to read it.')
                     continue
-                active = pair_map.load_mask_active(path)
+                active = pair_map.load_mask_active(src)
                 if node == 1:
                     m1 = active
                 else:
@@ -899,10 +936,10 @@ class MultiCorrelateWindow(tk.Toplevel):
         expected_str = self.expected_var.get().strip()
         if expected_str:
             try:
-                R  = float(expected_str)
-                Nc = mean * R
+                ratio = float(expected_str)          # 1 + R
+                Nc = mean * ratio
                 self.ax.axvline(Nc, color='red', linestyle='dashed', linewidth=1,
-                                label=f'Nc = {Nc:.1f}  (mean×{R})')
+                                label=f'Nc = {Nc:.1f}  (mean×{ratio})')
             except ValueError:
                 pass
 

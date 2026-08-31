@@ -5,11 +5,14 @@ Given a source model + size, aperture/baseline, wavelength, dispersion and
 photon rate, live-computes:
   R  = 0.5 * <|V|^2> * tc / td          (bunching-excess factor)
   Nc = R * avg_coincidence              (expected bunching in a coincidence bin)
+                                        -- so the bunched bin sits at
+                                        (1 + R) * avg_coincidence, which is what
+                                        "Apply 1+R" pushes to the correlator
   T  = (target_snr / (R * ndot))**2 / td   (integration time for a target SNR,
                                              from snr = ndot * R * (T*td)**0.5)
 
 Can be launched standalone (python sii_calculator.py) or opened from
-correlate.py's "Compute R..." button next to its "Expected rate (R)" field.
+correlate_multi.py's "Compute R..." button next to its "Expected ratio (1+R)" field.
 """
 import tkinter as tk
 from tkinter import ttk
@@ -172,7 +175,7 @@ class SIICalculatorWindow(tk.Toplevel):
         btn_row = ttk.Frame(res)
         btn_row.grid(row=len(rows), column=0, columnspan=4, padx=6, pady=(4, 4), sticky='w')
         if self._on_apply is not None:
-            ttk.Button(btn_row, text='Apply R', command=self._apply_r).pack(side='left')
+            ttk.Button(btn_row, text='Apply 1+R', command=self._apply_r).pack(side='left')
 
         self.status_var = tk.StringVar(value='')
         ttk.Label(res, textvariable=self.status_var, foreground='firebrick').grid(
@@ -326,8 +329,12 @@ class SIICalculatorWindow(tk.Toplevel):
     # ------------------------------------------------------------------
 
     def _apply_r(self) -> None:
+        # The correlator's field multiplies the flat coincidence mean to place
+        # the Nc marker (Nc = mean * value), so the value it wants is the total
+        # ratio 1 + R, not the bare excess R. R itself stays as computed --
+        # required_time() and every readout above are defined on the excess.
         if self._on_apply is not None and hasattr(self, '_last_R'):
-            self._on_apply(f'{self._last_R:.6g}')
+            self._on_apply(f'{1.0 + self._last_R:.6g}')
 
 
 def main():
