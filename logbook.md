@@ -199,3 +199,38 @@ and registration within +0.2/−0.8 px across pixels 118–216. Scans archived i
 **Multi-pair correlator merged to main.** The scale-up work is on `main` (`f6ca861`, 43 commits): `MultiCorrelateWindow` is now the only correlator — the single-pair and 2x2 windows are retired into it, since a single pair is just `identity` over two 1-pixel masks. The previous 1v1 code is tagged `v1-single-pair` as the fallback, and both nodes are back on `main`. Only the sender-throughput rewrite is left outstanding, deferred: the parser sustains 2.97 Mcps at 40 pixels with no lag.
 
 **Module rename.** `receiver{,_backend}.py` -> `master{,_backend}.py` and `sender{,_backend}.py` -> `node{,_backend}.py`. Sender side is `node`, not `slave`, because `slave` already names the 170-pixel detector chip throughout (`slave_dwell.bin`, `slave_loc`, the slave-dwell offset the correlator actually applies). Verified from the GUI. The scale-up plan is now closed apart from the deferred sender-throughput rewrite.
+
+## 27-8-26 — Move to 25 micron fibers 
+- Spectral alignment of new fibers.
+- Alignment of temporary telescope- max 400kcps.
+- Short bunching r1un with 25 micron fibers, no signal observed (integration probably too short for a marginal detection).
+- *Get a better telescope*
+- *Build beamsplitter setup for arc calibration*
+- Data throughput test: live acquisition with ~1Mcps per pixel, for 80 pixels. 
+  - The end nodes falls way behind, because it's parsing each timestamp before sending it to the master PC.
+  - Doesn't affect 1 pixel measurements, but must be addressed before scaling up.
+  - Consider a new arcitechture where raw timestamps are used without parsing.
+
+## 30-8-26 — Reverting to 2:1 fiber splitter, new spectral alignment
+
+Reverting to 2:1 fiber splitter, new spectral alignment.
+
+- Only one good telescope, any two-25 micron fiber measurement will be impractical due to count rate.
+- For now I'd rather test other hypotheses, accepting the lower bunching rate.
+- New spectral alignment for the new fibers.
+- New hypothesis: SM fiber not a good source for bunching.
+- Reasoning: perhaps different points on the fiber face cannot be treated as independent sources- for any specific wavelength, they are governed by the fiber's TE00 mode.
+- Test: use a pinhole as a source. 
+  - I tried to diffuse the fiber output before reimaging onto a fiber, but it's extremely hard to image diffused light.
+  - I also tried to directly put the pinhole at the LDLS FC port (no fiber or relay system) but the count rate was poor.
+  - Finally I used a 1.5:1 relay (ala FIFA calibration bench- achromat + aspheric) and a 10 micron pinhole; that gives around ~ 1Mcps per pixel with the 2:1 fiber splitter.
+- 5 hour integration: hint of 0.1% bunching excess at tau = 24 ns; after accumulating 1e7 counts per bin this gives S/N~3.5. This integration saved data so I had to stop it before disk overflowed.
+- Overnight integration: survived for ~4 hours, one of the PCs restarted midway through the integration. It seems no bin in the neighborhood of tau = 24ns is consistent with 0.1% excess.
+- The expected coincidence rate for these runs was slightly over 0.2%: 
+  - Angular diameter of the disc: θ = 10 µm / 0.65 m = 1.538×10⁻⁵ rad ≈ 3.17″ (3173 mas)
+  - Coherence time: t_c = λ²/(c·Δλ) = (550 nm)²/(c·0.2 nm) ≈ 5.05 ps
+  - Aperture-averaged visibility² (single 25.4 mm aperture, baseline=0, uniform-disc model): ⟨|V|²⟩ ≈ 0.860 (the disc is only partly resolved — its angular size is a bit smaller than the aperture's diffraction scale λ/D ≈ 4.46″) 
+  - R = 0.5 · ⟨|V|²⟩ · t_c / t_d = 0.5 × 0.860 × 5.05 ps / 1 ns ≈ 2.17×10⁻³ (0.217%)
+- We have no evidence for such a bunching signal in the data.
+  - Likely dlambda > 0.2 nm due to blending of neighboring resolution elements with 50 micron fibers. We can estimate dlambda in Zemax and calculate the corresponding expected R. We need to buy a new telescope (or a new 2:1 fiber) to test this in reasonable time.
+  - I'd like to try a green LED source instead of the LDLS (has been used successfully in the literature; maybe LDLS is somehow destroying the signal)
