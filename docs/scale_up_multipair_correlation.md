@@ -6,7 +6,25 @@
 
 ---
 
-## STATUS — 2026-08-26: CLOSED except Stage 2
+## STATUS — 2026-08-27: Stage 2 measured, decision made
+
+**Stage 2 is now measured against a real 81-pixel overload, not deferred on a 40-pixel
+extrapolation.** Summary (full writeup below, in "Stage 2 — measured 2026-08-27"): the
+`O(chunk × N_active)` cost model that motivated the original deferral is **refuted** — a
+chunk-size-controlled regression on real captured data puts the N=40→81 cost ratio at
+**0.843**, not the ~0.50 that model predicted. A verified prototype of 2a's fused-slot +
+`bincount` approach gives **2.8–3.4× on the bucket block alone** (order-preserving-identical
+output confirmed against the real parser on real chunks), which is a genuine, worthwhile,
+roughly-N-flat win — but it is a **constant factor**, not a fix for a blowup that doesn't
+exist. Separately, and decisively: node1 was flood-illuminated to **116 Mcps** across 81
+pixels (up to 1.82 Mcps on one pixel) — **~8× above the measured parser ceiling** even before
+any 2a speedup, and 10+ minutes of unrecovered lag confirms it in the field, not just on
+paper. No software-only fix at the 2–3× scale closes an 8× gap. Node2's calmer 22 Mcps offer
+is a different story — within 2a's reach. **Build 2a**: it is real and needed for node2's
+overload band and any future high-N operation, but it does not make node1's flood-illuminated
+regime tractable; that needs the source attenuated, not a faster parser.
+
+## Prior status — 2026-08-26: CLOSED except Stage 2
 
 **Everything in this plan is delivered and merged except Stage 2, which was never
 built — it is deferred on measured evidence, not left half-done.** Stage 2 is the only
@@ -29,7 +47,7 @@ work is on `main` the problem is gone, but it will recur for the next feature br
 |---|---|
 | **1a** tap fan-out | **DONE** — `d049f36` |
 | **1b** write-to-disk checkbox | **COMPLETE** 2026-08-26 — deviation 1 closed, semantics widened to write *nothing*, deviation 2 (checkbox locked once committed) fixed, deviation 3 largely answered by `spad_data/log/`. Verified on hardware: a 15-min run wrote 0 bytes of the 11.43 GB it would have, with the buffer plateauing |
-| **2** sender throughput | **DEFERRED, and now PROVABLE** — Phase 0 complete 2026-08-26: real captures taken from both nodes and `tools/replay.py` reproduces each acquisition byte-for-byte across all 326 files, `epoch_fixes` included. Still deferred on merit: 2.97 M rec/s runs clean at 40 pixels against the ~80 M/s that would make 2a bind |
+| **2** sender throughput | **MEASURED 2026-08-27, BUILD 2a** — real 81-pixel overload capture (broadband source, 292.6 M records/node) replaces the 40-pixel extrapolation. Chunk-size-controlled ratio 0.843 (not H1's ~0.50) refutes `O(chunk × N)` as the dominant term; a verified prototype gives 2.8–3.4× on the bucket block, order-identical to the current parser on real data. But node1's 116 Mcps offer is ~8× the measured ceiling — 2a closes node2's ~22 Mcps gap, not node1's. See "Stage 2 — measured 2026-08-27" below |
 | **3** multi-pair correlator | **COMPLETE** 2026-08-26 — validated on hardware from 8 to 40 pairs, 10 and 40 MHz, up to 15 min, comb on every pair in every run; 80 pairs covered synthetically; `QuadCorrelateWindow` deleted |
 | **4** retire the single-pair correlator | **COMPLETE** 2026-08-26 — distribution view ported (and its Lee correction fixed), synthetic GUI surface out, `CorrelateWindow` and `correlate.py` deleted. `MultiCorrelateWindow` is the only correlator |
 | **5** tag the 1v1 fallback, then merge to `main` | **COMPLETE** 2026-08-26 — `v1-single-pair` tagged and pushed, 43 commits merged `--no-ff` into `main` (`f6ca861`), suite green on `main`, both nodes moved back |
@@ -570,6 +588,102 @@ it, and the sync files still allow offline re-derivation.
 
 Note `root.resizable(False, False)` (`master.py:694`) — the `acq` frame absorbed the new checkbox
 row without trouble, but a second added row is worth re-checking.
+
+---
+
+## Stage 2 — measured 2026-08-27
+
+The bench prerequisite this plan named on 2026-08-26 — *"a broadband source"* over ~80 pixels —
+became available, and Phase 0's own spec (an 80-active-pixel capture; August's was 40) was closed in
+the same session. `mask_sparse.txt` (81 active) illuminated by a flood broadband source, run to
+deliberate overload: **node1 had to be manually truncated after 10+ minutes of unrecovered parser
+lag.** Fresh intensity scans taken in the same session (`spad_data/intensity/27-8-26/parser test/`)
+give the offered rate: **node1 116.1 Mcps** total across the 81 pixels (mean 1.43 Mcps/pixel, max
+1.82 Mcps on one pixel), **node2 21.8–22.2 Mcps**. Both nodes' raw-stream captures were pulled —
+`spad_data/captures/cap_node{1,2}.raw`, 2.048 GB each, 292.6 M records each, hitting the 2048 MB
+default dump cap cleanly (no partial record). August's 40-pixel captures were preserved at
+`spad_data/captures/26-8-26_40px/`.
+
+### The offline analysis, and where it corrected itself mid-session
+
+**1. The chunk-size confound this plan warned about, encountered directly.** A raw ratio of the two
+captures' implied throughput (N=81 saturated at the `recv()` ceiling of 8192 records/chunk, vs N=40's
+natural ~3000–4100) came out **above 1** — the "N=81" data looked *faster* than "N=40". That is
+amortization, not an N effect: larger chunks spread the same fixed per-chunk cost over more records.
+Fixed with a pooled least-squares regression, `t_bucket(N, n_rec) = p0 + p1·N + p2·n_rec`, over 24,000
+real chunks from all four captures (R² = 0.90), predicting both N points at the **same** `n_rec=8192`:
+
+| N (both at n_rec=8192) | predicted total | R_max on this CPU |
+|---|---|---|
+| 25 | 0.468 ms/chunk | 17.5 M rec/s |
+| 40 | 0.502 ms/chunk | 16.3 M rec/s |
+| 81 | 0.595 ms/chunk | 13.8 M rec/s |
+
+**Chunk-size-controlled ratio, N=81 vs N=40: 0.843.** H1 (`O(chunk×N)` dominant, cost ∝ N²) predicted
+~0.50; H2 (per-call overhead dominant, roughly N-flat) predicted 0.85–0.95. **H2 wins outright.**
+Going 40→81 active pixels costs ~16% more parse time per record, not 2×.
+
+**2. A structural finding, corrected once inside this same session.** Every 8192-record chunk in both
+new captures is **100% one detector chip** (master or slave), never mixed — but *not* because the
+light landed on only one chip (an earlier reading of this data, corrected before being acted on):
+over the whole file both chips are ~50/50 (node1: 144.6 M vs 148.0 M records). lSPAD delivers data in
+strictly single-chip bursts that alternate almost every chunk (median run-length 1, max 17). This
+doesn't change the throughput conclusion — the regression's `N_active` already reflects each chunk's
+real active-pixel count — but it means the N=81 "both chips populated in one chunk" prediction above
+is an extrapolation past anything actually observed (largest real N was 43).
+
+**3. A verified prototype of Stage 2a's proposed shape** (fused `uint16` slot key,
+`argsort(kind='stable')`, `bincount(minlength=512)`/`cumsum`, view slices instead of per-uid
+gather) timed against the *current* bucketing loop on the same real parsed chunks:
+
+| capture | bucket-block speedup |
+|---|---|
+| node1 N=81 (8192-rec chunks) | 3.26× |
+| node2 N=81 (8192-rec chunks) | 3.43× |
+| node1 N=40 (natural chunks) | 2.81× |
+| node2 N=40 (natural chunks) | 2.89× |
+
+Output verified **order-identical** (not merely same-values) to the current parser on 200 sampled
+real chunks — the stable-sort/gather equivalence the original Stage 2a design called for, confirmed
+against real data rather than argued. This is real and worth building. End-to-end (bucket fix only,
+pre-pass untouched) works out to roughly **1.5–1.9× overall**, growing mildly with N since the bucket
+is a larger share of total cost at higher N. Folding the pre-pass into the same histogram (as 2a's
+fuller design proposes) was not itself prototyped this session and would add more — unverified here.
+
+**4. A test-harness trap worth recording**, since it cost real time chasing a phantom result: replaying
+two captures back-to-back in one Python process via `tools/replay.py`'s `replay()` can leave the first
+call's receiver thread still finishing (`recv_done.wait(timeout=10)` is a 10 s grace, not a guarantee)
+while the second call's timing starts — measured as an 8× phantom slowdown (172 s vs the true 21 s) on
+whichever capture ran second, reproduced twice, and resolved by giving each replay its own process (or
+an explicit `th.join()` after `replay()` returns). This never touched real acquisition code — `node.py`
+runs one long-lived process per detector, not per-capture-per-process — but it is a real gotcha for
+Stage 2a's own acceptance test, which explicitly needs to replay multiple captures in sequence for
+comparison. Worth a note or fix in `tools/replay.py` before that acceptance run is built.
+
+**5. The FIFO overflow marker (id 247) still never fired** — 0 across 585 M combined records at up to
+1.82 Mcps on a single pixel. This is about as hard a stress test as this hardware has seen, and
+confirms [[project_count_rate_ceiling]]'s note as strongly as it can be confirmed: `overflow == 0`
+must never be read as "the parser kept up."
+
+### The decision
+
+**Build 2a.** It is a real, verified, ~roughly-N-flat 2.8–3.4× win on the bucket block (~1.5–1.9×
+end-to-end as prototyped), not the phantom quadratic-killer the original deferral reasoning implied —
+but real and worth having regardless, and it is what the multi-pair correlator will want at N well
+past 81.
+
+**It does not make node1's flood-illuminated regime tractable.** 116 Mcps is ~8× the measured ceiling
+on the *master* PC's CPU, which is faster than the node PCs (the existing 2.97 M rec/s-at-40-px,
+0.01 s-lag datum bounds the node PC at ≤3.7× slower). Even the unverified fuller-rewrite estimate of
+2.4–3.0× end-to-end could not close an order-of-magnitude gap. Node2's 22 Mcps offer is a different
+story — within reach of 2a alone, or possibly already close to the current ceiling depending on the
+actual node-PC slowdown factor.
+
+**Practical reading:** today's run was a deliberate stress test — flood-illuminating 81 pixels with a
+broadband source to find the ceiling, not a realistic operating condition — and it found one. The
+right response to node1's specific overload is attenuating the source for any live run at that
+brightness, not chasing a 2–3× software factor against an 8× gap. Build 2a on its own merits; don't
+expect it to rescue this particular stress test.
 
 ---
 
