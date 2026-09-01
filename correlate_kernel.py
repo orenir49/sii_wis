@@ -111,6 +111,59 @@ def _pair_kernel(t1, t2, bin_width, tmax, nbins, n_shift):
     return hist
 
 
+@njit(nogil=True, cache=True)
+def _pair_kernel_diffs(t1, t2, bin_width, tmax, nbins, n_shift):
+    """Same histogram as _pair_kernel, plus every in-range tau it binned.
+
+    Two passes rather than one preallocated worst-case buffer: a
+    `2*n_shift*len(t1)` buffer would be hundreds of MB per pair at this
+    module's stated scale (500k events x 80 pairs, n_shift up to
+    suggest_n_shift's cap of 40) -- out of line with how carefully this
+    module already tracks memory elsewhere (RAM caps, peak-RSS, the "hold"
+    policy in correlate_multi.py). The first pass is _pair_kernel's exact
+    loop (same binning arithmetic -- see DO NOT OPTIMIZE THE BINNING above)
+    to learn hist and hist.sum(); the second re-sweeps into an exactly-sized
+    output array. ~2x a plain histogram's cost, paid only when a caller
+    actually wants the diffs.
+    """
+    hist = np.zeros(nbins, dtype=np.int64)
+    n1 = len(t1)
+    n2 = len(t2)
+    if n1 == 0 or n2 == 0:
+        return hist, np.empty(0, dtype=np.int64)
+
+    j = 0
+    for i in range(n1):
+        ti = t1[i]
+        while j < n2 and t2[j] < ti:
+            j += 1
+        for s in range(-n_shift, n_shift):
+            k = j + s
+            if 0 <= k < n2:
+                tau = t2[k] - ti
+                b = int(np.floor((tau + tmax) / bin_width))
+                if 0 <= b < nbins:
+                    hist[b] += 1
+
+    diffs = np.empty(int(hist.sum()), dtype=np.int64)
+    idx = 0
+    j = 0
+    for i in range(n1):
+        ti = t1[i]
+        while j < n2 and t2[j] < ti:
+            j += 1
+        for s in range(-n_shift, n_shift):
+            k = j + s
+            if 0 <= k < n2:
+                tau = t2[k] - ti
+                b = int(np.floor((tau + tmax) / bin_width))
+                if 0 <= b < nbins:
+                    diffs[idx] = tau
+                    idx += 1
+
+    return hist, diffs
+
+
 # Both kernels are warmed from ONE thread behind this lock. 16 threads
 # triggering the same compile serialize on numba's compile lock anyway, and
 # with cache=True they race on the cache file.
@@ -121,10 +174,12 @@ _warmed = False
 def prewarm(also=()) -> None:
     """Compile the kernels once, from a single thread. Idempotent.
 
-    Warms both `_pair_kernel` and the reference `_multistart_multistop`, so a
-    caller needs nothing but this. `also` used to carry the window's own warmup
-    callable for exactly that second compile; it is retained only so an
-    out-of-tree caller does not break, and is expected to be empty.
+    Warms `_pair_kernel`, the reference `_multistart_multistop`, and
+    `_pair_kernel_diffs`, so a caller needs nothing but this -- including
+    diff-capture mode's first live batch, which would otherwise be a JIT
+    stall. `also` used to carry the window's own warmup callable for exactly
+    that second compile; it is retained only so an out-of-tree caller does
+    not break, and is expected to be empty.
     """
     global _warmed
     with _warm_lock:
@@ -134,6 +189,7 @@ def prewarm(also=()) -> None:
         idx = np.array([0, 1, 2], dtype=np.int64)
         _pair_kernel(d, d, 100.0, 300.0, 6, 2)
         _multistart_multistop(d, d, idx, 100.0, 300.0, 6, 2)
+        _pair_kernel_diffs(d, d, 100.0, 300.0, 6, 2)
         for fn in also:
             fn()
         _warmed = True
@@ -146,6 +202,25 @@ def is_warm() -> bool:
 def bin_edges(bin_width: float, tmax: float) -> np.ndarray:
     """Same edges CorrelateWindow uses, so histograms are directly comparable."""
     return np.arange(-tmax - bin_width / 2, tmax + 3 * bin_width / 2, bin_width)
+
+
+def rebin_diffs(diffs: np.ndarray, bin_width: float, tmax: float, nbins: int) -> np.ndarray:
+    """Rebin raw tau values the same way _pair_kernel/_pair_kernel_diffs do.
+
+    NOT np.histogram(diffs, bin_edges(bin_width, tmax)): bin_edges() is offset
+    by half a bin from the kernel's own boundaries (its edges are centered so
+    that bin_edges()'s midpoints land on -tmax, -tmax+bin_width, ... for
+    display), and np.histogram's internal fast path for uniform bins disagrees
+    with floor((tau+tmax)/bin_width) on boundary-hugging values by up to a
+    handful of ULP. This function is the one guaranteed to reproduce a saved
+    diffs_ps array into the exact live histogram, bit for bit, at the same
+    bin_width/tmax/nbins it was captured with. For a *different* bin width,
+    call this with the new parameters -- it is still the correct binning, just
+    no longer promising to match a specific past live histogram.
+    """
+    b = np.floor((diffs.astype(np.float64) + tmax) / bin_width).astype(np.int64)
+    mask = (b >= 0) & (b < nbins)
+    return np.bincount(b[mask], minlength=nbins).astype(np.int64)
 
 
 class PairPool:
@@ -173,6 +248,22 @@ class PairPool:
         for key, t1, t2 in batches:
             futs[key] = self._ex.submit(
                 _pair_kernel, t1, t2, float(bin_width), float(tmax),
+                int(nbins), int(n_shift))
+        return {k: f.result() for k, f in futs.items()}
+
+    def run_with_diffs(self, batches, bin_width: float, tmax: float, nbins: int,
+                        n_shift: int) -> dict:
+        """Like run(), but {key: (histogram, diffs)}. diffs holds every
+        in-range tau the histogram binned, already trimmed to its exact size.
+
+        Only dispatched by the caller when diff-capture is active -- run()
+        stays the plain, cheaper histogram-only path for ordinary use.
+        """
+        prewarm()
+        futs = {}
+        for key, t1, t2 in batches:
+            futs[key] = self._ex.submit(
+                _pair_kernel_diffs, t1, t2, float(bin_width), float(tmax),
                 int(nbins), int(n_shift))
         return {k: f.result() for k, f in futs.items()}
 
@@ -241,6 +332,25 @@ def _selftest() -> int:
            f'{int(np.abs(got - want).sum())} counts differ, '
            f'totals {got.sum()} vs {want.sum()}')
 
+    def compare_diffs(name, t1, t2, bw, tmax, n_shift):
+        edges = bin_edges(bw, tmax)
+        nbins = len(edges) - 1
+        want = _pair_kernel(t1, t2, bw, tmax, nbins, n_shift)
+        got_hist, diffs = _pair_kernel_diffs(t1, t2, bw, tmax, nbins, n_shift)
+        ck(f'{name}: diffs-kernel hist == plain kernel',
+           np.array_equal(got_hist, want),
+           f'totals {got_hist.sum()} vs {want.sum()}')
+        # rebin_diffs, NOT np.histogram(diffs, bin_edges(...)) -- bin_edges()
+        # is display-centered, half a bin off the kernel's own boundaries, so
+        # np.histogram disagrees with the kernel on boundary-hugging values.
+        rehist = rebin_diffs(diffs, bw, tmax, nbins)
+        ck(f'{name}: rebin_diffs reproduces the kernel hist exactly',
+           np.array_equal(rehist, want),
+           f'{int(np.abs(rehist - want).sum())} counts differ, '
+           f'totals {rehist.sum()} vs {want.sum()}')
+        ck(f'{name}: diff count matches histogram count',
+           diffs.size == want.sum())
+
     rng = np.random.default_rng(3)
     BW, TMAX = 1000.0, 500_000.0
 
@@ -263,6 +373,7 @@ def _selftest() -> int:
     compare('dense random, n_shift=5', t1, t2, BW, TMAX, 5)
     compare('dense random, n_shift=20', t1, t2, BW, TMAX, 20)
     compare('dense random, n_shift=1', t1, t2, BW, TMAX, 1)
+    compare_diffs('dense random, n_shift=5', t1, t2, BW, TMAX, 5)
 
     # n_shift > n2: every k is out of range for most i.
     small = np.array([100, 200, 300], dtype=np.int64)
@@ -272,6 +383,7 @@ def _selftest() -> int:
     empty = np.empty(0, dtype=np.int64)
     compare('empty t1', empty, t2, BW, TMAX, 5)
     compare('empty t2', t1, empty, BW, TMAX, 5)
+    compare_diffs('empty t1', empty, t2, BW, TMAX, 5)
     ck('empty inputs give an all-zero histogram of the right length',
        _pair_kernel(empty, empty, BW, TMAX, 11, 5).shape == (11,)
        and not _pair_kernel(empty, empty, BW, TMAX, 11, 5).any())
@@ -280,12 +392,14 @@ def _selftest() -> int:
     d1 = np.repeat(np.array([1000, 2000, 3000], dtype=np.int64), 40)
     d2 = np.repeat(np.array([1000, 2000, 3000], dtype=np.int64), 40)
     compare('duplicate timestamps on both sides', d1, d2, BW, TMAX, 8)
+    compare_diffs('duplicate timestamps on both sides', d1, d2, BW, TMAX, 8)
 
     # tau exactly on a bin edge -- the case that breaks if you hoist 1/bw.
     edge_t1 = np.array([0, 0, 0], dtype=np.int64)
     offs = np.array([-TMAX, -TMAX + BW, -BW, 0, BW, TMAX - BW, TMAX],
                     dtype=np.int64)
     compare('tau exactly on bin edges', edge_t1, np.sort(offs), BW, TMAX, 8)
+    compare_diffs('tau exactly on bin edges', edge_t1, np.sort(offs), BW, TMAX, 8)
     ck('a tau on an edge lands in exactly one bin',
        _pair_kernel(np.array([0], dtype=np.int64),
                     np.array([0], dtype=np.int64), BW, TMAX,
@@ -313,6 +427,7 @@ def _selftest() -> int:
     c1 = np.sort(base + rng.integers(-60, 60, base.size)).astype(np.int64)
     c2 = np.sort(base + rng.integers(-60, 60, base.size)).astype(np.int64)
     compare('planted 80 MHz comb', c1, c2, 250.0, 50_000.0, 6)
+    compare_diffs('planted 80 MHz comb', c1, c2, 250.0, 50_000.0, 6)
     h = _pair_kernel(c1, c2, 250.0, 50_000.0,
                      len(bin_edges(250.0, 50_000.0)) - 1, 6)
     centers = 0.5 * (bin_edges(250.0, 50_000.0)[:-1] + bin_edges(250.0, 50_000.0)[1:])
@@ -338,6 +453,12 @@ def _selftest() -> int:
        all(np.array_equal(got[k], _pair_kernel(a, b, BW, TMAX, nbins, 5))
            for k, a, b in pairs))
     ck('pool returns one histogram per submitted pair', len(got) == 12)
+
+    got_diffs = pool.run_with_diffs(pairs, BW, TMAX, nbins, 5)
+    ck('run_with_diffs histograms == run()\'s',
+       all(np.array_equal(got_diffs[k][0], got[k]) for k, a, b in pairs))
+    ck('run_with_diffs diff count == histogram count, every pair',
+       all(got_diffs[k][1].size == got_diffs[k][0].sum() for k, a, b in pairs))
     pool.shutdown()
 
     ck('suggest_n_shift: 1 MHz / 500 ns is far below the default 20',

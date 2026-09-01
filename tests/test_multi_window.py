@@ -29,6 +29,7 @@ sys.path.insert(0, os.path.join(ROOT, 'tools'))
 import correlate_multi
 import pair_map
 from correlate_multi import MultiCorrelateWindow
+from correlate_kernel import rebin_diffs
 from synthetic_source import SyntheticSource
 
 PASSED = []
@@ -119,7 +120,7 @@ def install_sync_tick(w):
                 return
             if res[0] == 'err':
                 raise AssertionError(f'correlation error: {res[1]}')
-            _, hists, sizes, rel, dt = res
+            _, hists, sizes, rel, dt, diffs = res
             for key, h in hists.items():
                 cur = w._hist.get(key)
                 if cur is None or cur.shape != h.shape:
@@ -130,6 +131,11 @@ def install_sync_tick(w):
                 n1, n2 = sizes[key]
                 w._counts[key][0] += n1
                 w._counts[key][1] = max(w._counts[key][1], n2)
+            if diffs:
+                for key, arr in diffs.items():
+                    f = w._diff_files.get(key)
+                    if f is not None and arr.size:
+                        arr.tofile(f)
     w._poll_results_once = poll_once
 
 
@@ -277,6 +283,10 @@ def test_end_to_end_comb():
                   meta['offset_ps'] == OFFSET and meta['mode'] == 'identity'
                   and 'write_to_disk' in meta,
                   str(meta)[:160])
+            check('diff-capture never enabled -> no diffs_ps in the npz '
+                  '(regression guard for the two existing write modes)',
+                  'diffs_ps' not in d.files and meta['diff_capture'] is False,
+                  str(d.files))
             # Scale figures ride along with the run, so a saved .npz answers
             # "what did 40 pairs cost" without a screenshot of the status line.
             check('npz meta carries the scale measurements',
@@ -329,6 +339,93 @@ def test_end_to_end_comb():
         check('disable stops accumulation and drops the hooks',
               not w.is_enabled and w.hooks_node1 == {})
     finally:
+        root.destroy()
+
+
+def test_diff_capture_streams_and_consolidates():
+    """'Save time differences' mode: the correlator streams every in-range
+    tau per pair to disk as it computes the live histogram, then packages
+    them into the same batched .npz 'Save .npz' already produces. The
+    strongest check is exact: rebin_diffs on the saved diffs_ps must
+    reproduce each pair's histogram row bit for bit."""
+    root = tk.Tk()
+    root.withdraw()
+    tmp = tempfile.mkdtemp(prefix='g2diffs_')
+    cwd = os.getcwd()
+    try:
+        os.chdir(tmp)
+        w, mtmp = masked_window(root, range(150, 154), range(150, 154))
+        install_sync_tick(w)
+
+        PERIOD_NS, OFFSET = 12.5, 20_000
+        w.mode_var.set('identity')
+        w.bw_var.set('250')
+        w.tmax_var.set('50000')
+        w.nshift_var.set('12')
+        w.suffix_var.set('selftest_diffs')
+        w._show_preview = lambda *a, **k: None
+        w._derive()
+        w._enable()
+
+        check('diff capture starts disabled', not w._diff_capture_enabled)
+        w.set_diff_capture_enabled(True)
+        w.start_with_offset(OFFSET)
+        check('starting an accumulation session with diff-capture enabled '
+              'opens one file per derived pair',
+              len(w._diff_files) == 4, str(sorted(w._diff_files)))
+
+        src = SyntheticSource(list(w._graph.ch1), list(w._graph.ch2),
+                              period_ps=PERIOD_NS * 1000, p_detect=0.06,
+                              rate_hz=30_000, offset_ps=OFFSET, seed=11)
+        drive(w, src, seconds=0.03)
+
+        check('every pair accumulated a histogram (4 of 4)',
+              len(w._hist) == 4, str(sorted(w._hist)))
+
+        for key, path in w._diff_paths.items():
+            n_expected = int(w._hist[key].sum())
+            size = os.path.getsize(path)
+            check(f"pair {key} .bin holds exactly its histogram's worth of diffs",
+                  size == 8 * n_expected, f'{size} bytes vs {n_expected} diffs')
+
+        w._disable()
+        check('disable closes the diff files and auto-consolidates into .npz',
+              w._diff_files == {})
+
+        npz_path = os.path.join(tmp, 'spad_data', 'selftest_diffs.npz')
+        check('disable produced the consolidated .npz', os.path.exists(npz_path))
+        d = np.load(npz_path)
+        meta = json.loads(str(d['meta']))
+        check('npz meta records diff_capture and the session dir',
+              meta['diff_capture'] is True and meta['diff_dir'] is not None,
+              str(meta.get('diff_capture')))
+        check('npz carries diffs_ps and diffs_offset',
+              'diffs_ps' in d.files and 'diffs_offset' in d.files, str(d.files))
+        offsets = d['diffs_offset']
+        check('diffs_offset is monotonically non-decreasing and spans diffs_ps',
+              bool(np.all(np.diff(offsets) >= 0)) and offsets[-1] == d['diffs_ps'].size,
+              f'{offsets} vs diffs_ps size {d["diffs_ps"].size}')
+
+        bw, tmax = float(w.bw_var.get()), float(w.tmax_var.get())
+        nbins = d['hist'].shape[1]
+        bad = []
+        for i, (p1, p2) in enumerate(zip(d['px1'], d['px2'])):
+            seg = d['diffs_ps'][offsets[i]:offsets[i + 1]]
+            rehist = rebin_diffs(seg, bw, tmax, nbins)
+            if not np.array_equal(rehist, d['hist'][i]):
+                bad.append((int(p1), int(p2)))
+        check("rebin_diffs on the saved diffs_ps reproduces every pair's "
+              'histogram row exactly -- the reproduction guarantee this '
+              'feature exists for',
+              not bad, str(bad))
+
+        raw_files = [p for p in w._diff_paths.values() if os.path.exists(p)]
+        check('the raw per-pair .bin files are kept, not deleted, after '
+              'consolidation -- same ground-truth status as px_*.bin',
+              len(raw_files) == 4, str(raw_files))
+    finally:
+        os.chdir(cwd)
+        shutil.rmtree(tmp, ignore_errors=True)
         root.destroy()
 
 

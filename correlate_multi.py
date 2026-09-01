@@ -32,6 +32,7 @@ import os
 import queue
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, ttk
 
@@ -45,10 +46,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tools'))
 
 import pair_map
-from scipy.stats import poisson
+from scipy.stats import poisson, norm
 
 from correlate_engine import PS_PER_S, ChannelGraph
-from correlate_kernel import PairPool, bin_edges, prewarm, suggest_n_shift, tau_coverage_ps
+from correlate_kernel import (PairPool, bin_edges, prewarm, rebin_diffs,
+                              suggest_n_shift, tau_coverage_ps)
 from sii_calculator import SIICalculatorWindow
 
 MAX_PAIRS = 320           # guard: grid mode is how you ask for 6400 by accident
@@ -106,10 +108,10 @@ def _mark_peak_bin(ax, centers: np.ndarray, hist: np.ndarray,
             markersize=12, markeredgewidth=2.5, linestyle='none', zorder=5)
     ax.annotate(
         f'peak τ = {centers[i] / 1_000.0:g} ns\n'
-        f'counts = {height:,.0f}\n'
+        f'counts = {height:.1e}\n'
         f'excess = {excess:.3f}% of mean\n'
         f'SNR = {snr}\n'
-        f'mean = {mean:.1f} ± {std:.1f}',
+        f'mean = {mean:.1e} ± {std:.1e}',
         xy=(centers[i] / scale, height), xycoords='data',
         # Right-aligned inside the axes rather than at a fixed left edge: the box
         # is as wide as its longest number, and the live figure gets resized.
@@ -199,6 +201,13 @@ class MultiCorrelateWindow(tk.Toplevel):
         self._correlating = False
         self._held = False             # RAM cap tripped: draining stopped
         self._write_to_disk = True
+        # Diff-capture: independent of _write_to_disk (that one tracks raw
+        # px_*.bin writes, this one tracks streaming filtered per-pair time
+        # differences). Told by ReceiverGUI.set_diff_capture_enabled.
+        self._diff_capture_enabled = False
+        self._diff_files: dict = {}    # (p1, p2) -> open file handle, this session
+        self._diff_paths: dict = {}    # (p1, p2) -> path, kept after close for consolidation
+        self._diff_session_dir: str | None = None
         self._result_q: queue.Queue = queue.Queue()
         self._last_kernel_s = 0.0
         # Scale measurements the plan asks for at 4 -> 16 -> 80 pairs. Peak, not
@@ -404,6 +413,13 @@ class MultiCorrelateWindow(tk.Toplevel):
         """Told by ReceiverGUI. Changes what an overload MEANS, so the warning
         can say the truth rather than the old docstring's promise."""
         self._write_to_disk = bool(on)
+
+    def set_diff_capture_enabled(self, on: bool) -> None:
+        """Told by ReceiverGUI when write-mode is 'diffs'. Independent of
+        set_write_to_disk, which stays tied to raw per-pixel timestamp writes
+        -- diff-capture never writes px_*.bin, so it doesn't change what an
+        overload means."""
+        self._diff_capture_enabled = bool(on)
 
     # ------------------------------------------------------------------
     # Pair derivation
@@ -678,6 +694,7 @@ class MultiCorrelateWindow(tk.Toplevel):
         self._accumulating = False
         if self._graph is not None:
             self._graph.stop()
+        self._stop_diff_capture()
         self.status_var.set('Disabled.')
 
     def _reset(self) -> None:
@@ -692,11 +709,59 @@ class MultiCorrelateWindow(tk.Toplevel):
         if self._graph is not None:
             self._graph.start(offset=0)
             self._graph.stop()
+        self._stop_diff_capture()
         self.ax.clear()
         self.ax.set_title('g² — data cleared')
         self.canvas.draw_idle()
         self.status_var.set('Data cleared. ' +
                             ('Enabled — waiting for DWELL.' if self._active else 'Disabled.'))
+
+    # ------------------------------------------------------------------
+    # Diff capture -- streams each derived pair's filtered time differences
+    # to disk for the life of one accumulation session, consolidated into
+    # the same .npz "Save .npz" already produces.
+    # ------------------------------------------------------------------
+
+    def _start_diff_capture(self) -> None:
+        self._diff_files, self._diff_paths = {}, {}
+        if not self._diff_capture_enabled or not self._pairs:
+            return
+        stamp = time.strftime('%Y%m%d_%H%M%S')
+        suffix = self.suffix_var.get().strip() or 'g2multi'
+        self._diff_session_dir = os.path.join(
+            '.', 'spad_data', 'diffs', f'{suffix}_{stamp}')
+        os.makedirs(self._diff_session_dir, exist_ok=True)
+        for p1, p2 in self._pair_keys():
+            path = os.path.join(self._diff_session_dir,
+                                f'pair_{p1:03d}_{p2:03d}.bin')
+            self._diff_paths[(p1, p2)] = path
+            self._diff_files[(p1, p2)] = open(path, 'wb')
+
+    def _flush_diff_handles(self) -> None:
+        for f in self._diff_files.values():
+            try:
+                f.flush()
+            except OSError:
+                pass
+
+    def _stop_diff_capture(self, consolidate: bool = True) -> None:
+        had_files = bool(self._diff_files)
+        for f in self._diff_files.values():
+            try:
+                f.close()
+            except OSError:
+                pass
+        self._diff_files = {}
+        if had_files and consolidate:
+            self._save_npz()
+
+    def destroy(self) -> None:
+        """Window teardown must not leak open diff-capture handles. No
+        auto-consolidate here -- the status-line widgets _save_npz touches
+        may already be gone by the time Tk calls this, and the raw .bin files
+        are already durable on disk regardless."""
+        self._stop_diff_capture(consolidate=False)
+        super().destroy()
 
     # ------------------------------------------------------------------
     # Hooks / calibration
@@ -717,6 +782,7 @@ class MultiCorrelateWindow(tk.Toplevel):
     def start_with_offset(self, offset: int) -> None:
         if not self._active or self._graph is None:
             return
+        self._start_diff_capture()
         self._offset = int(offset)
         self._graph.start(offset=int(offset))
         self._hist.clear()
@@ -793,17 +859,22 @@ class MultiCorrelateWindow(tk.Toplevel):
                          args=(rel, bw, tmax, nbins, nshift)).start()
 
     def _correlate_bg(self, rel, bw, tmax, nbins, nshift) -> None:
-        import time
         try:
             t0 = time.perf_counter()
             batches = [((p1, p2), t1, t2) for p1, p2, t1, t2 in rel.batches]
-            hists = self._pool.run(batches, bw, tmax, nbins, nshift)
+            if self._diff_capture_enabled and self._diff_files:
+                results = self._pool.run_with_diffs(batches, bw, tmax, nbins, nshift)
+                hists = {k: h for k, (h, d) in results.items()}
+                diffs = {k: d for k, (h, d) in results.items()}
+            else:
+                hists = self._pool.run(batches, bw, tmax, nbins, nshift)
+                diffs = None
             dt = time.perf_counter() - t0
             self._kernel_s_total += dt
             self._kernel_batches += 1
             sizes = {(p1, p2): (int(t1.size), int(t2.size))
                      for p1, p2, t1, t2 in rel.batches}
-            self._result_q.put(('ok', hists, sizes, rel, dt))
+            self._result_q.put(('ok', hists, sizes, rel, dt, diffs))
         except Exception as exc:
             self._result_q.put(('err', str(exc)))
         finally:
@@ -819,7 +890,7 @@ class MultiCorrelateWindow(tk.Toplevel):
             if res[0] == 'err':
                 self._set_status(f'Correlation error: {res[1]}', bad=True)
                 continue
-            _, hists, sizes, rel, dt = res
+            _, hists, sizes, rel, dt, diffs = res
             self._last_kernel_s = dt
             for key, h in hists.items():
                 cur = self._hist.get(key)
@@ -831,6 +902,13 @@ class MultiCorrelateWindow(tk.Toplevel):
                 n1, n2 = sizes[key]
                 self._counts[key][0] += n1
                 self._counts[key][1] = max(self._counts[key][1], n2)
+            # Written on this thread, not the kernel worker -- one writer per
+            # handle at a time, same as run_session_loop's own file writes.
+            if diffs:
+                for key, arr in diffs.items():
+                    f = self._diff_files.get(key)
+                    if f is not None and arr.size:
+                        arr.tofile(f)
             drawn = True
         if drawn:
             # Exactly ONE redraw per batch, not one per pair. The old windows
@@ -931,15 +1009,27 @@ class MultiCorrelateWindow(tk.Toplevel):
         self.ax.axvline(mean - std, color='k', linestyle='dashed', linewidth=1)
 
         x = np.arange(max(0, int(mean - 4 * std)), int(mean + 4 * std) + 1)
-        self.ax.plot(x, pois.pmf(x), 'r-', linewidth=1.5, label='Poisson PMF')
+        pmf = pois.pmf(x)
+        self.ax.plot(x, pmf, 'r-', linewidth=1.5, label='Poisson PMF')
 
         expected_str = self.expected_var.get().strip()
         if expected_str:
             try:
                 ratio = float(expected_str)          # 1 + R
                 Nc = mean * ratio
-                self.ax.axvline(Nc, color='red', linestyle='dashed', linewidth=1,
+                self.ax.axvline(Nc, color='green', linestyle='solid', linewidth=1,
                                 label=f'Nc = {Nc:.1f}  (mean×{ratio})')
+                # Gaussian(mean=Nc, var=Nc), scaled to 10% of the Poisson PMF's
+                # peak height so it reads as a marker, not a competing model.
+                sigma_nc = np.sqrt(Nc)
+                xg = np.arange(max(0, int(Nc - 4 * sigma_nc)),
+                                int(Nc + 4 * sigma_nc) + 1)
+                gauss = norm.pdf(xg, loc=Nc, scale=sigma_nc)
+                peak = gauss.max()
+                if peak > 0:
+                    gauss = gauss / peak * (0.1 * pmf.max())
+                    self.ax.plot(xg, gauss, color='green', linestyle='dashed',
+                                linewidth=1.5, label='N(Nc, Nc)')
             except ValueError:
                 pass
 
@@ -980,7 +1070,7 @@ class MultiCorrelateWindow(tk.Toplevel):
                          color='steelblue', linewidth=1)
             n1, n2 = self._counts.get(key, (0, 0))
             self.ax.set_title(f'g² — pixel {key[0]} × {key[1]}   '
-                              f'({n1:,} × {n2:,} events)')
+                              f'({n1:.1e} × {n2:.1e} events)')
             _mark_peak_bin(self.ax, centers, hist, scale)
             self.ax.set_xlabel(f'τ ({unit})')
             self.ax.set_ylabel('Counts')
@@ -1032,6 +1122,32 @@ class MultiCorrelateWindow(tk.Toplevel):
                          in (self._graph.exclusion_history.items()
                              if self._graph else {}.items())],
         }
+
+        # Filtered per-pair time differences, if diff-capture streamed any
+        # this session -- one concatenated int64 array plus offsets, in the
+        # same `keys` order as px1/px2/n_start/n_stop, rather than a ragged
+        # per-pair object array (avoids allow_pickle). Read by path, not from
+        # the live handles: this runs both mid-run ("Save .npz" clicked while
+        # still streaming, handles flushed but open) and at session stop
+        # (handles already closed by _stop_diff_capture).
+        extra = {}
+        if self._diff_paths:
+            self._flush_diff_handles()
+            diff_arrays = [np.fromfile(self._diff_paths[k], dtype=np.int64)
+                           if k in self._diff_paths and os.path.exists(self._diff_paths[k])
+                           else np.empty(0, dtype=np.int64)
+                           for k in keys]
+            offsets = np.zeros(len(diff_arrays) + 1, dtype=np.int64)
+            offsets[1:] = np.cumsum([d.size for d in diff_arrays])
+            extra = dict(
+                diffs_ps=(np.concatenate(diff_arrays) if diff_arrays
+                         else np.empty(0, dtype=np.int64)),
+                diffs_offset=offsets)
+            meta['diff_capture'] = True
+            meta['diff_dir'] = self._diff_session_dir
+        else:
+            meta['diff_capture'] = False
+
         suffix = self.suffix_var.get().strip() or 'g2multi'
         path = os.path.join('.', 'spad_data', f'{suffix}.npz')
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -1048,7 +1164,7 @@ class MultiCorrelateWindow(tk.Toplevel):
                     px2=np.array([k[1] for k in keys]),
                     n_start=np.array([self._counts[k][0] for k in keys]),
                     n_stop=np.array([self._counts[k][1] for k in keys]),
-                    meta=json.dumps(meta))
+                    meta=json.dumps(meta), **extra)
             # Atomic swap: an interrupted save must not truncate a good archive.
             os.replace(tmp, path)
             self.status_var.set(f'Saved {len(keys)} pairs → {path}')

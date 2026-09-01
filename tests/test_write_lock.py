@@ -71,47 +71,59 @@ def test_lock_is_the_or_over_nodes():
 
 
 def test_gui_locks_and_unlocks_the_widget():
-    """The widget half, against a stubbed-out GUI: _refresh_write_disk_lock is
-    the only thing under test, so nothing is connected or started."""
+    """The widget half, against a stubbed-out GUI: _refresh_write_mode_lock is
+    the only thing under test, so nothing is connected or started.
+
+    g._correlators = () so the diffs-mode gate (a separate concern, covered by
+    test_diff_mode_gated_on_enabled below) evaluates to "not ready" without
+    needing a real correlator -- irrelevant here since the mode under test is
+    'timestamps', never 'diffs'.
+    """
     root = tk.Tk()
     root.withdraw()
     try:
         g = object.__new__(master.ReceiverGUI)
         g.node1, g.node2 = FakeNode(), FakeNode()
-        g.write_disk_var = tk.BooleanVar(value=True)
+        g.write_mode_var = tk.StringVar(value='timestamps')
         g._write_lock_var = tk.StringVar(value='')
-        g._write_disk_cb = tk.Checkbutton(root)
+        g._write_none_rb = tk.Checkbutton(root)
+        g._write_ts_rb = tk.Checkbutton(root)
+        g._write_diff_rb = tk.Checkbutton(root)
+        g._correlators = ()
         logs = []
         g._enqueue_log = logs.append
         g._write_locked_last = False    # as ReceiverGUI.__init__ sets it
 
-        g._refresh_write_disk_lock()
+        g._refresh_write_mode_lock()
         check('the build-time refresh logs nothing -- unlocked is the start state',
               logs == [], str(logs))
-        check('idle: the checkbox is enabled and no reason is shown',
-              str(g._write_disk_cb['state']) == 'normal'
+        check('idle: the radios are enabled and no reason is shown',
+              str(g._write_ts_rb['state']) == 'normal'
               and g._write_lock_var.get() == '',
-              f"{g._write_disk_cb['state']} / {g._write_lock_var.get()!r}")
+              f"{g._write_ts_rb['state']} / {g._write_lock_var.get()!r}")
 
         g.node2._session_active = True
-        g._refresh_write_disk_lock()
-        check('committed: the checkbox is disabled',
-              str(g._write_disk_cb['state']) == 'disabled')
+        g._refresh_write_mode_lock()
+        check('committed: the radios are disabled',
+              str(g._write_none_rb['state']) == 'disabled'
+              and str(g._write_ts_rb['state']) == 'disabled'
+              and str(g._write_diff_rb['state']) == 'disabled')
         check('and says why, naming the data connection',
               'data connection' in g._write_lock_var.get(),
               g._write_lock_var.get())
         check('the transition is logged once, with the value that got locked in',
-              len(logs) == 1 and 'LOCKED' in logs[0] and 'ON' in logs[0], str(logs))
+              len(logs) == 1 and 'LOCKED' in logs[0] and 'TIMESTAMPS' in logs[0],
+              str(logs))
 
-        g._refresh_write_disk_lock()
-        g._refresh_write_disk_lock()
+        g._refresh_write_mode_lock()
+        g._refresh_write_mode_lock()
         check('and only once -- a 2 s health check must not spam the log',
               len(logs) == 1, str(logs))
 
         g.node2._session_active = False
-        g._refresh_write_disk_lock()
+        g._refresh_write_mode_lock()
         check('released: enabled again, reason cleared, transition logged',
-              str(g._write_disk_cb['state']) == 'normal'
+              str(g._write_ts_rb['state']) == 'normal'
               and g._write_lock_var.get() == ''
               and len(logs) == 2 and 'unlocked' in logs[1], str(logs))
     finally:
@@ -136,9 +148,12 @@ def test_the_locked_line_reaches_the_run_log():
     try:
         g = object.__new__(master.ReceiverGUI)
         g.node1, g.node2 = FakeNode(), FakeNode()
-        g.write_disk_var = tk.BooleanVar(value=False)
+        g.write_mode_var = tk.StringVar(value='none')
         g._write_lock_var = tk.StringVar(value='')
-        g._write_disk_cb = tk.Checkbutton(root)
+        g._write_none_rb = tk.Checkbutton(root)
+        g._write_ts_rb = tk.Checkbutton(root)
+        g._write_diff_rb = tk.Checkbutton(root)
+        g._correlators = ()
         g._write_locked_last = False
         g._run_log = RunLog(tmp)
         # _enqueue_log's real behaviour: the pane AND the file.
@@ -147,26 +162,29 @@ def test_the_locked_line_reaches_the_run_log():
         # The order _start_all uses: open the log, THEN refresh the lock.
         path = g._run_log.start(stamp='RUN')
         g.node1._session_active = True          # START committed the flag
-        g._refresh_write_disk_lock()
+        g._refresh_write_mode_lock()
         g._run_log.finish()
 
         body = open(path).read()
         check('the LOCKED transition is in the run log file',
               'LOCKED' in body, repr(body))
         check('and records which way it was locked',
-              'OFF' in body, repr(body))
+              'NONE' in body, repr(body))
 
         # The old order, to show the test would have caught it.
         rl = RunLog(tmp)
         g2 = object.__new__(master.ReceiverGUI)
         g2.node1, g2.node2 = FakeNode(session_active=True), FakeNode()
-        g2.write_disk_var = tk.BooleanVar(value=False)
+        g2.write_mode_var = tk.StringVar(value='none')
         g2._write_lock_var = tk.StringVar(value='')
-        g2._write_disk_cb = tk.Checkbutton(root)
+        g2._write_none_rb = tk.Checkbutton(root)
+        g2._write_ts_rb = tk.Checkbutton(root)
+        g2._write_diff_rb = tk.Checkbutton(root)
+        g2._correlators = ()
         g2._write_locked_last = False
         g2._run_log = rl
         g2._enqueue_log = lambda t: rl.add(t)
-        g2._refresh_write_disk_lock()           # refresh BEFORE start: the bug
+        g2._refresh_write_mode_lock()           # refresh BEFORE start: the bug
         p2 = rl.start(stamp='RUN_OLD')
         rl.finish()
         check('refreshing before the log opens loses the line (the old bug)',
@@ -178,15 +196,85 @@ def test_the_locked_line_reaches_the_run_log():
 
 def test_the_flag_the_backend_reads_is_unaffected():
     """Locking is a UI guard, not a change of semantics: get_write_hooked_fn must
-    still return the variable's value, so a locked-ON run still writes."""
+    still reduce the tri-state mode to one boolean, so a locked-'timestamps'
+    run still writes."""
     root = tk.Tk()
     root.withdraw()
     try:
-        var = tk.BooleanVar(value=False)
-        fn = lambda: var.get()
-        check('the getter reflects the box while unlocked', fn() is False)
-        var.set(True)
+        var = tk.StringVar(value='none')
+        fn = lambda: var.get() == 'timestamps'
+        check('the getter reflects the mode while unlocked', fn() is False)
+        var.set('timestamps')
         check('and after a change', fn() is True)
+        var.set('diffs')
+        check("'diffs' mode does not write raw timestamps either", fn() is False)
+    finally:
+        root.destroy()
+
+
+class FakeCorrelator:
+    """Only what _refresh_write_mode_lock and _push_*_state read/call."""
+
+    def __init__(self, is_enabled=False):
+        self.is_enabled = is_enabled
+        self.write_to_disk_calls = []
+        self.diff_capture_calls = []
+
+    def set_write_to_disk(self, on):
+        self.write_to_disk_calls.append(on)
+
+    def set_diff_capture_enabled(self, on):
+        self.diff_capture_calls.append(on)
+
+
+def test_diff_mode_gated_on_enabled():
+    """'Save time differences' only produces data once the correlator has
+    pairs derived and Enabled -- reuse is_enabled, the same property master.py
+    already reads before calibration, not a second gate."""
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        fc = FakeCorrelator(is_enabled=False)
+        g = object.__new__(master.ReceiverGUI)
+        g.node1, g.node2 = FakeNode(), FakeNode()
+        g.write_mode_var = tk.StringVar(value='diffs')
+        g._write_lock_var = tk.StringVar(value='')
+        g._write_none_rb = tk.Checkbutton(root)
+        g._write_ts_rb = tk.Checkbutton(root)
+        g._write_diff_rb = tk.Checkbutton(root)
+        g._correlators = (fc,)
+        logs = []
+        g._enqueue_log = logs.append
+        g._write_locked_last = False
+
+        g._refresh_write_mode_lock()
+        check('not enabled -> diffs mode reverts to timestamps',
+              g.write_mode_var.get() == 'timestamps', g.write_mode_var.get())
+        check('the diff radio is disabled when the correlator is not enabled',
+              str(g._write_diff_rb['state']) == 'disabled')
+        check('the revert is logged',
+              any('reverted' in l for l in logs), str(logs))
+
+        logs.clear()
+        g.write_mode_var.set('diffs')
+        fc.is_enabled = True
+        g._refresh_write_mode_lock()
+        check('enabled -> diffs mode is selectable and stays selected',
+              g.write_mode_var.get() == 'diffs')
+        check('the diff radio is enabled once the correlator is enabled',
+              str(g._write_diff_rb['state']) == 'normal')
+
+        # The invariant that must never regress: once committed, the mode
+        # must not move even if is_enabled later flips back off.
+        g.node1._session_active = True
+        g._refresh_write_mode_lock()
+        check('committed while in diffs mode: all radios locked, mode unchanged',
+              g.write_mode_var.get() == 'diffs'
+              and str(g._write_diff_rb['state']) == 'disabled')
+        fc.is_enabled = False
+        g._refresh_write_mode_lock()
+        check('is_enabled flipping off after commit does not move a locked mode',
+              g.write_mode_var.get() == 'diffs')
     finally:
         root.destroy()
 

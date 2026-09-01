@@ -7,9 +7,11 @@ Manages two sender nodes:
   - Data channel    : sender → receiver data server   (binary chunks)
 
 Workflow:
-  1. Enter sender IP / ports / output folder per node, click Connect.
+  1. Enter sender IP / ports / output folder per node, click Launch.
   2. Set duration and mode, click START ALL.
   3. Each connected sender runs its acquisition and streams data here.
+  4. Click Disconnect (same button) when done. Right-click it to attach to a
+     node already running, without relaunching it.
 """
 
 import csv
@@ -161,13 +163,19 @@ class NodePanel:
                                    fg='#cc3333', font=('TkDefaultFont', 9, 'bold'), anchor='w')
         self._ctrl_lbl.grid(row=2, column=0, columnspan=2, sticky='w', padx=8, pady=(2, 2))
 
-        self._launch_btn = ttk.Button(frame, text='Launch', width=9,
-                                      command=self._on_launch)
-        self._launch_btn.grid(row=2, column=2, columnspan=2, sticky='e', padx=(0, 4), pady=4)
+        # One button for the workflow actually used -- Launch to bring a node
+        # up, Disconnect to bring it down. Attaching to an already-running node
+        # without relaunching it (the recovery path after master.py itself
+        # restarts mid-session) is real but rare, so it lives on right-click
+        # rather than as a second always-visible button.
+        self._primary_btn = ttk.Button(frame, text='Launch', width=11,
+                                       command=self._on_primary)
+        self._primary_btn.grid(row=2, column=2, columnspan=4, sticky='e', padx=(0, 8), pady=4)
 
-        self._connect_btn = ttk.Button(frame, text='Connect', width=9,
-                                       command=self._toggle)
-        self._connect_btn.grid(row=2, column=4, columnspan=2, sticky='e', padx=(0, 8), pady=4)
+        self._attach_menu = tk.Menu(self._primary_btn, tearoff=0)
+        self._attach_menu.add_command(label='Connect (attach only, no launch)',
+                                      command=self._toggle)
+        self._primary_btn.bind('<Button-3>', self._on_primary_right_click)
 
         # Row 3 — data status
         self.data_status_var = tk.StringVar(value='  Data: ● Idle')
@@ -178,6 +186,22 @@ class NodePanel:
     # ------------------------------------------------------------------
     # Connect / disconnect
     # ------------------------------------------------------------------
+
+    def _on_primary(self) -> None:
+        """The one always-visible button: Launch when idle, Disconnect once
+        connected. 'launching' leaves the button disabled, so nothing to do."""
+        if self._state == 'idle':
+            self._on_launch()
+        elif self._state != 'launching':
+            self._disconnect()
+
+    def _on_primary_right_click(self, event) -> None:
+        """Attach-only path, for reconnecting to a node still running from a
+        previous session (e.g. master.py itself was restarted) without
+        relaunching lSPAD on it. Only meaningful while idle."""
+        if self._state != 'idle':
+            return
+        self._attach_menu.tk_popup(event.x_root, event.y_root)
 
     def _toggle(self) -> None:
         if self._state == 'idle':
@@ -704,22 +728,19 @@ class NodePanel:
         if state == 'idle':
             self.ctrl_status_var.set('● Disconnected')
             self._ctrl_lbl.config(fg='#cc3333')
-            self._launch_btn.config(state='normal')
-            self._connect_btn.config(text='Connect', state='normal')
+            self._primary_btn.config(text='Launch', state='normal')
             for e in entries:
                 e.config(state='normal')
         elif state == 'launching':
             self.ctrl_status_var.set('● Launching …')
             self._ctrl_lbl.config(fg='#cc9900')
-            self._launch_btn.config(state='disabled')
-            self._connect_btn.config(state='disabled')
+            self._primary_btn.config(state='disabled')
             for e in entries:
                 e.config(state='disabled')
         else:  # 'ready' or 'streaming'
             self.ctrl_status_var.set('● Connected')
             self._ctrl_lbl.config(fg='#33aa33')
-            self._launch_btn.config(state='disabled')
-            self._connect_btn.config(text='Disconnect', state='normal')
+            self._primary_btn.config(text='Disconnect', state='normal')
             for e in entries:
                 e.config(state='disabled')
 
@@ -781,7 +802,7 @@ class ReceiverGUI:
         # to ~1.3 GB/s of timestamps and the sender's TCP window is what must
         # not close. With write-to-disk off this file is the run's only record.
         self._run_log = RunLog()
-        # False, not None: the first _refresh_write_disk_lock() at build time
+        # False, not None: the first _refresh_write_mode_lock() at build time
         # would otherwise read as a transition and log "unlocked" on every start.
         self._write_locked_last = False
         self._run_id = 0
@@ -812,8 +833,9 @@ class ReceiverGUI:
         self._correlators = (self._multi_correlate_win,)
         self._monitor_abort: threading.Event | None = None
         self._build_ui()
-        self._push_write_disk_state()   # correlators start out agreeing with the box
-        self._refresh_write_disk_lock()
+        self._push_write_disk_state()    # correlators start out agreeing with the mode
+        self._push_diff_capture_state()
+        self._refresh_write_mode_lock()
         # Only now do the NodePanels exist, so this is the first moment the
         # multi-pair window can read their mask fields.
         for c in self._correlators:
@@ -830,9 +852,9 @@ class ReceiverGUI:
 
     def _build_ui(self) -> None:
         # Defined before the NodePanels, which close over it for their
-        # get_write_hooked_fn. On by default: keeping the data is the safe
-        # default, and not keeping it has to be a deliberate click.
-        self.write_disk_var = tk.BooleanVar(value=True)
+        # get_write_hooked_fn. 'timestamps' by default: keeping the data is
+        # the safe default, and not keeping it has to be a deliberate click.
+        self.write_mode_var = tk.StringVar(value='timestamps')  # none|timestamps|diffs
 
         nodes_frame = ttk.Frame(self.root)
         nodes_frame.grid(row=0, column=0, sticky='ew')
@@ -846,7 +868,7 @@ class ReceiverGUI:
                                log_fn=self._enqueue_log,
                                get_hooks_fn=lambda: merge_hooks(
                                    *(c.hooks_node1 for c in self._correlators)),
-                               get_write_hooked_fn=lambda: self.write_disk_var.get(),
+                               get_write_hooked_fn=lambda: self.write_mode_var.get() == 'timestamps',
                                on_first_data_fn=self._on_node_first_data)
         self.node2 = NodePanel(nodes_frame, self.root,
                                node_id=2,
@@ -857,7 +879,7 @@ class ReceiverGUI:
                                log_fn=self._enqueue_log,
                                get_hooks_fn=lambda: merge_hooks(
                                    *(c.hooks_node2 for c in self._correlators)),
-                               get_write_hooked_fn=lambda: self.write_disk_var.get(),
+                               get_write_hooked_fn=lambda: self.write_mode_var.get() == 'timestamps',
                                on_first_data_fn=self._on_node_first_data)
 
         # ── acquisition controls ───────────────────────────────────────
@@ -878,11 +900,24 @@ class ReceiverGUI:
         self._cal_status_lbl = tk.Label(acq, textvariable=self._cal_status_var, anchor='w')
         self._cal_status_lbl.grid(row=2, column=0, columnspan=5, sticky='w', padx=8, pady=(0, 6))
 
-        self._write_disk_cb = ttk.Checkbutton(
-            acq, text='Write timestamps to disk (uncheck: live correlation only)',
-            variable=self.write_disk_var, command=self._on_write_disk_toggle)
-        self._write_disk_cb.grid(row=3, column=0, columnspan=6, sticky='w',
-                                 padx=8, pady=(0, 6))
+        write_mode_frame = ttk.Frame(acq)
+        write_mode_frame.grid(row=3, column=0, columnspan=6, sticky='w',
+                              padx=8, pady=(0, 6))
+        self._write_none_rb = ttk.Radiobutton(
+            write_mode_frame, text='No save (live only)',
+            variable=self.write_mode_var, value='none',
+            command=self._on_write_mode_change)
+        self._write_none_rb.grid(row=0, column=0, sticky='w', padx=(0, 12))
+        self._write_ts_rb = ttk.Radiobutton(
+            write_mode_frame, text='Save timestamps to disk',
+            variable=self.write_mode_var, value='timestamps',
+            command=self._on_write_mode_change)
+        self._write_ts_rb.grid(row=0, column=1, sticky='w', padx=(0, 12))
+        self._write_diff_rb = ttk.Radiobutton(
+            write_mode_frame, text='Save time differences to disk',
+            variable=self.write_mode_var, value='diffs',
+            command=self._on_write_mode_change)
+        self._write_diff_rb.grid(row=0, column=2, sticky='w')
         # A greyed-out checkbox with no reason given is worse than a live one.
         self._write_lock_var = tk.StringVar(value='')
         tk.Label(acq, textvariable=self._write_lock_var, anchor='w',
@@ -938,24 +973,33 @@ class ReceiverGUI:
     # Acquisition control
     # ------------------------------------------------------------------
 
-    def _on_write_disk_toggle(self) -> None:
+    def _on_write_mode_change(self) -> None:
         """Log the choice, and say when it takes effect.
 
         run_session_loop decides which files to open at session start, so a
-        toggle during a run applies from the next data connection — saying so
-        beats leaving someone to wonder why px_*.bin kept growing.
+        mode change during a run applies from the next data connection —
+        saying so beats leaving someone to wonder why px_*.bin kept growing.
         """
         self._push_write_disk_state()
-        if self.write_disk_var.get():
-            self._enqueue_log('Write to disk ON — every pixel is persisted as usual.\n')
+        self._push_diff_capture_state()
+        mode = self.write_mode_var.get()
+        if mode == 'timestamps':
+            self._enqueue_log('Write to disk: TIMESTAMPS — every pixel is persisted as usual.\n')
+        elif mode == 'diffs':
+            self._enqueue_log(
+                'Write to disk: TIME DIFFERENCES — raw px_*.bin will NOT be '
+                'written; the correlator streams each derived pair\'s filtered '
+                'time differences to spad_data\\diffs\\... instead, consolidated '
+                'into .npz on Disable/Reset or Save. Applies from the next data '
+                'connection.\n')
         else:
             self._enqueue_log(
-                'Write to disk OFF — NOTHING will be written: no px_*.bin, no '
+                'Write to disk: NONE — NOTHING will be written: no px_*.bin, no '
                 'sync files, no output directory. Hooked pixels go to the '
                 'correlator only. Applies from the next data connection.\n')
 
-    def _refresh_write_disk_lock(self) -> None:
-        """Lock the checkbox while the flag is already committed.
+    def _refresh_write_mode_lock(self) -> None:
+        """Lock the radios while the flag is already committed.
 
         Deviation 2 of Stage 1b. The old mitigation only *said* the toggle
         applied later; the box still moved, which reads as "this run will not
@@ -964,28 +1008,63 @@ class ReceiverGUI:
         node's pixels and not the other's -- half a dataset, found later.
         """
         locked = any(n.write_flag_is_committed() for n in (self.node1, self.node2))
-        self._write_disk_cb.configure(state='disabled' if locked else 'normal')
-        self._write_lock_var.set(
-            'Locked: the write choice is fixed when a node\'s data connection '
-            'is accepted and holds for every session on it. Disconnect a node to '
-            'change it.' if locked else '')
+        radios = (self._write_none_rb, self._write_ts_rb, self._write_diff_rb)
+        if locked:
+            for rb in radios:
+                rb.configure(state='disabled')
+            self._write_lock_var.set(
+                'Locked: the write choice is fixed when a node\'s data connection '
+                'is accepted and holds for every session on it. Disconnect a node '
+                'to change it.')
+        else:
+            for rb in radios:
+                rb.configure(state='normal')
+            # "Save time differences" only produces anything once the
+            # correlator has pairs derived and Enabled -- the same is_enabled
+            # property master.py already reads before calibration (line
+            # ~1082), not a second gate.
+            diffs_ready = any(c.is_enabled for c in self._correlators)
+            self._write_diff_rb.configure(state='normal' if diffs_ready else 'disabled')
+            if not diffs_ready and self.write_mode_var.get() == 'diffs':
+                self.write_mode_var.set('timestamps')
+                self._push_write_disk_state()
+                self._push_diff_capture_state()
+                self._enqueue_log(
+                    'Write to disk reverted to TIMESTAMPS — the correlator was '
+                    'disabled, so "Save time differences" has nothing to '
+                    'capture.\n')
+            self._write_lock_var.set('')
         if locked != getattr(self, '_write_locked_last', False):
             self._write_locked_last = locked
             self._enqueue_log(
                 f'Write-to-disk choice {"LOCKED" if locked else "unlocked"} '
-                f'({"ON" if self.write_disk_var.get() else "OFF"}).\n')
+                f'({self.write_mode_var.get().upper()}).\n')
 
     def _push_write_disk_state(self) -> None:
-        """Tell every correlator whether the timestamps are being kept.
+        """Tell every correlator whether raw timestamps are being kept.
 
         Without this the correlator cannot know, and its overload warning says
-        "raw data is still complete on disk" — which is false the moment the
-        checkbox is unchecked. What an overload MEANS changes with this flag:
-        a recoverable delay, or permanent photon loss.
+        "raw data is still complete on disk" — which is false unless raw
+        per-pixel timestamps are actually being written. What an overload
+        MEANS changes with this flag: a recoverable delay, or permanent photon
+        loss. Tied to 'timestamps' specifically, not 'diffs' -- diff-capture
+        does not write px_*.bin, so it does not change this message.
         """
-        on = bool(self.write_disk_var.get())
+        on = (self.write_mode_var.get() == 'timestamps')
         for c in self._correlators:
             setter = getattr(c, 'set_write_to_disk', None)
+            if setter is not None:
+                setter(on)
+
+    def _push_diff_capture_state(self) -> None:
+        """Tell every correlator whether to stream filtered per-pair time
+        differences to disk. Deliberately separate from _push_write_disk_state
+        -- the two write paths (raw px_*.bin vs. derived per-pair diffs) are
+        mutually exclusive but independently meaningful to the correlator.
+        """
+        on = (self.write_mode_var.get() == 'diffs')
+        for c in self._correlators:
+            setter = getattr(c, 'set_diff_capture_enabled', None)
             if setter is not None:
                 setter(on)
 
@@ -1030,14 +1109,20 @@ class ReceiverGUI:
 
         self._run_id += 1
         self._set_cal_status('')
-        writing = self.write_disk_var.get()
+        mode = self.write_mode_var.get()
+        note = ''
+        if mode == 'none':
+            note = ('# NOTHING is written to disk this run: no px_*.bin, no sync '
+                    'files. This file is the only record.\n')
+        elif mode == 'diffs':
+            note = ('# Raw timestamps are NOT written this run: no px_*.bin, no '
+                    'sync files. The correlator streams filtered per-pair time '
+                    'differences to spad_data\\diffs\\... instead.\n')
         path = self._run_log.start(header=(
             f'# sii_wis run log — {time.strftime("%Y-%m-%d %H:%M:%S")}\n'
             f'# duration={duration} s  nodes={sent}  '
-            f'write_timestamps_to_disk={writing}\n'
-            + ('' if writing else
-               '# NOTHING is written to disk this run: no px_*.bin, no sync '
-               'files. This file is the only record.\n')))
+            f'write_mode={mode}\n'
+            + note))
         if path:
             self._enqueue_log(f'Run log: {path}\n')
         # AFTER the run log is open, not before: this call logs the LOCKED
@@ -1047,7 +1132,7 @@ class ReceiverGUI:
         # and its record did not, which for a writes-off run is precisely
         # where the record is the only evidence there was a run at all.
         # Still before any accept, so the two nodes cannot disagree.
-        self._refresh_write_disk_lock()
+        self._refresh_write_mode_lock()
         if duration == 0:
             self._enqueue_log(f'START sent to {sent} node(s) (real, indefinite).\n')
             self._start_timer()
@@ -1485,7 +1570,7 @@ class ReceiverGUI:
     def _health_check(self) -> None:
         self.node1.health_check()
         self.node2.health_check()
-        self._refresh_write_disk_lock()
+        self._refresh_write_mode_lock()
         self._schedule_health_check()
 
     # ------------------------------------------------------------------
