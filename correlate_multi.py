@@ -349,7 +349,8 @@ class MultiCorrelateWindow(tk.Toplevel):
         self.enable_btn.grid(row=0, column=0, padx=3)
         ttk.Button(btn, text='Disable', width=8, command=self._disable).grid(row=0, column=1, padx=3)
         ttk.Button(btn, text='Reset data', width=10, command=self._reset).grid(row=0, column=2, padx=3)
-        ttk.Button(btn, text='Save .npz', width=10, command=self._save_npz).grid(row=0, column=3, padx=(14, 3))
+        self.save_btn = ttk.Button(btn, text='Save .npz', width=10, command=self._save_npz)
+        self.save_btn.grid(row=0, column=3, padx=(14, 3))
         ttk.Button(btn, text='Export pair → .txt', width=17,
                    command=self._export_pair_txt).grid(row=0, column=4, padx=3)
 
@@ -673,6 +674,16 @@ class MultiCorrelateWindow(tk.Toplevel):
     # Enable / disable / reset
     # ------------------------------------------------------------------
 
+    def _set_accumulating(self, on: bool) -> None:
+        """Save .npz reads whatever's on disk with np.fromfile then
+        np.savez_compressed, synchronously on this (the Tk main) thread --
+        cheap for the histogram alone, but with diff-capture on a long
+        high-rate run it can take a long time and freezes the GUI for it.
+        Disabled while accumulating so that cost is only ever paid on a
+        stopped run, not fired mid-session."""
+        self._accumulating = on
+        self.save_btn.configure(state='disabled' if on else 'normal')
+
     def _enable(self) -> None:
         if self._pairs is None:
             self.status_var.set('Derive a pair list first.')
@@ -684,14 +695,14 @@ class MultiCorrelateWindow(tk.Toplevel):
             return
         self._graph = ChannelGraph(self._pairs, tmax, offset=0)
         self._active = True
-        self._accumulating = False
+        self._set_accumulating(False)
         self._held = False
         self.status_var.set(
             f'Enabled — {len(self._pairs)} pairs, waiting for DWELL calibration …')
 
     def _disable(self) -> None:
         self._active = False
-        self._accumulating = False
+        self._set_accumulating(False)
         if self._graph is not None:
             self._graph.stop()
         self._stop_diff_capture()
@@ -702,7 +713,7 @@ class MultiCorrelateWindow(tk.Toplevel):
         self._counts.clear()
         self._bins = None
         self._offset = None
-        self._accumulating = False
+        self._set_accumulating(False)
         self._held = False
         self._kernel_s_total = 0.0
         self._kernel_batches = 0
@@ -788,7 +799,7 @@ class MultiCorrelateWindow(tk.Toplevel):
         self._hist.clear()
         self._counts.clear()
         self._bins = None
-        self._accumulating = True
+        self._set_accumulating(True)
         self._held = False
         self.status_var.set(f'Accumulating — offset {offset:+,} ps, '
                             f'{len(self._pairs)} pairs')
@@ -904,11 +915,16 @@ class MultiCorrelateWindow(tk.Toplevel):
                 self._counts[key][1] = max(self._counts[key][1], n2)
             # Written on this thread, not the kernel worker -- one writer per
             # handle at a time, same as run_session_loop's own file writes.
+            # Flushed every batch (not just at Save/stop): without it the
+            # bytes sit in Python's BufferedWriter and the .bin file can read
+            # as empty/stale for the whole run even though data is arriving,
+            # and a big backlog then hits Save .npz's np.fromfile all at once.
             if diffs:
                 for key, arr in diffs.items():
                     f = self._diff_files.get(key)
                     if f is not None and arr.size:
                         arr.tofile(f)
+                        f.flush()
             drawn = True
         if drawn:
             # Exactly ONE redraw per batch, not one per pair. The old windows
@@ -1008,7 +1024,7 @@ class MultiCorrelateWindow(tk.Toplevel):
                         label=f'±1σ = {std:.1f}')
         self.ax.axvline(mean - std, color='k', linestyle='dashed', linewidth=1)
 
-        x = np.arange(max(0, int(mean - 4 * std)), int(mean + 4 * std) + 1)
+        x = np.arange(max(0, int(mean - 3 * std)), int(mean + 3 * std) + 1)
         pmf = pois.pmf(x)
         self.ax.plot(x, pmf, 'r-', linewidth=1.5, label='Poisson PMF')
 
@@ -1022,8 +1038,8 @@ class MultiCorrelateWindow(tk.Toplevel):
                 # Gaussian(mean=Nc, var=Nc), scaled to 10% of the Poisson PMF's
                 # peak height so it reads as a marker, not a competing model.
                 sigma_nc = np.sqrt(Nc)
-                xg = np.arange(max(0, int(Nc - 4 * sigma_nc)),
-                                int(Nc + 4 * sigma_nc) + 1)
+                xg = np.arange(max(0, int(Nc - 3 * sigma_nc)),
+                                int(Nc + 3 * sigma_nc) + 1)
                 gauss = norm.pdf(xg, loc=Nc, scale=sigma_nc)
                 peak = gauss.max()
                 if peak > 0:

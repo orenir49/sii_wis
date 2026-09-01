@@ -10,8 +10,7 @@ Workflow:
   1. Enter sender IP / ports / output folder per node, click Launch.
   2. Set duration and mode, click START ALL.
   3. Each connected sender runs its acquisition and streams data here.
-  4. Click Disconnect (same button) when done. Right-click it to attach to a
-     node already running, without relaunching it.
+  4. Click Disconnect (same button) when done.
 """
 
 import csv
@@ -157,6 +156,13 @@ class NodePanel:
         self._pixel_entry = ttk.Entry(frame, textvariable=self.pixel_var, width=5)
         self._pixel_entry.grid(row=1, column=6, sticky='w', padx=(0, 8))
 
+        # Re-apply the mask/pixel fields to an already-running lSPAD, without a
+        # full relaunch. Only meaningful once lSPAD is up.
+        self._mask_refresh_btn = ttk.Button(frame, text='⟳', width=3,
+                                            state='disabled',
+                                            command=self._on_refresh_mask)
+        self._mask_refresh_btn.grid(row=1, column=7, sticky='w', padx=(0, 8))
+
         # Row 2 — status + launch / connect buttons
         self.ctrl_status_var = tk.StringVar(value='● Disconnected')
         self._ctrl_lbl = tk.Label(frame, textvariable=self.ctrl_status_var,
@@ -164,18 +170,10 @@ class NodePanel:
         self._ctrl_lbl.grid(row=2, column=0, columnspan=2, sticky='w', padx=8, pady=(2, 2))
 
         # One button for the workflow actually used -- Launch to bring a node
-        # up, Disconnect to bring it down. Attaching to an already-running node
-        # without relaunching it (the recovery path after master.py itself
-        # restarts mid-session) is real but rare, so it lives on right-click
-        # rather than as a second always-visible button.
+        # up, Disconnect to bring it down.
         self._primary_btn = ttk.Button(frame, text='Launch', width=11,
                                        command=self._on_primary)
         self._primary_btn.grid(row=2, column=2, columnspan=4, sticky='e', padx=(0, 8), pady=4)
-
-        self._attach_menu = tk.Menu(self._primary_btn, tearoff=0)
-        self._attach_menu.add_command(label='Connect (attach only, no launch)',
-                                      command=self._toggle)
-        self._primary_btn.bind('<Button-3>', self._on_primary_right_click)
 
         # Row 3 — data status
         self.data_status_var = tk.StringVar(value='  Data: ● Idle')
@@ -193,20 +191,6 @@ class NodePanel:
         if self._state == 'idle':
             self._on_launch()
         elif self._state != 'launching':
-            self._disconnect()
-
-    def _on_primary_right_click(self, event) -> None:
-        """Attach-only path, for reconnecting to a node still running from a
-        previous session (e.g. master.py itself was restarted) without
-        relaunching lSPAD on it. Only meaningful while idle."""
-        if self._state != 'idle':
-            return
-        self._attach_menu.tk_popup(event.x_root, event.y_root)
-
-    def _toggle(self) -> None:
-        if self._state == 'idle':
-            self._connect()
-        else:
             self._disconnect()
 
     def _connect(self) -> None:
@@ -597,13 +581,9 @@ class NodePanel:
         if pixel_str:
             self.mask_var.set(f'mask_{pixel_str}.txt')
 
-    def _on_launch(self) -> None:
-        """Validate the mask/pixel fields, then start the launch thread."""
-        if self._state != 'idle':
-            self.log_fn(f'Node {self.node_id}: already connected or launching.\n')
-            return
-        host       = self.ip_var.get().strip()
-        username   = self.ssh_user_var.get().strip()
+    def _read_mask_fields(self) -> tuple[str, int | None] | None:
+        """Validate the mask/pixel fields; returns (mask, mask_pixel) or None
+        (having already logged why) on a bad pixel value."""
         mask       = self.mask_var.get().strip()
         pixel_str  = self.pixel_var.get().strip()
         mask_pixel = None
@@ -612,14 +592,64 @@ class NodePanel:
                 mask_pixel = int(pixel_str)
             except ValueError:
                 self.log_fn(f'Node {self.node_id}: invalid pixel value {pixel_str!r}.\n')
-                return
+                return None
             if not (0 <= mask_pixel <= 319):
                 self.log_fn(f'Node {self.node_id}: pixel must be between 0 and 319.\n')
-                return
+                return None
+        return mask, mask_pixel
+
+    def _on_launch(self) -> None:
+        """Validate the mask/pixel fields, then start the launch thread."""
+        if self._state != 'idle':
+            self.log_fn(f'Node {self.node_id}: already connected or launching.\n')
+            return
+        host     = self.ip_var.get().strip()
+        username = self.ssh_user_var.get().strip()
+        fields   = self._read_mask_fields()
+        if fields is None:
+            return
+        mask, mask_pixel = fields
         threading.Thread(
             target=self._ssh_launch,
             args=(host, username, mask, mask_pixel),
             daemon=True).start()
+
+    def _on_refresh_mask(self) -> None:
+        """Re-apply the mask/pixel fields to the already-running lSPAD, without
+        relaunching it. Only meaningful once lSPAD is up (is_ready())."""
+        if not self.is_ready():
+            self.log_fn(f'Node {self.node_id}: not connected — nothing to refresh.\n')
+            return
+        fields = self._read_mask_fields()
+        if fields is None:
+            return
+        mask, mask_pixel = fields
+        if not mask.strip() and mask_pixel is None:
+            self.log_fn(f'Node {self.node_id}: no mask specified — nothing to apply.\n')
+            return
+        host, username = self.ip_var.get().strip(), self.ssh_user_var.get().strip()
+        self._mask_refresh_btn.config(state='disabled')
+        threading.Thread(
+            target=self._refresh_mask_thread,
+            args=(host, username, mask, mask_pixel),
+            daemon=True).start()
+
+    def _refresh_mask_thread(self, host: str, username: str,
+                             mask: str, mask_pixel: int | None) -> None:
+        """Background thread for _on_refresh_mask."""
+        def _log(msg: str) -> None:
+            self.log_fn(f'[N{self.node_id}] {msg}' if msg.endswith('\n')
+                        else f'[N{self.node_id}] {msg}\n')
+        try:
+            ssh_launcher.apply_mask(
+                host=host, username=username, mask_filename=mask,
+                mask_pixel=mask_pixel, log_fn=_log,
+                mask_sink=self._record_applied_mask)
+        except Exception as exc:
+            self.log_fn(f'Node {self.node_id}: mask refresh failed — {exc}\n')
+        finally:
+            self._gui(lambda: self._mask_refresh_btn.config(
+                state='normal' if self.is_ready() else 'disabled'))
 
     def _ssh_launch(self, host: str, username: str,
                     mask: str, mask_pixel: int | None) -> None:
@@ -723,26 +753,36 @@ class NodePanel:
 
     def _set_ctrl_status(self, state: str) -> None:
         self._state = state
+        # Connection parameters -- only meaningful before Launch.
         entries = [self._ip_entry, self._cmd_port_entry,
-                   self._data_port_entry, self._ssh_user_entry, self._mask_entry]
+                   self._data_port_entry, self._ssh_user_entry]
         if state == 'idle':
             self.ctrl_status_var.set('● Disconnected')
             self._ctrl_lbl.config(fg='#cc3333')
             self._primary_btn.config(text='Launch', state='normal')
             for e in entries:
                 e.config(state='normal')
+            self._mask_entry.config(state='normal')
+            self._mask_refresh_btn.config(state='disabled')
         elif state == 'launching':
             self.ctrl_status_var.set('● Launching …')
             self._ctrl_lbl.config(fg='#cc9900')
             self._primary_btn.config(state='disabled')
             for e in entries:
                 e.config(state='disabled')
+            self._mask_entry.config(state='disabled')
+            self._mask_refresh_btn.config(state='disabled')
         else:  # 'ready' or 'streaming'
             self.ctrl_status_var.set('● Connected')
             self._ctrl_lbl.config(fg='#33aa33')
             self._primary_btn.config(text='Disconnect', state='normal')
             for e in entries:
                 e.config(state='disabled')
+            # Mask/pixel stay editable while connected: that's what the
+            # refresh button is for -- swapping or re-applying a mask
+            # without a full relaunch.
+            self._mask_entry.config(state='normal')
+            self._mask_refresh_btn.config(state='normal')
 
     def _set_data_status(self, state: str) -> None:
         self._data_streaming = (state == 'streaming')

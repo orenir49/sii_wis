@@ -421,6 +421,65 @@ def kill_node(client: paramiko.SSHClient) -> str:
     return out.strip()
 
 
+def _apply_mask(client: paramiko.SSHClient, lspad_dir: str, lspad_port: int,
+                mask_filename: str, mask_pixel: int | None, log_fn, mask_sink) -> None:
+    """Send the M,<path> command for one mask, on an already-connected client
+    with lSPAD already located. Shared by launch_node's step 4 and the
+    standalone apply_mask() used to refresh a mask without relaunching."""
+    if mask_pixel is not None:
+        generated_filename = f'mask_{mask_pixel}.txt'
+        mask_path = lspad_dir + '\\' + generated_filename
+        log_fn(f'Generating and uploading {generated_filename} …\n')
+        mask_content = generate_mask_content(mask_pixel)
+        upload_file(client, mask_path, mask_content)
+        log_fn(f'Applying mask: {mask_path}\n')
+        send_lspad_cmd(client, lspad_port, f'M,{mask_path}',
+                      read_timeout=30.0, until='successful',
+                      log_fn=lambda s: log_fn(f'  {s}'))
+        if mask_sink is not None:
+            mask_sink(mask_path, mask_content.decode('ascii'))
+    elif mask_filename.strip():
+        mask_path = lspad_dir + '\\' + mask_filename
+        log_fn(f'Applying mask: {mask_path}\n')
+        send_lspad_cmd(client, lspad_port, f'M,{mask_path}',
+                      read_timeout=30.0, until='successful',
+                      log_fn=lambda s: log_fn(f'  {s}'))
+        # Read it back rather than assume: this branch never uploaded
+        # anything, so the file is whatever is on the node. A failure here
+        # must not fail the caller -- the mask is applied either way, and
+        # only the correlator's pair derivation needs the contents.
+        if mask_sink is not None:
+            try:
+                mask_sink(mask_path,
+                          read_remote_file(client, mask_path).decode('ascii', 'replace'))
+            except Exception as exc:
+                log_fn(f'Could not read {mask_path} back for the correlator: {exc}\n')
+    else:
+        log_fn('No mask specified — skipping mask command.\n')
+
+
+def apply_mask(host: str, username: str, mask_filename: str, log_fn,
+               lspad_port: int = SPAD_PORT, mask_pixel: int | None = None,
+               mask_sink=None) -> None:
+    """Apply a mask to an already-running lSPAD, without relaunching it or
+    touching calibration/node.py. For the GUI's mask refresh button: the
+    Launch sequence applies a mask once at startup, but a mask edited or
+    swapped mid-session had no way back onto the detector short of a full
+    relaunch. Raises RuntimeError if lSPAD isn't found (i.e. isn't running).
+    """
+    client = ssh_connect(host, username)
+    log_fn(f'SSH connected to {host}\n')
+    try:
+        lspad_dir = find_lspad_dir(client)
+        if not lspad_dir:
+            raise RuntimeError(
+                f'lSPAD.exe not found under {LSPAD_SEARCH_ROOT}\\{LSPAD_SUBDIR}')
+        _apply_mask(client, lspad_dir, lspad_port, mask_filename, mask_pixel,
+                   log_fn, mask_sink)
+    finally:
+        client.close()
+
+
 def launch_node(host: str, username: str,
                 mask_filename: str, log_fn,
                 lspad_port: int = SPAD_PORT,
@@ -475,36 +534,8 @@ def launch_node(host: str, username: str,
         time.sleep(2)   # let lSPAD finish GUI/hardware init before sending commands
 
         # 4. Apply pixel mask (generated single-pixel mask takes priority over a manual filename)
-        if mask_pixel is not None:
-            generated_filename = f'mask_{mask_pixel}.txt'
-            mask_path = lspad_dir + '\\' + generated_filename
-            log_fn(f'Generating and uploading {generated_filename} …\n')
-            mask_content = generate_mask_content(mask_pixel)
-            upload_file(client, mask_path, mask_content)
-            log_fn(f'Applying mask: {mask_path}\n')
-            send_lspad_cmd(client, lspad_port, f'M,{mask_path}',
-                          read_timeout=30.0, until='successful',
-                          log_fn=lambda s: log_fn(f'  {s}'))
-            if mask_sink is not None:
-                mask_sink(mask_path, mask_content.decode('ascii'))
-        elif mask_filename.strip():
-            mask_path = lspad_dir + '\\' + mask_filename
-            log_fn(f'Applying mask: {mask_path}\n')
-            send_lspad_cmd(client, lspad_port, f'M,{mask_path}',
-                          read_timeout=30.0, until='successful',
-                          log_fn=lambda s: log_fn(f'  {s}'))
-            # Read it back rather than assume: this branch never uploaded
-            # anything, so the file is whatever is on the node. A failure here
-            # must not fail the launch -- the mask is applied either way, and
-            # only the correlator's pair derivation needs the contents.
-            if mask_sink is not None:
-                try:
-                    mask_sink(mask_path,
-                              read_remote_file(client, mask_path).decode('ascii', 'replace'))
-                except Exception as exc:
-                    log_fn(f'Could not read {mask_path} back for the correlator: {exc}\n')
-        else:
-            log_fn('No mask specified — skipping mask command.\n')
+        _apply_mask(client, lspad_dir, lspad_port, mask_filename, mask_pixel,
+                   log_fn, mask_sink)
 
         # 5. Read detector status (R) before calibration
         dwell_freq = 0.0
