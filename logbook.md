@@ -234,3 +234,15 @@ Reverting to 2:1 fiber splitter, new spectral alignment.
 - We have no evidence for such a bunching signal in the data.
   - Likely dlambda > 0.2 nm due to blending of neighboring resolution elements with 50 micron fibers. We can estimate dlambda in Zemax and calculate the corresponding expected R. We need to buy a new telescope (or a new 2:1 fiber) to test this in reasonable time.
   - I'd like to try a green LED source instead of the LDLS (has been used successfully in the literature; maybe LDLS is somehow destroying the signal)
+
+  ## 31-08-26
+
+  - Estimated dlambda with Zemax: ~0.27-0.30 nm, corresponding to 3-4 ps coherence time. The expected coincidence rate in this case drops to R~0.1%.
+  - Added a 550 nm filter (10 nm fwhm) to the source relay (mildly suspecting m=2 order contamination from UV emission), realigned it to get ~2 Mcps/pixel.
+    - After 1 hour integration pinhole + filter, ~2e7 counts were accumulated in each bin, and no bin was consistent with 0.1% bunching excess. 
+    - There is probably something wrong beyond spectral blending (otherwise we'd see bunching in this case).
+    - In any case, we'll attempt to go to 25 micron fibers: adding lens back to the source, we negate the need for adjustable focus telescopes and can work with a two telescope setup.
+  - Switched to 2x25 micron fibers, 0.5" OAPs, collimating lens back in the source. New spectral alignment.
+    - LDLS --> SM fiber --> 550nm filter --> 400mm lens --> two 0.5" OAPs, ~30mm center to center distance --> two 25 micron fibers --> spectrographs --> ~1-2 Mcps per pix.
+    - 7 hour integration, pix 164 versus pix 164: bunching peak, SNR ~11, ~0.17% bunching excess at tau=13ns, total 5e7 counts per bin.
+    - 11 hour integration, pix 164 versus pix 164: bunching peak, SNR ~9, ~0.11% bunching excess at tau=13ns, total 8e7 counts per bin.
