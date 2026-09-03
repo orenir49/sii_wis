@@ -183,18 +183,6 @@ def run_session_loop(conn: socket.socket, log_fn=print,
                     handles[kid] = open(os.path.join(output_dir, fname), 'wb')
 
             if skipped_keys:
-                # Say it once per session, up front: a run that recorded nothing
-                # must not look like a normal one. Name the hooked pixels --
-                # those are the only ones whose photons survive anywhere, so
-                # that list is the session's entire record.
-                _hooked = sorted(k for k in subs if k < 320)
-                _shown  = (str(_hooked) if len(_hooked) <= 12
-                           else f'{_hooked[:12]}... ({len(_hooked)} total)')
-                log_fn(f'[session {session}] Write to disk OFF — NOTHING is written '
-                       f'this session: no px_*.bin, no sync files, and '
-                       f'{output_dir} is not created. Live-correlated pixel(s) '
-                       f'{_shown} stream to the correlator only; everything else '
-                       f'is discarded. This log is the only record of the run.')
                 # A directory left over from an earlier run is the one way this
                 # can still mislead: its px_*.bin are NOT this run's data.
                 try:

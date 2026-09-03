@@ -97,7 +97,13 @@ class NodePanel:
         self._master_dwell_q: queue.Queue = queue.Queue()  # master_dwell (key 320)
         self._output_dir: str | None = None
         self._drain_active = False   # periodic discard of the post-calibration dwell tap
-        self._ssh_creds: tuple | None = None       # (host, user) set after Launch
+        self._ssh_creds: tuple | None = None       # (host, user) set at Launch, before the thread starts
+        # Bumped on every Launch and on every Abort. A background launch thread's
+        # GUI-facing callbacks are tagged with the epoch active when they were
+        # started, and dropped if it no longer matches -- so aborting (or
+        # starting a fresh Launch) can never be clobbered by a stale thread that
+        # finishes, succeeds or fails later.
+        self._launch_epoch = 0
         # The mask this node is actually running, captured at the moment
         # launch_node applied it. Masks exist only in the node's own lSPAD
         # directory, so this — not any file on the master — is what the
@@ -170,7 +176,7 @@ class NodePanel:
         self._ctrl_lbl.grid(row=2, column=0, columnspan=2, sticky='w', padx=8, pady=(2, 2))
 
         # One button for the workflow actually used -- Launch to bring a node
-        # up, Disconnect to bring it down.
+        # up, Abort to bail out mid-launch, Disconnect to bring it down.
         self._primary_btn = ttk.Button(frame, text='Launch', width=11,
                                        command=self._on_primary)
         self._primary_btn.grid(row=2, column=2, columnspan=4, sticky='e', padx=(0, 8), pady=4)
@@ -186,11 +192,13 @@ class NodePanel:
     # ------------------------------------------------------------------
 
     def _on_primary(self) -> None:
-        """The one always-visible button: Launch when idle, Disconnect once
-        connected. 'launching' leaves the button disabled, so nothing to do."""
+        """The one always-visible button: Launch when idle, Abort while
+        launching, Disconnect once connected."""
         if self._state == 'idle':
             self._on_launch()
-        elif self._state != 'launching':
+        elif self._state == 'launching':
+            self._on_abort_launch()
+        else:
             self._disconnect()
 
     def _connect(self) -> None:
@@ -609,10 +617,39 @@ class NodePanel:
         if fields is None:
             return
         mask, mask_pixel = fields
+        self._launch_epoch += 1
+        epoch = self._launch_epoch
+        # Set here, on the GUI thread, before the thread even starts -- so an
+        # Abort clicked in the first instant still has creds to shut down with.
+        self._ssh_creds = (host, username)
         threading.Thread(
             target=self._ssh_launch,
-            args=(host, username, mask, mask_pixel),
+            args=(host, username, mask, mask_pixel, epoch),
             daemon=True).start()
+
+    def _on_abort_launch(self) -> None:
+        """Abort a Launch in progress.
+
+        The background thread (SSH connect, mask apply, TDC calibration...)
+        is a daemon thread with no cancellation point, so this can't stop it
+        mid-step -- it can only make sure the GUI stops waiting on it and
+        best-effort tear down whatever it may already have started remotely.
+        Bumping the epoch means the thread's own success/failure handlers,
+        whenever they do run, are dropped instead of clobbering the state
+        this sets.
+        """
+        self._launch_epoch += 1
+        self.log_fn(f'Node {self.node_id}: launch aborted by user.\n')
+        self._set_ctrl_status('idle')
+        self._trigger_remote_shutdown()
+
+    def _gui_guarded(self, epoch: int, fn) -> None:
+        """Like _gui, but dropped if `epoch` is no longer the active launch
+        epoch -- i.e. this launch was aborted or superseded by a new one."""
+        def _wrapped():
+            if epoch == self._launch_epoch:
+                fn()
+        self._gui(_wrapped)
 
     def _on_refresh_mask(self) -> None:
         """Re-apply the mask/pixel fields to the already-running lSPAD, without
@@ -628,14 +665,15 @@ class NodePanel:
             self.log_fn(f'Node {self.node_id}: no mask specified — nothing to apply.\n')
             return
         host, username = self.ip_var.get().strip(), self.ssh_user_var.get().strip()
+        epoch = self._launch_epoch
         self._mask_refresh_btn.config(state='disabled')
         threading.Thread(
             target=self._refresh_mask_thread,
-            args=(host, username, mask, mask_pixel),
+            args=(host, username, mask, mask_pixel, epoch),
             daemon=True).start()
 
     def _refresh_mask_thread(self, host: str, username: str,
-                             mask: str, mask_pixel: int | None) -> None:
+                             mask: str, mask_pixel: int | None, epoch: int) -> None:
         """Background thread for _on_refresh_mask."""
         def _log(msg: str) -> None:
             self.log_fn(f'[N{self.node_id}] {msg}' if msg.endswith('\n')
@@ -644,7 +682,7 @@ class NodePanel:
             ssh_launcher.apply_mask(
                 host=host, username=username, mask_filename=mask,
                 mask_pixel=mask_pixel, log_fn=_log,
-                mask_sink=self._record_applied_mask)
+                mask_sink=lambda rp, text: self._record_applied_mask(rp, text, epoch))
         except Exception as exc:
             self.log_fn(f'Node {self.node_id}: mask refresh failed — {exc}\n')
         finally:
@@ -652,11 +690,16 @@ class NodePanel:
                 state='normal' if self.is_ready() else 'disabled'))
 
     def _ssh_launch(self, host: str, username: str,
-                    mask: str, mask_pixel: int | None) -> None:
-        """Background thread: run full node launch sequence then auto-connect."""
-        self._gui(lambda: self._set_ctrl_status('launching'))
+                    mask: str, mask_pixel: int | None, epoch: int) -> None:
+        """Background thread: run full node launch sequence then auto-connect.
+
+        `epoch` was the active launch epoch when this thread was started; every
+        GUI-facing outcome below is routed through `_gui_guarded(epoch, ...)`
+        so an Abort (or a fresh Launch) in the meantime makes this thread's
+        eventual result a no-op instead of clobbering whatever state followed.
+        """
+        self._gui_guarded(epoch, lambda: self._set_ctrl_status('launching'))
         self.log_fn(f'Node {self.node_id}: launching remote node …\n')
-        self._ssh_creds = (host, username)   # store early so shutdown works on any error
 
         def _log(msg: str) -> None:
             self.log_fn(f'[N{self.node_id}] {msg}' if msg.endswith('\n')
@@ -675,23 +718,23 @@ class NodePanel:
                 host=host, username=username,
                 mask_pixel=mask_pixel, raw_dump=raw_dump,
                 mask_filename=mask, log_fn=_log,
-                mask_sink=self._record_applied_mask)
+                mask_sink=lambda rp, text: self._record_applied_mask(rp, text, epoch))
             time.sleep(3)           # give node.py command server time to start
-            self._gui(self._connect)
+            self._gui_guarded(epoch, self._connect)
         except ssh_launcher.UncommittedChangesError as exc:
             changes = str(exc)
-            self._gui(lambda: messagebox.showwarning(
+            self._gui_guarded(epoch, lambda: messagebox.showwarning(
                 'Uncommitted Changes',
                 f'Node {self.node_id} has uncommitted changes on the sender — '
                 f'git pull skipped.\n\n{changes}'))
             self._trigger_remote_shutdown()
-            self._gui(lambda: self._set_ctrl_status('idle'))
+            self._gui_guarded(epoch, lambda: self._set_ctrl_status('idle'))
         except Exception as exc:
             self.log_fn(f'Node {self.node_id}: launch failed — {exc}\n')
             self._trigger_remote_shutdown()
-            self._gui(lambda: self._set_ctrl_status('idle'))
+            self._gui_guarded(epoch, lambda: self._set_ctrl_status('idle'))
 
-    def _record_applied_mask(self, remote_path: str, text: str) -> None:
+    def _record_applied_mask(self, remote_path: str, text: str, epoch: int) -> None:
         """launch_node's mask_sink: remember the mask the detector is running.
 
         Called from the launch thread. Storing a value (not a path) is the
@@ -699,11 +742,17 @@ class NodePanel:
         creates it there, so there is nothing on the master to open. Also
         mirrored into mask_var so the field names the file that was really
         applied rather than whatever was typed.
+
+        Dropped outright if this launch has since been aborted or superseded
+        (`epoch` stale): the mask is real on the node, but `_trigger_remote_shutdown`
+        has already cleared `_applied_mask` and there is nothing left to record it for.
         """
+        if epoch != self._launch_epoch:
+            return
         name = os.path.basename(remote_path.replace('\\', '/'))
         self._applied_mask = pair_map.MaskSource(
             origin=f'node {self.node_id}: {remote_path}', text=text)
-        self._gui(lambda: self.mask_var.set(name))
+        self._gui_guarded(epoch, lambda: self.mask_var.set(name))
         # The mask is already on the hardware by now, so a parse problem here is
         # bookkeeping, not a reason to fail the launch this runs inside.
         try:
@@ -767,7 +816,7 @@ class NodePanel:
         elif state == 'launching':
             self.ctrl_status_var.set('● Launching …')
             self._ctrl_lbl.config(fg='#cc9900')
-            self._primary_btn.config(state='disabled')
+            self._primary_btn.config(text='Abort', state='normal')
             for e in entries:
                 e.config(state='disabled')
             self._mask_entry.config(state='disabled')
@@ -1014,29 +1063,10 @@ class ReceiverGUI:
     # ------------------------------------------------------------------
 
     def _on_write_mode_change(self) -> None:
-        """Log the choice, and say when it takes effect.
-
-        run_session_loop decides which files to open at session start, so a
-        mode change during a run applies from the next data connection —
-        saying so beats leaving someone to wonder why px_*.bin kept growing.
-        """
+        """Apply the choice. Takes effect from the next data connection,
+        since run_session_loop decides which files to open at session start."""
         self._push_write_disk_state()
         self._push_diff_capture_state()
-        mode = self.write_mode_var.get()
-        if mode == 'timestamps':
-            self._enqueue_log('Write to disk: TIMESTAMPS — every pixel is persisted as usual.\n')
-        elif mode == 'diffs':
-            self._enqueue_log(
-                'Write to disk: TIME DIFFERENCES — raw px_*.bin will NOT be '
-                'written; the correlator streams each derived pair\'s filtered '
-                'time differences to spad_data\\diffs\\... instead, consolidated '
-                'into .npz on Disable/Reset or Save. Applies from the next data '
-                'connection.\n')
-        else:
-            self._enqueue_log(
-                'Write to disk: NONE — NOTHING will be written: no px_*.bin, no '
-                'sync files, no output directory. Hooked pixels go to the '
-                'correlator only. Applies from the next data connection.\n')
 
     def _refresh_write_mode_lock(self) -> None:
         """Lock the radios while the flag is already committed.
@@ -1463,9 +1493,7 @@ class ReceiverGUI:
                                      np.empty(0, dtype=np.int64)]
                          for n in (self.node1, self.node2)}
         self._cal_deadline = time.time() + CAL_MAX_WAIT_S
-        self._enqueue_log(
-            f'Sparse cal: collecting one waveform period '
-            f'({SPARSE_CAL_WAVEFORM_S:.2f} s) of dwell…\n')
+        self._enqueue_log('Running dwell offset calibration…\n')
         self._set_cal_status(
             f'● Calibrating dwell offset ({SPARSE_CAL_WAVEFORM_S:.2f} s)…',
             color='#cc8800')
@@ -1549,17 +1577,6 @@ class ReceiverGUI:
             self.node2.start_dwell_drain()
             return
 
-        # Capture diagnostics: a span well short of the window means dwell data
-        # stopped arriving early (sender-side queue lag); a full span with too
-        # few events means pulses are genuinely being missed.
-        for label, arr in (('node1', t1), ('node2', t2)):
-            if arr.size >= 2:
-                span_s = float(arr.max() - arr.min()) / 1e12
-                self._enqueue_log(
-                    f'  {label}: {arr.size} dwell events over {span_s:.2f} s '
-                    f'of a {SPARSE_CAL_WAVEFORM_S:.2f} s target '
-                    f'({arr.size / max(span_s, 1e-9):.1f} /s)\n')
-
         cluster_tol = 10_000  # 10 ns: excludes ±32 ns TDC doublet sidelobes
         slave_offset_ps, slave_details = estimate_offset(
             t1, t2, cluster_tol=cluster_tol, return_details=True)
@@ -1572,23 +1589,13 @@ class ReceiverGUI:
 
         slave_offset = int(round(slave_offset_ps))
 
-        self._enqueue_log('Automatic dwell calibration\n')
-        if master_details is not None and not np.isnan(master_offset_ps):
-            self._enqueue_log(
-                f'  Master offset = {int(round(master_offset_ps)):+,} ps  '
-                f'({master_details["n_matched"]} matched pairs, '
-                f'SEM = {master_details["sem"]:.0f} ps, '
-                f'streams: {master_details["n1"]} / {master_details["n2"]} events)\n'
-            )
-        else:
-            self._enqueue_log(
-                f'  Master offset: unavailable ({m1.size} / {m2.size} master dwell events)\n'
-            )
+        # Master offset above is still fit (diagnostic only -- master_offset_ps
+        # is never applied, only slave_offset is), but logging it, the
+        # per-node collection stats, and the SEM/stream-count detail was noise
+        # on every run. Only the number actually used goes to the log.
         self._enqueue_log(
-            f'  Slave offset  = {slave_offset:+,} ps  '
-            f'({slave_details["n_matched"]} matched pairs, '
-            f'SEM = {slave_details["sem"]:.0f} ps, '
-            f'streams: {slave_details["n1"]} / {slave_details["n2"]} events)\n'
+            f'Slave offset = {slave_offset:+,} ps '
+            f'({slave_details["n_matched"]} matched pairs)\n'
         )
         self._enqueue_log('Acquiring\n')
 
