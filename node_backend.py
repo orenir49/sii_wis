@@ -92,17 +92,16 @@ PIXMAP = np.array([
 SPECIAL = {225: 'dwell', 226: 'line', 228: 'frame'}
 RESET_ID          = 234      # coarse-counter reset marker
 OVERFLOW_ID       = 247      # detector FIFO overflow: photons already lost
-FILE_START_ID     = 239      # lSPAD file/stream-start marker
+FILE_START_ID     = 239      # lSPAD file/stream-start marker -- expected once per session
 KNOWN_MARKER_IDS  = np.array(sorted(SPECIAL) + [RESET_ID, OVERFLOW_ID])
 
-# Traffic a healthy stream is *made of*: photons, the coarse-counter reset, and
-# the dwell/line/frame sync markers. Every other id is abnormal and is reported
-# live by report_abnormal() — including OVERFLOW_ID, which is "known" only in the
-# sense that we know what it means.
-NORMAL_MARKER_IDS = np.array(sorted(SPECIAL) + [RESET_ID])
+# Traffic a healthy stream is *made of*: photons, the coarse-counter reset, the
+# dwell/line/frame sync markers, and the file-start marker. Every other id is
+# abnormal and is reported live by report_abnormal() — including OVERFLOW_ID,
+# which is "known" only in the sense that we know what it means.
+NORMAL_MARKER_IDS = np.array(sorted(SPECIAL) + [RESET_ID, FILE_START_ID])
 MARKER_NAMES = {
     OVERFLOW_ID:   'FIFO overflow, photons already lost',
-    FILE_START_ID: 'file-start marker',
 }
 ANOM_LOG_S     = 2.0   # min seconds between rollup lines for one (chip, id)
 ANOM_MAX_FIRST = 40    # cap on distinct first-sighting lines per session
