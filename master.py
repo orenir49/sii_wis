@@ -80,12 +80,14 @@ class NodePanel:
                  log_fn=None,
                  get_hooks_fn=None,
                  get_write_hooked_fn=None,
+                 get_wire_mode_fn=None,
                  on_first_data_fn=None) -> None:
         self.root          = root
         self.node_id       = node_id
         self.log_fn        = log_fn
         self._get_hooks_fn = get_hooks_fn
         self._get_write_hooked_fn = get_write_hooked_fn
+        self._get_wire_mode_fn = get_wire_mode_fn
         self._on_first_data_fn = on_first_data_fn
 
         self._ctrl_sock:   socket.socket | None = None
@@ -279,6 +281,7 @@ class NodePanel:
         recv_port  = int(self.data_port_var.get())
         output_dir = f'./spad_data/node{self.node_id}'
         self._output_dir = output_dir
+        wire_mode = self._get_wire_mode_fn() if self._get_wire_mode_fn else 'baseline'
         self._send_ctrl({
             'cmd':        'start',
             'recv_host':  recv_host,
@@ -286,6 +289,7 @@ class NodePanel:
             'output_dir': output_dir,
             'duration':   duration,
             'test':       test,
+            'wire_mode':  wire_mode,
         })
 
     def send_intensity(self, duration: float) -> None:
@@ -507,6 +511,19 @@ class NodePanel:
             # mid-run must not leave half a pixel's timestamps on disk.
             write_hooked = (self._get_write_hooked_fn()
                             if self._get_write_hooked_fn else True)
+            expected_wire_mode = (self._get_wire_mode_fn()
+                                  if self._get_wire_mode_fn else 'baseline')
+
+            def _check_wire_mode(observed: str) -> None:
+                # The sender was told expected_wire_mode via the same START
+                # command that carried duration/output_dir; this is a
+                # correctness assertion that the wire agrees, not the
+                # primary source of truth (node and master are always the
+                # same git commit in this lab, launched together).
+                if observed != expected_wire_mode:
+                    raise RuntimeError(
+                        f'wire mode mismatch: master expected '
+                        f'{expected_wire_mode!r}, sender used {observed!r}')
 
             log_fn = lambda m: self.log_fn(
                 f'[N{self.node_id}] {m}' if m.endswith('\n') else f'[N{self.node_id}] {m}\n')
@@ -523,6 +540,7 @@ class NodePanel:
                             (lambda: self._on_first_data_fn(self.node_id))
                             if self._on_first_data_fn else None),
                         write_hooked=write_hooked,
+                        on_wire_mode=_check_wire_mode,
                     )
             except Exception:
                 # Never let the accept loop die — otherwise the next START connects
@@ -924,6 +942,7 @@ class ReceiverGUI:
         self._build_ui()
         self._push_write_disk_state()    # correlators start out agreeing with the mode
         self._push_diff_capture_state()
+        self._push_wire_mode_state()
         self._refresh_write_mode_lock()
         # Only now do the NodePanels exist, so this is the first moment the
         # multi-pair window can read their mask fields.
@@ -944,6 +963,13 @@ class ReceiverGUI:
         # get_write_hooked_fn. 'timestamps' by default: keeping the data is
         # the safe default, and not keeping it has to be a deliberate click.
         self.write_mode_var = tk.StringVar(value='timestamps')  # none|timestamps|diffs
+        # Live wire-encoding bake-off confirmation
+        # (docs/raw_timestamp_wire_encoding_bakeoff.md). 'baseline' by
+        # default: only available for testing when write_mode isn't
+        # 'timestamps' (raw/delta bytes must never be written to px_*.bin
+        # as if they were plain int64 -- see master_backend.run_session_
+        # loop's own hard-fail backstop for the same reason).
+        self.wire_mode_var = tk.StringVar(value='baseline')  # baseline|raw|delta
 
         nodes_frame = ttk.Frame(self.root)
         nodes_frame.grid(row=0, column=0, sticky='ew')
@@ -958,6 +984,7 @@ class ReceiverGUI:
                                get_hooks_fn=lambda: merge_hooks(
                                    *(c.hooks_node1 for c in self._correlators)),
                                get_write_hooked_fn=lambda: self.write_mode_var.get() == 'timestamps',
+                               get_wire_mode_fn=lambda: self.wire_mode_var.get(),
                                on_first_data_fn=self._on_node_first_data)
         self.node2 = NodePanel(nodes_frame, self.root,
                                node_id=2,
@@ -969,6 +996,7 @@ class ReceiverGUI:
                                get_hooks_fn=lambda: merge_hooks(
                                    *(c.hooks_node2 for c in self._correlators)),
                                get_write_hooked_fn=lambda: self.write_mode_var.get() == 'timestamps',
+                               get_wire_mode_fn=lambda: self.wire_mode_var.get(),
                                on_first_data_fn=self._on_node_first_data)
 
         # ── acquisition controls ───────────────────────────────────────
@@ -1012,6 +1040,31 @@ class ReceiverGUI:
         tk.Label(acq, textvariable=self._write_lock_var, anchor='w',
                  fg='#aa6600', wraplength=560, justify='left').grid(
             row=4, column=0, columnspan=6, sticky='w', padx=8, pady=(0, 6))
+
+        # Live wire-encoding bake-off confirmation -- only meaningful (and
+        # only enabled) when write-to-disk is off px_*.bin's own format, same
+        # gate as diffs above.
+        wire_mode_frame = ttk.Frame(acq)
+        wire_mode_frame.grid(row=5, column=0, columnspan=6, sticky='w',
+                             padx=8, pady=(0, 6))
+        ttk.Label(wire_mode_frame, text='Wire encoding (testing):').grid(
+            row=0, column=0, sticky='w', padx=(0, 8))
+        self._wire_baseline_rb = ttk.Radiobutton(
+            wire_mode_frame, text='Baseline', variable=self.wire_mode_var,
+            value='baseline', command=self._on_wire_mode_change)
+        self._wire_baseline_rb.grid(row=0, column=1, sticky='w', padx=(0, 12))
+        self._wire_raw_rb = ttk.Radiobutton(
+            wire_mode_frame, text='Raw columns', variable=self.wire_mode_var,
+            value='raw', command=self._on_wire_mode_change)
+        self._wire_raw_rb.grid(row=0, column=2, sticky='w', padx=(0, 12))
+        self._wire_delta_rb = ttk.Radiobutton(
+            wire_mode_frame, text='Delta-encoded', variable=self.wire_mode_var,
+            value='delta', command=self._on_wire_mode_change)
+        self._wire_delta_rb.grid(row=0, column=3, sticky='w')
+        self._wire_lock_var = tk.StringVar(value='')
+        tk.Label(acq, textvariable=self._wire_lock_var, anchor='w',
+                 fg='#aa6600', wraplength=560, justify='left').grid(
+            row=6, column=0, columnspan=6, sticky='w', padx=8, pady=(0, 6))
 
         ttk.Label(acq, text='Duration (s):').grid(row=0, column=3, sticky='w', padx=(12, 4))
         self.duration_var = tk.StringVar(value='1')
@@ -1067,6 +1120,10 @@ class ReceiverGUI:
         since run_session_loop decides which files to open at session start."""
         self._push_write_disk_state()
         self._push_diff_capture_state()
+        self._refresh_write_mode_lock()
+
+    def _on_wire_mode_change(self) -> None:
+        self._push_wire_mode_state()
 
     def _refresh_write_mode_lock(self) -> None:
         """Lock the radios while the flag is already committed.
@@ -1079,13 +1136,19 @@ class ReceiverGUI:
         """
         locked = any(n.write_flag_is_committed() for n in (self.node1, self.node2))
         radios = (self._write_none_rb, self._write_ts_rb, self._write_diff_rb)
+        wire_radios = (self._wire_baseline_rb, self._wire_raw_rb, self._wire_delta_rb)
         if locked:
             for rb in radios:
+                rb.configure(state='disabled')
+            for rb in wire_radios:
                 rb.configure(state='disabled')
             self._write_lock_var.set(
                 'Locked: the write choice is fixed when a node\'s data connection '
                 'is accepted and holds for every session on it. Disconnect a node '
                 'to change it.')
+            self._wire_lock_var.set(
+                'Locked: the wire-encoding choice is fixed the same way as the '
+                'write choice, for the same reason. Disconnect a node to change it.')
         else:
             for rb in radios:
                 rb.configure(state='normal')
@@ -1104,6 +1167,24 @@ class ReceiverGUI:
                     'disabled, so "Save time differences" has nothing to '
                     'capture.\n')
             self._write_lock_var.set('')
+
+            # Wire-mode testing (docs/raw_timestamp_wire_encoding_bakeoff.md)
+            # is only meaningful, and only offered, when raw timestamps are
+            # NOT being written verbatim -- see master_backend.
+            # run_session_loop's own hard-fail for why 'timestamps' + a
+            # non-baseline wire mode must never reach the wire at all.
+            wire_ready = (self.write_mode_var.get() != 'timestamps')
+            for rb in (self._wire_raw_rb, self._wire_delta_rb):
+                rb.configure(state='normal' if wire_ready else 'disabled')
+            self._wire_baseline_rb.configure(state='normal')
+            if not wire_ready and self.wire_mode_var.get() != 'baseline':
+                self.wire_mode_var.set('baseline')
+                self._push_wire_mode_state()
+                self._enqueue_log(
+                    'Wire encoding reverted to BASELINE — "Save timestamps to '
+                    'disk" writes raw wire bytes verbatim, which only the '
+                    'baseline format can be read back as plain int64.\n')
+            self._wire_lock_var.set('')
         if locked != getattr(self, '_write_locked_last', False):
             self._write_locked_last = locked
             self._enqueue_log(
@@ -1137,6 +1218,16 @@ class ReceiverGUI:
             setter = getattr(c, 'set_diff_capture_enabled', None)
             if setter is not None:
                 setter(on)
+
+    def _push_wire_mode_state(self) -> None:
+        """Tell every correlator which wire encoding to expect when it next
+        builds a ChannelGraph (at Enable()) -- live wire-encoding bake-off
+        confirmation (docs/raw_timestamp_wire_encoding_bakeoff.md)."""
+        mode = self.wire_mode_var.get()
+        for c in self._correlators:
+            setter = getattr(c, 'set_wire_mode', None)
+            if setter is not None:
+                setter(mode)
 
     def _start_all(self) -> None:
         try:

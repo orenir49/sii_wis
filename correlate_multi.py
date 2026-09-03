@@ -205,6 +205,13 @@ class MultiCorrelateWindow(tk.Toplevel):
         # px_*.bin writes, this one tracks streaming filtered per-pair time
         # differences). Told by ReceiverGUI.set_diff_capture_enabled.
         self._diff_capture_enabled = False
+        # Live wire-encoding bake-off confirmation
+        # (docs/raw_timestamp_wire_encoding_bakeoff.md): 'baseline'/'raw'/
+        # 'delta', told by ReceiverGUI.set_wire_mode, same pattern as
+        # set_write_to_disk/set_diff_capture_enabled. Bound into a
+        # ChannelGraph only at Enable() -- changing it while enabled has no
+        # effect until Disable -> re-Derive -> re-Enable.
+        self._wire_mode = 'baseline'
         self._diff_files: dict = {}    # (p1, p2) -> open file handle, this session
         self._diff_paths: dict = {}    # (p1, p2) -> path, kept after close for consolidation
         self._diff_session_dir: str | None = None
@@ -432,6 +439,11 @@ class MultiCorrelateWindow(tk.Toplevel):
         -- diff-capture never writes px_*.bin, so it doesn't change what an
         overload means."""
         self._diff_capture_enabled = bool(on)
+
+    def set_wire_mode(self, mode: str) -> None:
+        """Told by ReceiverGUI. Read at the next Enable() -- a graph already
+        built keeps whatever mode it was constructed with."""
+        self._wire_mode = mode
 
     # ------------------------------------------------------------------
     # Pair derivation
@@ -704,12 +716,14 @@ class MultiCorrelateWindow(tk.Toplevel):
         except Exception as exc:
             self.status_var.set(f'Error: {exc}')
             return
-        self._graph = ChannelGraph(self._pairs, tmax, offset=0)
+        self._graph = ChannelGraph(self._pairs, tmax, offset=0, wire_mode=self._wire_mode)
         self._active = True
         self._set_accumulating(False)
         self._held = False
         self.status_var.set(
-            f'Enabled — {len(self._pairs)} pairs, waiting for DWELL calibration …')
+            f'Enabled — {len(self._pairs)} pairs'
+            + (f' ({self._wire_mode} wire mode)' if self._wire_mode != 'baseline' else '')
+            + ', waiting for DWELL calibration …')
 
     def _disable(self) -> None:
         self._active = False
