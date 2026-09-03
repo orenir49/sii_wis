@@ -188,24 +188,53 @@ def parse_capture(path):
             coarse[phys_ok], fine[phys_ok])
 
 
+def _local_slot_table():
+    """Fallback for a node_backend.py that predates Phase 1 (no SLOT_DEST
+    attribute yet -- this bench is meant to run standalone on whatever
+    branch is actually deployed, per the plan's own Branching note). Built
+    the same way Phase 1's table is, from master_loc/slave_loc, which exist
+    on both sides of that change -- so results agree with SLOT_DEST once a
+    node does have it, just recomputed locally when it doesn't."""
+    dest_keys: list = []
+    slot_dest = np.full(N_SLOTS, -1, dtype=np.int32)
+    for uid, loc in enumerate(node_backend.slave_loc):
+        slot_dest[uid] = len(dest_keys)
+        dest_keys.append(int(loc))
+    for uid, loc in enumerate(node_backend.master_loc):
+        slot_dest[256 + uid] = len(dest_keys)
+        dest_keys.append(int(loc))
+    return slot_dest, dest_keys, len(dest_keys)
+
+
+N_SLOTS = 512
+
+
+def _slot_table():
+    if hasattr(node_backend, 'SLOT_DEST'):
+        return node_backend.SLOT_DEST, node_backend.DEST_KEYS, node_backend.N_PHYS_DEST
+    return _local_slot_table()
+
+
 def extract_pixel_streams(is_mast, pixel_nr, reset_arr, coarse, fine):
     """{loc: (reset, coarse, fine)} in arrival order, one entry per physical
-    pixel location -- reuses node_backend's own Phase 1 slot table (the same
-    fused-key bucketing the live parser now uses) so "which events belong to
-    this pixel" can never disagree with production."""
+    pixel location -- reuses node_backend's own Phase 1 slot table when
+    present (the same fused-key bucketing the live parser uses, so "which
+    events belong to this pixel" can never disagree with production), or an
+    equivalent computed locally otherwise (see _local_slot_table)."""
+    slot_dest, dest_keys, n_phys_dest = _slot_table()
     slot = pixel_nr.astype(np.uint16) | (is_mast.astype(np.uint16) << 8)
-    dest = node_backend.SLOT_DEST[slot]
+    dest = slot_dest[slot]
     order = np.argsort(dest, kind='stable')
     dest_sorted = dest[order]
-    counts = np.bincount(dest_sorted, minlength=node_backend.N_PHYS_DEST)
+    counts = np.bincount(dest_sorted, minlength=n_phys_dest)
     bounds = np.concatenate(([0], np.cumsum(counts)))
 
     streams = {}
-    for d in range(node_backend.N_PHYS_DEST):
+    for d in range(n_phys_dest):
         if counts[d] == 0:
             continue
         idx = order[bounds[d]:bounds[d + 1]]
-        loc = node_backend.DEST_KEYS[d]
+        loc = dest_keys[d]
         streams[loc] = (reset_arr[idx], coarse[idx], fine[idx])
     return streams
 
@@ -497,14 +526,19 @@ def run_live_ceiling(path, candidate: str, queue_maxsize=200) -> dict:
         reset_arr = np.where(is_mast, cum_reset_m, cum_reset_s)
 
         node_backend.correct_boundary_epochs(coarse, reset_arr, pixel_nr, is_mast)
-        time_ps = combine_to_int64(reset_arr, coarse, fine)
 
-        if candidate == 'delta':
-            payload = encode_deltas(time_ps)
-        elif candidate == 'raw':
+        if candidate == 'raw':
+            # The whole point of this candidate is skipping the O(chunk)
+            # combine -- paying it here for every record (as an earlier cut
+            # of this harness did) silently made "raw" measure combine+pack,
+            # strictly MORE work than baseline, and hid its real advantage.
+            # Only the two boundary records are combined, for lag bookkeeping.
             payload = pack_raw_columns(reset_arr, coarse, fine)
+            time_ps = combine_to_int64(reset_arr[[0, -1]], coarse[[0, -1]], fine[[0, -1]])
         else:
-            payload = time_ps.tobytes()
+            time_ps = combine_to_int64(reset_arr, coarse, fine)
+            payload = encode_deltas(time_ps) if candidate == 'delta' else time_ps.tobytes()
+            time_ps = time_ps[[0, -1]]
 
         stats['records'] += len(raw)
         if stats['first_ts'] is None:
