@@ -266,3 +266,12 @@ Reverting to 2:1 fiber splitter, new spectral alignment.
 - Spectral alignment to start the day.
 - Correlating different pixel pairs to check wavelength dependence of g2.
 - So far: 143, 151, 164, 168, 180.
+
+## 03-09-26
+- Pixels 127, 137 seem to have lower bunching rate than the rest (no bunching observed in 1.5 hours)
+- With new collimator and 10 micron fiber, after spectral alignment, no bunching observed at the expected rate (750mm + 10 microns, 0.5" OAPs @ 30mm distance- expected rate 1%).
+- New optical alignment: ~2 Mcps/pixel. Went to test the wire-encoding-bakeoff branch live (baseline/raw/delta) before merging anything -- found the live parser falling behind at rates the offline bench said should be fine, well below the flood-overload regime.
+  - Root-caused it: NOT the wire encoding (baseline and raw failed identically), not node1's CPU (idle 5-19%, full turbo, zero throttling when isolated), not a Phase 1 regression -- it's the network. Both nodes' USB 2.5GbE adapters share one 1GbE unmanaged switch uplinking to master's 2.5GbE port. Node1 vs node2 running simultaneously contend for that one link; node1 consistently lost the contention. Confirmed decisively: node1 alone, same mask/rate that had just failed with node2 connected, ran completely clean (0.1s lag vs 55s before).
+  - Added Windows Defender exclusions (sii_wis dir + python.exe/pythonw.exe/lSPAD.exe) on both nodes and the master -- genuinely helped node2's headroom, but wasn't node1's actual problem.
+  - Fix for now: give node1 and node2 each their own dedicated cable to master, bypassing the shared switch. Topology recommendation for scaling to dozens of nodes written up in docs/network_topology.md.
+  - Wire-encoding live confirmation itself succeeded once run at a rate the (then-shared) network could sustain: baseline/raw/delta gave statistically indistinguishable g2 results (833M/831M/834M total taus, matching mean/std) at pixel 164, 2 min each -- see docs/raw_timestamp_wire_encoding_bakeoff.md.

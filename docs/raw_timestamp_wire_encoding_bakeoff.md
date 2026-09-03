@@ -228,6 +228,146 @@ gets decided against — a candidate can win the CPU-seconds table and still
 lose here if it leaves less headroom on a machine or link that is already
 close to its ceiling.
 
+### Preliminary results (2026-09-03, `tools/bench_wire_encoding.py`)
+
+Run against the 81-pixel flood capture (`spad_data/captures/cap_node{1,2}.raw`,
+~292.57M records/node) on the real node PCs over SSH (lSPAD not running —
+read-only, no live acquisition at risk), plus the master-side decode figure
+from the same capture run on the master PC directly. Item 2's live-ceiling
+harness caught its own bug on first run: an early cut of `run_live_ceiling`
+combined to int64 unconditionally for every candidate, so "raw" measured
+combine+pack (strictly *more* work than baseline) instead of skipping the
+combine as the candidate is supposed to — it came out slower than baseline,
+which was the tell. Fixed to combine only the two boundary records per
+chunk for lag bookkeeping when candidate is `raw`; re-run below.
+
+| | node1 | node2 |
+|---|---|---|
+| busiest pixel, events | loc 163, 4.61M | loc 181, 5.61M |
+| wire bytes/event (raw / delta / absolute) | 10.00 / 4.00 / 8.0 | 10.00 / 4.00 / 8.0 |
+| delta vs absolute compression | 2.00x | 2.00x |
+| node-side encode: raw / delta (ev/s) | 9.86e7 / 2.66e7 | 7.17e7 / 4.18e7 |
+| kernel: int64 sub / 3-term weighted | 0.386s / 0.563s (1.46x) | 0.373s / 0.587s (1.58x) |
+| live ceiling, no shipping (baseline / raw / delta) | 23.7s / 24.4s / 30.8s | 28.6s / 29.9s / 35.3s |
+| live ceiling queue_max (baseline / raw / delta) | 17 / 12 / 25 (cap 200) | 13 / 7 / 19 (cap 200) |
+| peak RSS during full run | 28.7 GB | 26.7 GB |
+
+Master-side decode (this capture, run on the master PC, not a node):
+**~7.7-9.3e8 events/s**, comfortably faster than either node's own encode
+rate — confirms decode is not where this decision will bind.
+
+**Reading these numbers:**
+- Wire compression lands exactly on the ~2.00x design prediction on real
+  data, both nodes, no surprises.
+- `raw` and `baseline` are close (`raw` slightly higher only because it
+  still pays a per-chunk two-record combine for lag bookkeeping, not the
+  full-array one) — skipping the combine alone is not where raw's cost
+  story would be won or lost; the earlier bug (see above) is why an even
+  closer number isn't shown here.
+- `delta` is the clear loser on **node-side live ceiling** (~30-35s vs
+  ~24-30s to chew through the same 292M records, no shipping) — the
+  encode_deltas() segment-detection + packing pass costs real node CPU
+  that neither baseline nor raw pay. This is the sharpest data point so
+  far against delta-encoding, on the metric (item 2) this branch was
+  started to be able to measure at all.
+- `queue_max` stayed far under the 200-slot cap for all three candidates
+  on both nodes (this consumer only discards, so it can never itself be
+  the bottleneck) — the elapsed-time numbers above are the load-bearing
+  ones, not queue depth.
+- Peak RSS (27-29 GB) is dominated by this harness's own whole-capture
+  load (see the Known limitation in the `bench_wire_encoding.py` commit),
+  not a per-candidate figure — not yet informative for the hardware-demand
+  table without subprocess isolation per item.
+
+**Not yet done**: items 1/3/5's CPU%/RSS columns from `with_resource_sample`
+(the same whole-process-RSS caveat above applies), the ethernet
+throughput/packet-rate half of item 6, and per-candidate RAM isolation.
+Wire bytes and kernel-cost figures are location-independent and were
+already cross-checked against this same capture on the master PC earlier
+in this branch's work, matching the node numbers above.
+
+### Second rate regime: the 40-pixel capture (same day, same nodes)
+
+The flood capture is an extreme burst (~8x over the parser ceiling, per the
+fact this doc opens with) — worth checking whether delta's node-side
+penalty above is an artifact of that overload rather than something that
+holds at a realistic operating rate. Uploaded
+`spad_data/captures/26-8-26_40px/cap_node{1,2}.raw` (1.64-2.97 Mcps,
+comfortably within the parser's normal range — `lag_max=0.00s` on all
+three candidates here, unlike the flood run's positive lag, confirms this
+regime is not overloaded) to each node's `spad_data/` under a throwaway
+name, ran the same `--live-ceiling` pass, then removed both the capture
+and the script again.
+
+| | node1 (40.76M records) | node2 (53.79M records) |
+|---|---|---|
+| wire bytes/event (raw / delta) | 10.00 / 4.00 | 10.00 / 4.00 |
+| node-side encode: raw / delta (ev/s) | 8.58e7 / 4.41e7 | 9.90e7 / 3.01e7 |
+| kernel: int64 sub / 3-term weighted | 0.387s / 0.578s (1.49x) | 0.373s / 0.562s (1.51x) |
+| live ceiling (baseline / raw / delta) | 5.7s / 5.9s / 7.2s | 7.7s / 7.9s / 9.4s |
+| delta / baseline elapsed ratio | 1.26x | 1.22x |
+
+Compare to the flood run's delta/baseline ratio: 1.30x (node1), 1.23x
+(node2). **The two regimes agree to within a few percent** — delta's
+node-side elapsed-time penalty is a roughly constant ~22-30% overhead, not
+something that only appears under flood-level overload. That answers the
+open question from before this run: the item 2 case against delta-encoding
+does not depend on being in an overloaded regime, so it is not a reason to
+discount the flood-run numbers above as unrepresentative.
+
+Given this, the lowest-value remaining Phase 2 work is subprocess-isolated
+per-candidate RAM and the ethernet throughput/packet-rate half of item 6:
+neither is likely to overturn a signal that already agrees across two very
+different rate regimes. The next real decision point is whether this
+node-side cost, combined with the correlator-side 3-term-weighted-form
+slowdown already measured (1.46-1.58x), outweighs delta-encoding's
+untouched-correlator / untouched-offline-tools blast-radius advantage over
+raw columns -- that is a judgement call for Phase 3, not something a
+further Phase 2 measurement resolves.
+
+### Live end-to-end confirmation (2026-09-03)
+
+Ran all three wire modes live, on real hardware, through the actual
+control channel and wire protocol (this was the whole point of Steps 2-5's
+implementation: `wire_format.py`, `KEY_SETUP_V2`, mode-aware `Channel.
+drain()`, the wire-mode UI) — not just replayed captures. It surfaced a
+real infrastructure problem unrelated to wire encoding, documented in full
+in `docs/network_topology.md`: both nodes share one 1GbE switch uplink
+into the master, and node1 lost that contention at any meaningful rate
+regardless of wire mode (baseline and raw failed identically at the same
+rate — proving the encoding wasn't the cause). Root-caused via an isolated
+single-node test (node1 alone ran the same failing mask/rate perfectly
+clean) rather than a node1 CPU/thermal/regression issue. Fixed for now
+with dedicated per-node links to the master, bypassing the shared switch.
+
+Once run at a rate the (then-shared) network could sustain (pixel 164
+identity pair, ~2.7 Mcps/node, 2 minutes/mode, `diffs` write mode), all
+three modes produced statistically indistinguishable g² results:
+
+| mode | total taus | mean/bin | peak excess | SNR |
+|---|---|---|---|---|
+| baseline | 834,738,276 | 4,172,863 | 0.289% | 1.27 |
+| raw | 833,301,510 | 4,165,678 | 0.255% | 1.11 |
+| delta | 831,037,882 | 4,154,362 | 0.263% | 1.15 |
+
+Total counts within 0.4%, matching mean/std, matching excess/SNR; all
+three nodes/modes ran with 0.0 s parser lag and no queue blocking at this
+rate. SNR ~1.1-1.3 is noise-level, expected and not a concern for a 2-minute
+integration (real bunching at pixel 164 historically needed ~15 hours for
+SNR 21) — this test was never meant to detect a peak, only to confirm the
+pipeline behaves identically across wire modes live. **It does.** This is
+the load-bearing confirmation Step 4 of the plan called for.
+
+One consequence worth carrying into the Phase 3 decision below: the live
+investigation found the actually-scarce resource in this deployment is
+**network bandwidth** (a shared, oversubscribed switch uplink), not node
+CPU — which the whole raw-vs-delta framing above was built around. Delta-
+encoding's ~2.00x wire compression directly relieves the resource that
+just caused a real outage, in a way raw columns' CPU-side savings do not.
+See `docs/network_topology.md`'s closing section before finalizing Phase 3
+if the eventual deployment topology still shares an oversubscribed link
+across nodes rather than giving each a dedicated, adequately-sized path.
+
 ## Phase 3 — Decide, then build the winning approach
 
 - **If delta-encoding wins or ties**: build Stage 2b as designed
