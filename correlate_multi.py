@@ -40,7 +40,7 @@ import numpy as np
 import matplotlib
 matplotlib.use('TkAgg')
 from matplotlib.figure import Figure
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tools'))
@@ -376,6 +376,26 @@ class MultiCorrelateWindow(tk.Toplevel):
         self.pairinfo_var = tk.StringVar(value='')
         ttk.Label(sel, textvariable=self.pairinfo_var).pack(side='left', padx=12)
 
+        # Explicit x-limits rather than an interactive zoom/pan toolbar:
+        # a typed number means the same thing on every redraw regardless of
+        # matplotlib's internal autoscale/view state, so there is no state to
+        # get out of sync with a histogram that keeps growing underneath it.
+        # A NavigationToolbar2Tk + "preserve whatever view it's left in
+        # across ax.clear()" was tried and produced exactly that failure
+        # mode live: the axes autoscale/view-limit state does not reliably
+        # survive a clear+replot cycle, so a redraw could silently reapply
+        # limits that no longer bracket the data -- an unrecoverable blank
+        # plot, since every later redraw re-derived its "preserved" limits
+        # from that same bad state. Blank means blank on both ends here.
+        ttk.Label(sel, text='τ min:').pack(side='left', padx=(12, 2))
+        self.xmin_var = tk.StringVar(value='')
+        ttk.Entry(sel, textvariable=self.xmin_var, width=8).pack(side='left')
+        ttk.Label(sel, text='τ max:').pack(side='left', padx=(6, 2))
+        self.xmax_var = tk.StringVar(value='')
+        ttk.Entry(sel, textvariable=self.xmax_var, width=8).pack(side='left')
+        self.xmin_var.trace_add('write', self._on_display_change)
+        self.xmax_var.trace_add('write', self._on_display_change)
+
         # One axes: the selected pair's histogram, peak bin marked. The pair
         # selector plus the peak-SNR readout on the info line is how you find
         # the pair worth looking at.
@@ -390,18 +410,7 @@ class MultiCorrelateWindow(tk.Toplevel):
         self.fig.tight_layout()
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=ff)
-        # Standard matplotlib zoom-box/pan/home toolbar. The live redraw below
-        # preserves whatever view it leaves the axes in (see _redraw), so
-        # zooming in doesn't get wiped out by the next batch of data.
-        toolbar = NavigationToolbar2Tk(self.canvas, ff, pack_toolbar=False)
-        toolbar.update()
-        toolbar.pack(side='top', fill='x')
         self.canvas.get_tk_widget().pack(padx=6, pady=6, fill='both', expand=True)
-
-        # (pair_key, is_distribution) of the last redraw that actually had
-        # data -- _redraw only carries the zoom over when this still matches,
-        # so switching pairs/views or a first draw for a pair autoscales.
-        self._last_view_key = None
 
         self.columnconfigure(0, weight=1)
         self.rowconfigure(2, weight=1)
@@ -734,7 +743,6 @@ class MultiCorrelateWindow(tk.Toplevel):
         self._stop_diff_capture()
         self.ax.clear()
         self.ax.set_title('g² — data cleared')
-        self._last_view_key = None
         self.canvas.draw_idle()
         self.status_var.set('Data cleared. ' +
                             ('Enabled — waiting for DWELL.' if self._active else 'Disabled.'))
@@ -1085,9 +1093,6 @@ class MultiCorrelateWindow(tk.Toplevel):
         hist = self._hist.get(key)
 
         dist = self.view_var.get() == 'distribution'
-        view_key = (key, dist)
-        same_view = hist is not None and view_key == self._last_view_key
-        xlim, ylim = (self.ax.get_xlim(), self.ax.get_ylim()) if same_view else (None, None)
 
         self.ax.clear()
         if hist is None:
@@ -1106,10 +1111,15 @@ class MultiCorrelateWindow(tk.Toplevel):
             _mark_peak_bin(self.ax, centers, hist, scale)
             self.ax.set_xlabel(f'τ ({unit})')
             self.ax.set_ylabel('Counts')
-        if xlim is not None:
-            self.ax.set_xlim(xlim)
-            self.ax.set_ylim(ylim)
-        self._last_view_key = view_key if hist is not None else None
+            # Explicit x-limits, in the same display unit as the axis above,
+            # rather than a preserved interactive zoom -- see the entry
+            # widgets' build-time comment for why. Blank (or unparsable)
+            # means autoscale, same as leaving it alone always did.
+            try:
+                xmin, xmax = float(self.xmin_var.get()), float(self.xmax_var.get())
+                self.ax.set_xlim(xmin, xmax)
+            except ValueError:
+                pass
         self.canvas.draw_idle()
 
         if key is not None:
