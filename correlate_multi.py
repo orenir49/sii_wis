@@ -40,7 +40,7 @@ import numpy as np
 import matplotlib
 matplotlib.use('TkAgg')
 from matplotlib.figure import Figure
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tools'))
@@ -390,7 +390,18 @@ class MultiCorrelateWindow(tk.Toplevel):
         self.fig.tight_layout()
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=ff)
+        # Standard matplotlib zoom-box/pan/home toolbar. The live redraw below
+        # preserves whatever view it leaves the axes in (see _redraw), so
+        # zooming in doesn't get wiped out by the next batch of data.
+        toolbar = NavigationToolbar2Tk(self.canvas, ff, pack_toolbar=False)
+        toolbar.update()
+        toolbar.pack(side='top', fill='x')
         self.canvas.get_tk_widget().pack(padx=6, pady=6, fill='both', expand=True)
+
+        # (pair_key, is_distribution) of the last redraw that actually had
+        # data -- _redraw only carries the zoom over when this still matches,
+        # so switching pairs/views or a first draw for a pair autoscales.
+        self._last_view_key = None
 
         self.columnconfigure(0, weight=1)
         self.rowconfigure(2, weight=1)
@@ -723,6 +734,7 @@ class MultiCorrelateWindow(tk.Toplevel):
         self._stop_diff_capture()
         self.ax.clear()
         self.ax.set_title('g² — data cleared')
+        self._last_view_key = None
         self.canvas.draw_idle()
         self.status_var.set('Data cleared. ' +
                             ('Enabled — waiting for DWELL.' if self._active else 'Disabled.'))
@@ -1073,6 +1085,10 @@ class MultiCorrelateWindow(tk.Toplevel):
         hist = self._hist.get(key)
 
         dist = self.view_var.get() == 'distribution'
+        view_key = (key, dist)
+        same_view = hist is not None and view_key == self._last_view_key
+        xlim, ylim = (self.ax.get_xlim(), self.ax.get_ylim()) if same_view else (None, None)
+
         self.ax.clear()
         if hist is None:
             self.ax.set_title('selected pair has no data yet')
@@ -1090,6 +1106,10 @@ class MultiCorrelateWindow(tk.Toplevel):
             _mark_peak_bin(self.ax, centers, hist, scale)
             self.ax.set_xlabel(f'τ ({unit})')
             self.ax.set_ylabel('Counts')
+        if xlim is not None:
+            self.ax.set_xlim(xlim)
+            self.ax.set_ylim(ylim)
+        self._last_view_key = view_key if hist is not None else None
         self.canvas.draw_idle()
 
         if key is not None:
