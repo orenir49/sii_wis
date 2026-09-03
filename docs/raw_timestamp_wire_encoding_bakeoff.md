@@ -325,6 +325,49 @@ untouched-correlator / untouched-offline-tools blast-radius advantage over
 raw columns -- that is a judgement call for Phase 3, not something a
 further Phase 2 measurement resolves.
 
+### Live end-to-end confirmation (2026-09-03)
+
+Ran all three wire modes live, on real hardware, through the actual
+control channel and wire protocol (this was the whole point of Steps 2-5's
+implementation: `wire_format.py`, `KEY_SETUP_V2`, mode-aware `Channel.
+drain()`, the wire-mode UI) — not just replayed captures. It surfaced a
+real infrastructure problem unrelated to wire encoding, documented in full
+in `docs/network_topology.md`: both nodes share one 1GbE switch uplink
+into the master, and node1 lost that contention at any meaningful rate
+regardless of wire mode (baseline and raw failed identically at the same
+rate — proving the encoding wasn't the cause). Root-caused via an isolated
+single-node test (node1 alone ran the same failing mask/rate perfectly
+clean) rather than a node1 CPU/thermal/regression issue. Fixed for now
+with dedicated per-node links to the master, bypassing the shared switch.
+
+Once run at a rate the (then-shared) network could sustain (pixel 164
+identity pair, ~2.7 Mcps/node, 2 minutes/mode, `diffs` write mode), all
+three modes produced statistically indistinguishable g² results:
+
+| mode | total taus | mean/bin | peak excess | SNR |
+|---|---|---|---|---|
+| baseline | 834,738,276 | 4,172,863 | 0.289% | 1.27 |
+| raw | 833,301,510 | 4,165,678 | 0.255% | 1.11 |
+| delta | 831,037,882 | 4,154,362 | 0.263% | 1.15 |
+
+Total counts within 0.4%, matching mean/std, matching excess/SNR; all
+three nodes/modes ran with 0.0 s parser lag and no queue blocking at this
+rate. SNR ~1.1-1.3 is noise-level, expected and not a concern for a 2-minute
+integration (real bunching at pixel 164 historically needed ~15 hours for
+SNR 21) — this test was never meant to detect a peak, only to confirm the
+pipeline behaves identically across wire modes live. **It does.** This is
+the load-bearing confirmation Step 4 of the plan called for.
+
+One consequence worth carrying into the Phase 3 decision below: the live
+investigation found the actually-scarce resource in this deployment is
+**network bandwidth** (a shared, oversubscribed switch uplink), not node
+CPU — which the whole raw-vs-delta framing above was built around. Delta-
+encoding's ~2.00x wire compression directly relieves the resource that
+just caused a real outage, in a way raw columns' CPU-side savings do not.
+See `docs/network_topology.md`'s closing section before finalizing Phase 3
+if the eventual deployment topology still shares an oversubscribed link
+across nodes rather than giving each a dedicated, adequately-sized path.
+
 ## Phase 3 — Decide, then build the winning approach
 
 - **If delta-encoding wins or ties**: build Stage 2b as designed
