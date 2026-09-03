@@ -113,6 +113,68 @@ master_loc = np.array([PIXMAP[170 + i] for i in range(150)])
 slave_loc  = np.array([PIXMAP[i]       for i in range(170)])
 
 # ---------------------------------------------------------------------------
+# Fused (chip, pixel_nr) slot table -- Stage 2a bucketing fix.
+#
+# Replaces the old per-chip "for uid in np.unique(phys_pid): bufs[...].append(
+# phys_ts[phys_pid == uid])" loop, whose cost is one numpy boolean-mask pass
+# per *active pixel* regardless of chunk length (O(chunk x N_active)) — the
+# team's own measurement found this loop, not the PIXMAP lookup or the
+# ps-scale combine arithmetic, is the actual bottleneck at N active pixels.
+#
+# pixel_nr is a raw byte (0-255) parsed straight off the wire, so it and
+# is_mast fuse losslessly into one uint16 slot: pixel_nr | (is_mast << 8) --
+# 0-255 for the slave chip, 256-511 for the master chip. SLOT_DEST maps each
+# of the 512 possible slots to a compact destination index (or -1 to
+# discard); DEST_KEYS maps that index back to the bufs key. Grouping a
+# chunk's events by destination is then one stable argsort + one bincount,
+# not one pass per pixel.
+#
+# Built once at import time from master_loc/slave_loc/SPECIAL — the same
+# three inputs the old loop closed over — so it is exactly as correct as
+# they are, including the master 150-169 hole: master_loc only has 150
+# entries (master pixel ids 0-149), so slots 406-425 (256+150 .. 256+169)
+# are never assigned and stay -1, discarded exactly as the old loop's
+# `n_phys=150` bound discarded them.
+#
+# Only physical photons and the dwell/line/frame sync markers are assigned a
+# destination here. Everything else this parse loop cares about — the reset
+# marker (234), FIFO overflow (247), file-start (239), and any abnormal/
+# unknown id — is read straight off the original pixel_nr/is_mast arrays
+# elsewhere in the loop (reset cumsum, overflow count, report_abnormal) and
+# was never part of this grouping loop, so it is correctly discarded (-1)
+# here too.
+N_SLOTS = 512
+
+
+def _build_slot_table():
+    dest_keys: list = []
+    slot_dest = np.full(N_SLOTS, -1, dtype=np.int32)
+
+    def add(slot: int, key) -> None:
+        slot_dest[slot] = len(dest_keys)
+        dest_keys.append(key)
+
+    for uid, loc in enumerate(slave_loc):
+        add(uid, int(loc))
+    for uid, loc in enumerate(master_loc):
+        add(256 + uid, int(loc))
+    n_phys_dest = len(dest_keys)
+
+    for sp_id, name in SPECIAL.items():
+        add(sp_id, ('slave', name))
+        add(256 + sp_id, ('master', name))
+
+    return slot_dest, dest_keys, n_phys_dest
+
+
+SLOT_DEST, DEST_KEYS, N_PHYS_DEST = _build_slot_table()
+N_DEST = len(DEST_KEYS)
+# The master 150-169 hole (valid pixel ids on the slave chip, not on master)
+# must survive the table build: those slots stay discarded (-1), not aliased
+# onto some other destination.
+assert (SLOT_DEST[256 + 150:256 + 170] == -1).all()
+
+# ---------------------------------------------------------------------------
 # Wire protocol keys
 # ---------------------------------------------------------------------------
 SPECIAL_KEY = {
@@ -704,26 +766,24 @@ def run(sock: socket.socket,
                         report_abnormal(abnormal, pixel_nr, is_mast, time_ps,
                                         stats['records'] - len(raw))
 
+                    # One fused-key bucketing pass replaces the old per-active-
+                    # pixel loop above (see SLOT_DEST's comment for why).
+                    slot = pixel_nr.astype(np.uint16) | (is_mast.astype(np.uint16) << 8)
+                    dest = SLOT_DEST[slot]
+                    keep = dest >= 0
                     dwell_seen = False
-                    for chip_flag, loc_map, n_phys, chip_name in (
-                        (True,  master_loc, 150, 'master'),
-                        (False, slave_loc,  170, 'slave'),
-                    ):
-                        chip_mask = is_mast if chip_flag else ~is_mast
-                        phys_mask = chip_mask & (pixel_nr < n_phys)
-                        if phys_mask.any():
-                            phys_pid = pixel_nr[phys_mask]
-                            phys_ts  = time_ps[phys_mask]
-                            for uid in np.unique(phys_pid):
-                                bufs[loc_map[uid]].append(phys_ts[phys_pid == uid])
-                            events_since_flush += int(phys_mask.sum())
-
-                        for sp_id, name in SPECIAL.items():
-                            mask = chip_mask & (pixel_nr == sp_id)
-                            if mask.any():
-                                bufs[(chip_name, name)].append(time_ps[mask])
-                                if name == 'dwell':
-                                    dwell_seen = True
+                    if keep.any():
+                        dest_k = dest[keep]
+                        order  = np.argsort(dest_k, kind='stable')
+                        ts_sorted = time_ps[keep][order]
+                        counts = np.bincount(dest_k, minlength=N_DEST)
+                        bounds = np.concatenate(([0], np.cumsum(counts)))
+                        events_since_flush += int(counts[:N_PHYS_DEST].sum())
+                        for d in np.nonzero(counts)[0]:
+                            key = DEST_KEYS[d]
+                            bufs[key].append(ts_sorted[bounds[d]:bounds[d + 1]])
+                            if isinstance(key, tuple) and key[1] == 'dwell':
+                                dwell_seen = True
 
                     # Markers go out immediately — calibration needs them promptly
                     # and there are only a handful per second. Pixel buffers are
