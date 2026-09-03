@@ -27,3 +27,12 @@ or remapping involved.
 4. Save it under `.claude/masks/<descriptive-name>.txt` (create the
    directory if it doesn't exist).
 5. Tell the user which pixels are active and where the file was written.
+6. If the user also asked to push it to the node(s) (e.g. "copy to both
+   nodes", "push to node 1"), run:
+   `.venv\Scripts\python.exe tools\push_mask.py .claude\masks\<name>.txt [--node 1|2]`
+   and relay the per-node upload + readback-verification result. This only
+   copies the file next to lSPAD.exe on each node — it does **not** apply
+   the mask. Applying it is a separate step through `master.py` (Launch, or
+   the mask-refresh button once connected), which is also the only place
+   that updates the correlator's record of which mask the detector is
+   actually running.

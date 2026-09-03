@@ -36,6 +36,10 @@ python .claude/skills/spectral-align/align_arc.py REF.txt OTHER.txt --emit-pairs
 python tools\pair_map.py --mode affine --lo 120 --hi 200 -a 1.037 -b -2.4
 python tools\pair_map.py --selftest
 
+# Push a local mask file to both nodes' lSPAD directories (upload + readback-verify;
+# does NOT apply it -- that's still Launch or the mask-refresh button in master.py)
+python tools\push_mask.py .claude\masks\mask_two.txt [--node 1|2]
+
 # Raw lSPAD capture (Stage 2 Phase 0) -- off by default
 # Set on the MASTER before launching master.py; forwarded to each node as
 # <that node repo>\<value>_node{1,2}. Relative is preferred: the two nodes have
@@ -103,6 +107,7 @@ Minimal GUI that starts a command server thread on launch. Receives JSON command
 | `tools/replay.py` | Replays a capture through `node_backend.run()` into the real receiver loop, and diffs two replays (`px_*.bin` bytes + input-derived stats). The check a parser rewrite has to pass; `--selftest` |
 | `tools/fetch_capture.py` | Pulls both nodes' raw captures back to the master over SFTP and summarizes them (chunks, records, truncation) |
 | `tools/pair_map.py` | Pure (node-1, node-2) pair derivation — identity / grid (both mask-driven) and file for the GUI, plus affine for `align_arc --emit-pairs`; mask cross-check, `--selftest` |
+| `tools/push_mask.py` | Uploads a local mask file to both nodes' lSPAD directories over SFTP, with readback verification. Copies only — applying is still through `master.py` |
 | `ssh_launcher.py` | Paramiko-based remote automation for launching sender nodes |
 | `setup_node.ps1` | One-shot node setup: OpenSSH, firewall, git clone, venv |
 | `spad_new.ipynb` | Offline g² analysis notebook |
@@ -122,7 +127,7 @@ Pixel mapping: `PIXMAP` in `node_backend.py` maps lSPAD pixel indices to output 
 
 ### Abnormal marker logging (sender)
 
-A healthy timestream carries only photons (lSPAD ids `<150` master / `<170` slave), the coarse-counter reset `234`, and the dwell/line/frame markers `225`/`226`/`228` (`NORMAL_MARKER_IDS`). `node_backend.py` reports every other id live over the control channel — FIFO overflow `247`, file-start `239`, and any id no pixel on that chip can emit (usually 7-byte record framing having slipped) — with the session record index and detector-relative timestamp, so a misplaced marker is distinguishable from an expected one.
+A healthy timestream carries only photons (lSPAD ids `<150` master / `<170` slave), the coarse-counter reset `234`, the dwell/line/frame markers `225`/`226`/`228`, and the file-start marker `239` (`NORMAL_MARKER_IDS`) — expected once per session, so it is no longer flagged. `node_backend.py` reports every other id live over the control channel — FIFO overflow `247`, and any id no pixel on that chip can emit (usually 7-byte record framing having slipped) — with the session record index and detector-relative timestamp, so a misplaced marker is distinguishable from an expected one.
 
 Throttled deliberately: `log_fn` writes to the control socket from the parser thread, so a flood would stall the parser and cost real photons. First sighting of each `(chip, id)` logs at once, then one rollup line per id per `ANOM_LOG_S`; past `ANOM_MAX_FIRST` distinct ids it stops opening new lines. Per-id totals land in `stats['abnormal']` → `session_stats.json`.
 
