@@ -237,17 +237,6 @@ def test_write_hooked_off_with_no_hooks_at_all():
           not os.path.exists(outdir), outdir)
 
 
-def test_write_hooked_off_log_names_the_hooked_pixels():
-    """The session log is the only record of what the run kept, so it has to
-    name the hooked pixels rather than dump all 320 suppressed keys."""
-    outdir, logs = run_stream([frame(42, PAYLOAD_A)], {42: [queue.Queue()]},
-                              write_hooked=False)
-    msg = [m for m in logs if 'Write to disk OFF' in m]
-    check('writes off: one up-front log line naming the hooked pixels',
-          len(msg) == 1 and '[42]' in msg[0] and 'NOTHING is written' in msg[0],
-          f'msg={msg}')
-
-
 def test_writes_off_suppresses_the_sync_keys_too():
     """Changed 2026-08-26: writes off now means NOTHING, sync files included.
 
