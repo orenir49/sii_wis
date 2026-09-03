@@ -89,6 +89,60 @@ def plot_histogram(centers, counts, px1, px2, suffix, bin_width_ps, outdir) -> s
     return out_path
 
 
+def plot_histogram_zoom(centers, counts, px1, px2, suffix, bin_width_ps, outdir,
+                        half_width_ns) -> str:
+    """Same peak as plot_histogram, but the x-axis is cropped to +/-half_width_ns
+    around it so individual bins are visible instead of being compressed across
+    the full tau window."""
+    mean = counts.mean()
+    std = counts.std()
+    peak_idx = int(np.argmax(counts))
+    peak_tau_ps = centers[peak_idx]
+    peak_count = counts[peak_idx]
+    excess_pct = (peak_count - mean) / mean * 100
+    snr = (peak_count - mean) / std if std > 0 else float('nan')
+
+    half_width_ps = half_width_ns * 1_000.0
+    roi = (centers >= peak_tau_ps - half_width_ps) & (centers <= peak_tau_ps + half_width_ps)
+
+    fig, ax = plt.subplots(dpi=150, figsize=(9, 5))
+    ax.step(centers[roi] / 1_000.0, counts[roi], where='mid',
+            color='steelblue', linewidth=1.2)
+    ax.axhline(mean, color='k', linestyle='solid', linewidth=1,
+               label=f'Mean = {mean:.1f}')
+    ax.axhline(mean + std, color='k', linestyle='dashed', linewidth=1,
+               label=f'+/-1sigma = {std:.1f}')
+    ax.axhline(mean - std, color='k', linestyle='dashed', linewidth=1)
+    ax.plot(peak_tau_ps / 1_000.0, peak_count, marker='x', color='red',
+            markersize=14, markeredgewidth=3, linestyle='none')
+
+    ax.annotate(
+        f'peak at tau = {peak_tau_ps / 1_000.0:.3f} ns\n'
+        f'excess = {excess_pct:.3f}% of avg coincidence count\n'
+        f'bin width = {bin_width_ps:.0f} ps\n'
+        f'SNR = {snr:.1f}',
+        xy=(peak_tau_ps / 1_000.0, peak_count), xycoords='data',
+        xytext=(0.55, 0.95), textcoords='axes fraction',
+        fontsize=10, verticalalignment='top',
+        bbox=dict(boxstyle='round', edgecolor='red', facecolor='white'),
+        arrowprops=dict(arrowstyle='->', color='red'),
+    )
+
+    ax.set_xlabel('tau (ns)')
+    ax.set_ylabel('Counts')
+    title = f'g2 zoom +/-{half_width_ns:.1f} ns - {suffix}' if suffix else \
+            f'g2 zoom +/-{half_width_ns:.1f} ns'
+    ax.set_title(title)
+    ax.legend(loc='lower left', fontsize=9)
+    fig.tight_layout()
+
+    out_path = os.path.join(outdir, f'{px1}_{px2}_{suffix}_peak_zoom.png'
+                            if suffix else f'{px1}_{px2}_peak_zoom.png')
+    fig.savefig(out_path)
+    plt.close(fig)
+    return out_path
+
+
 def plot_distribution(counts, px1, px2, suffix, outdir) -> str:
     counts_f = counts.astype(float)
     mean = counts_f.mean()
@@ -151,6 +205,10 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument('path', help='histogram txt file (tau_ps, counts)')
     ap.add_argument('--outdir', default='.', help='directory to write PNGs into')
+    ap.add_argument('--zoom-ns', type=float, default=2.0,
+                    help='zoom-plot half-width around the peak, in ns (default 2.0)')
+    ap.add_argument('--no-zoom', action='store_true',
+                    help='skip the peak-zoom plot')
     args = ap.parse_args()
 
     os.makedirs(args.outdir, exist_ok=True)
@@ -162,6 +220,10 @@ def main():
     dist_path = plot_distribution(counts, px1, px2, suffix, args.outdir)
     print(f'wrote {hist_path}')
     print(f'wrote {dist_path}')
+    if not args.no_zoom:
+        zoom_path = plot_histogram_zoom(centers, counts, px1, px2, suffix,
+                                        bin_width_ps, args.outdir, args.zoom_ns)
+        print(f'wrote {zoom_path}')
 
 
 if __name__ == '__main__':
