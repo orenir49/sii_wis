@@ -246,3 +246,23 @@ Reverting to 2:1 fiber splitter, new spectral alignment.
     - LDLS --> SM fiber --> 550nm filter --> 400mm lens --> two 0.5" OAPs, ~30mm center to center distance --> two 25 micron fibers --> spectrographs --> ~1-2 Mcps per pix.
     - 7 hour integration, pix 164 versus pix 164: bunching peak, SNR ~11, ~0.17% bunching excess at tau=13ns, total 5e7 counts per bin.
     - 11 hour integration, pix 164 versus pix 164: bunching peak, SNR ~9, ~0.11% bunching excess at tau=13ns, total 8e7 counts per bin.
+
+## 01-09-26
+
+- Same setup as 31-08-26.
+- Live grid correlation:
+  - Pixels 151,164 active on each node.
+  - Diagonal correlation shows bunching peak with 0.1-0.2% excess, cross-correlations have no bunching peak.
+  - Excess curiously smaller for 151x151 versus 164x164. Investigate why.
+- Overnight, a 15 hour integration of pix 164 vs pix 164 produced an SNR = 21 bunching peak. 
+  - 100 ps bins were used to resolve the peak width as a probe of the overall system jitter. The peak has 175 ps FWHM: very good and much better than pulsed laser measurements have suggested!
+  - The bunching excess is 0.7% at this bin width.
+  - Time differences were saved for offline analysis.
+  - Offline analysis with 20 ps bins shows 150 ps FWHM- great timing jitter. 
+
+## 02-09-26
+
+- Same setup as yesterday, but 100 ps bins which gives SNR 10 in ~2.5 hours.
+- Spectral alignment to start the day.
+- Correlating different pixel pairs to check wavelength dependence of g2.
+- So far: 143, 151, 164, 168, 180.
