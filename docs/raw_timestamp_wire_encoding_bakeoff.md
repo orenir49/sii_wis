@@ -228,6 +228,64 @@ gets decided against — a candidate can win the CPU-seconds table and still
 lose here if it leaves less headroom on a machine or link that is already
 close to its ceiling.
 
+### Preliminary results (2026-09-03, `tools/bench_wire_encoding.py`)
+
+Run against the 81-pixel flood capture (`spad_data/captures/cap_node{1,2}.raw`,
+~292.57M records/node) on the real node PCs over SSH (lSPAD not running —
+read-only, no live acquisition at risk), plus the master-side decode figure
+from the same capture run on the master PC directly. Item 2's live-ceiling
+harness caught its own bug on first run: an early cut of `run_live_ceiling`
+combined to int64 unconditionally for every candidate, so "raw" measured
+combine+pack (strictly *more* work than baseline) instead of skipping the
+combine as the candidate is supposed to — it came out slower than baseline,
+which was the tell. Fixed to combine only the two boundary records per
+chunk for lag bookkeeping when candidate is `raw`; re-run below.
+
+| | node1 | node2 |
+|---|---|---|
+| busiest pixel, events | loc 163, 4.61M | loc 181, 5.61M |
+| wire bytes/event (raw / delta / absolute) | 10.00 / 4.00 / 8.0 | 10.00 / 4.00 / 8.0 |
+| delta vs absolute compression | 2.00x | 2.00x |
+| node-side encode: raw / delta (ev/s) | 9.86e7 / 2.66e7 | 7.17e7 / 4.18e7 |
+| kernel: int64 sub / 3-term weighted | 0.386s / 0.563s (1.46x) | 0.373s / 0.587s (1.58x) |
+| live ceiling, no shipping (baseline / raw / delta) | 23.7s / 24.4s / 30.8s | 28.6s / 29.9s / 35.3s |
+| live ceiling queue_max (baseline / raw / delta) | 17 / 12 / 25 (cap 200) | 13 / 7 / 19 (cap 200) |
+| peak RSS during full run | 28.7 GB | 26.7 GB |
+
+Master-side decode (this capture, run on the master PC, not a node):
+**~7.7-9.3e8 events/s**, comfortably faster than either node's own encode
+rate — confirms decode is not where this decision will bind.
+
+**Reading these numbers:**
+- Wire compression lands exactly on the ~2.00x design prediction on real
+  data, both nodes, no surprises.
+- `raw` and `baseline` are close (`raw` slightly higher only because it
+  still pays a per-chunk two-record combine for lag bookkeeping, not the
+  full-array one) — skipping the combine alone is not where raw's cost
+  story would be won or lost; the earlier bug (see above) is why an even
+  closer number isn't shown here.
+- `delta` is the clear loser on **node-side live ceiling** (~30-35s vs
+  ~24-30s to chew through the same 292M records, no shipping) — the
+  encode_deltas() segment-detection + packing pass costs real node CPU
+  that neither baseline nor raw pay. This is the sharpest data point so
+  far against delta-encoding, on the metric (item 2) this branch was
+  started to be able to measure at all.
+- `queue_max` stayed far under the 200-slot cap for all three candidates
+  on both nodes (this consumer only discards, so it can never itself be
+  the bottleneck) — the elapsed-time numbers above are the load-bearing
+  ones, not queue depth.
+- Peak RSS (27-29 GB) is dominated by this harness's own whole-capture
+  load (see the Known limitation in the `bench_wire_encoding.py` commit),
+  not a per-candidate figure — not yet informative for the hardware-demand
+  table without subprocess isolation per item.
+
+**Not yet done**: items 1/3/5's CPU%/RSS columns from `with_resource_sample`
+(the same whole-process-RSS caveat above applies), the ethernet
+throughput/packet-rate half of item 6, and per-candidate RAM isolation.
+Wire bytes and kernel-cost figures are location-independent and were
+already cross-checked against this same capture on the master PC earlier
+in this branch's work, matching the node numbers above.
+
 ## Phase 3 — Decide, then build the winning approach
 
 - **If delta-encoding wins or ties**: build Stage 2b as designed
