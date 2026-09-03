@@ -286,6 +286,45 @@ Wire bytes and kernel-cost figures are location-independent and were
 already cross-checked against this same capture on the master PC earlier
 in this branch's work, matching the node numbers above.
 
+### Second rate regime: the 40-pixel capture (same day, same nodes)
+
+The flood capture is an extreme burst (~8x over the parser ceiling, per the
+fact this doc opens with) — worth checking whether delta's node-side
+penalty above is an artifact of that overload rather than something that
+holds at a realistic operating rate. Uploaded
+`spad_data/captures/26-8-26_40px/cap_node{1,2}.raw` (1.64-2.97 Mcps,
+comfortably within the parser's normal range — `lag_max=0.00s` on all
+three candidates here, unlike the flood run's positive lag, confirms this
+regime is not overloaded) to each node's `spad_data/` under a throwaway
+name, ran the same `--live-ceiling` pass, then removed both the capture
+and the script again.
+
+| | node1 (40.76M records) | node2 (53.79M records) |
+|---|---|---|
+| wire bytes/event (raw / delta) | 10.00 / 4.00 | 10.00 / 4.00 |
+| node-side encode: raw / delta (ev/s) | 8.58e7 / 4.41e7 | 9.90e7 / 3.01e7 |
+| kernel: int64 sub / 3-term weighted | 0.387s / 0.578s (1.49x) | 0.373s / 0.562s (1.51x) |
+| live ceiling (baseline / raw / delta) | 5.7s / 5.9s / 7.2s | 7.7s / 7.9s / 9.4s |
+| delta / baseline elapsed ratio | 1.26x | 1.22x |
+
+Compare to the flood run's delta/baseline ratio: 1.30x (node1), 1.23x
+(node2). **The two regimes agree to within a few percent** — delta's
+node-side elapsed-time penalty is a roughly constant ~22-30% overhead, not
+something that only appears under flood-level overload. That answers the
+open question from before this run: the item 2 case against delta-encoding
+does not depend on being in an overloaded regime, so it is not a reason to
+discount the flood-run numbers above as unrepresentative.
+
+Given this, the lowest-value remaining Phase 2 work is subprocess-isolated
+per-candidate RAM and the ethernet throughput/packet-rate half of item 6:
+neither is likely to overturn a signal that already agrees across two very
+different rate regimes. The next real decision point is whether this
+node-side cost, combined with the correlator-side 3-term-weighted-form
+slowdown already measured (1.46-1.58x), outweighs delta-encoding's
+untouched-correlator / untouched-offline-tools blast-radius advantage over
+raw columns -- that is a judgement call for Phase 3, not something a
+further Phase 2 measurement resolves.
+
 ## Phase 3 — Decide, then build the winning approach
 
 - **If delta-encoding wins or ties**: build Stage 2b as designed
