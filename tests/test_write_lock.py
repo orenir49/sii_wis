@@ -89,6 +89,11 @@ def test_gui_locks_and_unlocks_the_widget():
         g._write_none_rb = tk.Checkbutton(root)
         g._write_ts_rb = tk.Checkbutton(root)
         g._write_diff_rb = tk.Checkbutton(root)
+        g.wire_mode_var = tk.StringVar(value='baseline')
+        g._wire_lock_var = tk.StringVar(value='')
+        g._wire_baseline_rb = tk.Checkbutton(root)
+        g._wire_raw_rb = tk.Checkbutton(root)
+        g._wire_delta_rb = tk.Checkbutton(root)
         g._correlators = ()
         logs = []
         g._enqueue_log = logs.append
@@ -153,6 +158,11 @@ def test_the_locked_line_reaches_the_run_log():
         g._write_none_rb = tk.Checkbutton(root)
         g._write_ts_rb = tk.Checkbutton(root)
         g._write_diff_rb = tk.Checkbutton(root)
+        g.wire_mode_var = tk.StringVar(value='baseline')
+        g._wire_lock_var = tk.StringVar(value='')
+        g._wire_baseline_rb = tk.Checkbutton(root)
+        g._wire_raw_rb = tk.Checkbutton(root)
+        g._wire_delta_rb = tk.Checkbutton(root)
         g._correlators = ()
         g._write_locked_last = False
         g._run_log = RunLog(tmp)
@@ -180,6 +190,11 @@ def test_the_locked_line_reaches_the_run_log():
         g2._write_none_rb = tk.Checkbutton(root)
         g2._write_ts_rb = tk.Checkbutton(root)
         g2._write_diff_rb = tk.Checkbutton(root)
+        g2.wire_mode_var = tk.StringVar(value='baseline')
+        g2._wire_lock_var = tk.StringVar(value='')
+        g2._wire_baseline_rb = tk.Checkbutton(root)
+        g2._wire_raw_rb = tk.Checkbutton(root)
+        g2._wire_delta_rb = tk.Checkbutton(root)
         g2._correlators = ()
         g2._write_locked_last = False
         g2._run_log = rl
@@ -242,6 +257,11 @@ def test_diff_mode_gated_on_enabled():
         g._write_none_rb = tk.Checkbutton(root)
         g._write_ts_rb = tk.Checkbutton(root)
         g._write_diff_rb = tk.Checkbutton(root)
+        g.wire_mode_var = tk.StringVar(value='baseline')
+        g._wire_lock_var = tk.StringVar(value='')
+        g._wire_baseline_rb = tk.Checkbutton(root)
+        g._wire_raw_rb = tk.Checkbutton(root)
+        g._wire_delta_rb = tk.Checkbutton(root)
         g._correlators = (fc,)
         logs = []
         g._enqueue_log = logs.append
