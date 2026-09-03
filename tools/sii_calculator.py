@@ -18,10 +18,6 @@ import tkinter as tk
 from tkinter import ttk
 
 import numpy as np
-import matplotlib
-matplotlib.use('TkAgg')
-from matplotlib.figure import Figure
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 import sii_calculator_backend as backend
 
@@ -181,18 +177,7 @@ class SIICalculatorWindow(tk.Toplevel):
         ttk.Label(res, textvariable=self.status_var, foreground='firebrick').grid(
             row=len(rows) + 1, column=0, columnspan=4, padx=6, pady=(2, 4), sticky='w')
 
-        fig_frame = ttk.LabelFrame(self, text='Plots')
-        fig_frame.grid(row=5, column=0, padx=10, pady=(4, 10), sticky='nsew')
-
-        self.fig = Figure(figsize=(9, 4))
-        self.ax_v2, self.ax_t = self.fig.subplots(1, 2)
-        self.fig.tight_layout()
-
-        self.canvas = FigureCanvasTkAgg(self.fig, master=fig_frame)
-        self.canvas.get_tk_widget().pack(padx=6, pady=6, fill='both', expand=True)
-
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(5, weight=1)
 
         for var in (self.model_var, self.size_mode_var, self.ang_size_var, self.lin_size_var,
                     self.distance_var, self.D_var, self.baseline_var, self.subD_var, self.lam_var,
@@ -287,42 +272,6 @@ class SIICalculatorWindow(tk.Toplevel):
         self.ndot_result_var.set(f'{ndot:.4g} /s  [{ndot_note}]')
         self.nc_result_var.set(f'{Nc:.4g}' if Nc is not None else '-')
         self.T_result_var.set(f'{T:.4g} s  ({T/3600:.4g} hr)')
-
-        self._redraw_plots(vis_func, p, V2, R, ndot)
-
-    def _redraw_plots(self, vis_func, p, V2, R, ndot) -> None:
-        theta, D, lam, td = p['theta'], p['D'], p['lam'], p['td']
-        subD = p['subD'] if p['subD'] is not None else D
-        baseline = p['baseline']
-        vis = lambda u: vis_func(theta, u)
-
-        self.ax_v2.clear()
-        b_max = max(baseline * 1.5, 500e-3) if baseline > 0 else 500e-3
-        baselines_mm = np.linspace(0, b_max * 1e3, 30)
-        v2_sweep = [backend.effective_V2(vis, D, lam, baseline=b * 1e-3, sub_aperture_D=subD)
-                    for b in baselines_mm]
-        self.ax_v2.plot(baselines_mm, v2_sweep)
-        self.ax_v2.axvline(baseline * 1e3, color='firebrick', ls='--', lw=1)
-        self.ax_v2.set_xlabel('Baseline (mm)')
-        self.ax_v2.set_ylabel('<|V|^2>')
-        self.ax_v2.set_yscale('log')
-        self.ax_v2.set_title('<|V|^2> vs baseline')
-        self.ax_v2.grid(alpha=0.3)
-
-        self.ax_t.clear()
-        target_snr = p['target_snr']
-        snr_sweep = np.linspace(max(target_snr * 0.1, 0.5), target_snr * 2, 30)
-        T_sweep = [backend.required_time(s, R, ndot, td) for s in snr_sweep]
-        self.ax_t.plot(snr_sweep, np.array(T_sweep) / 3600.0)
-        self.ax_t.axvline(target_snr, color='firebrick', ls='--', lw=1)
-        self.ax_t.set_xlabel('Target SNR')
-        self.ax_t.set_ylabel('Required T (hr)')
-        self.ax_t.set_yscale('log')
-        self.ax_t.set_title('Required integration time vs target SNR')
-        self.ax_t.grid(alpha=0.3)
-
-        self.fig.tight_layout()
-        self.canvas.draw_idle()
 
     # ------------------------------------------------------------------
     # Apply-R callback
