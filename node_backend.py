@@ -22,6 +22,8 @@ import queue
 import time
 import traceback
 
+import wire_format
+
 # ---------------------------------------------------------------------------
 # Configuration (standalone defaults)
 # ---------------------------------------------------------------------------
@@ -188,6 +190,17 @@ SPECIAL_KEY = {
 KEY_SETUP     = 0xFFFFFFFF   # payload: utf-8 output directory
 KEY_END       = 0xFFFFFFFE   # payload: empty — signals end of one session
 KEY_INTENSITY = 326          # payload: utf-8 header + raw lSPAD `I` reply (px,count,px2,count2)
+
+# Live wire-encoding bake-off confirmation (docs/raw_timestamp_wire_encoding_
+# bakeoff.md): payload = 1 mode byte + utf-8 output directory. Only sent when
+# wire_mode != 'baseline' -- a baseline session still sends plain KEY_SETUP,
+# unchanged, so the common case (almost every real science run) never
+# touches this at all. A receiver that doesn't know KEY_SETUP_V2 hard-fails
+# at session start instead of silently writing structurally-valid,
+# numerically-wrong px_NNN.bin.
+KEY_SETUP_V2  = 0xFFFFFFFD
+WIRE_MODE_BYTE = {'raw': 1, 'delta': 2}          # 'baseline' never needs a byte
+WIRE_MODE_FROM_BYTE = {v: k for k, v in WIRE_MODE_BYTE.items()}
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -377,11 +390,26 @@ def run(sock: socket.socket,
         test_mode: bool,
         stop_event: threading.Event,
         log_fn=print,
-        soft_event: threading.Event | None = None) -> dict:
+        soft_event: threading.Event | None = None,
+        wire_mode: str = 'baseline') -> dict:
     """
     Run one acquisition session over an already-connected socket.
-    Sends KEY_SETUP, streams data chunks, then sends KEY_END.
-    Does NOT close the socket — the caller owns it.
+    Sends KEY_SETUP (or KEY_SETUP_V2 when wire_mode != 'baseline'), streams
+    data chunks, then sends KEY_END. Does NOT close the socket — the caller
+    owns it.
+
+    wire_mode is the live wire-encoding bake-off confirmation
+    (docs/raw_timestamp_wire_encoding_bakeoff.md): 'baseline' (today's plain
+    int64, unchanged), 'raw' (3-column reset/coarse/fine, no combine) or
+    'delta' (delta-encoded int64) -- see flush()'s branch below. The
+    combine step itself stays unconditional in the hot loop (it was already
+    established as cheap/not the bottleneck, unlike the per-pixel grouping
+    loop Phase 1 fixed), so 'raw' derives its columns from the already-
+    combined buffer at flush time via wire_format.split_int64 rather than
+    reworking the hot loop -- a smaller, safer change to code a real
+    detector depends on, at the cost of not modeling raw's theoretical
+    combine-skipping saving (which the bake-off's own numbers already show
+    is not where the real cost difference lives).
 
     Returns per-session counters: records parsed, FIFO-overflow markers (photons
     the detector dropped — unrecoverable, so they are totalled rather than just
@@ -411,8 +439,14 @@ def run(sock: socket.socket,
         return soft_event is not None and soft_event.is_set()
 
     # --- session preamble -------------------------------------------------
+    if wire_mode not in ('baseline', 'raw', 'delta'):
+        raise ValueError(f'unknown wire_mode {wire_mode!r}')
     outdir_bytes = output_dir.encode('utf-8')
-    sock.sendall(struct.pack('>II', KEY_SETUP, len(outdir_bytes)) + outdir_bytes)
+    if wire_mode == 'baseline':
+        sock.sendall(struct.pack('>II', KEY_SETUP, len(outdir_bytes)) + outdir_bytes)
+    else:
+        setup_payload = bytes([WIRE_MODE_BYTE[wire_mode]]) + outdir_bytes
+        sock.sendall(struct.pack('>II', KEY_SETUP_V2, len(setup_payload)) + setup_payload)
 
     # --- per-run queue and buffers ----------------------------------------
     sq: queue.Queue = queue.Queue(maxsize=QUEUE_MAXSIZE)
@@ -426,13 +460,20 @@ def run(sock: socket.socket,
     def flush(keys=None) -> None:
         """Coalesce the named buffers (all of them by default) into ONE blob.
 
-        The wire format is unchanged — frames are simply concatenated before the
-        write, which the receiver cannot tell apart from separate writes. One
-        queue item and one sendall per flush instead of one per pixel: at 320
-        active pixels that collapses 326 syscalls into 1. The old behaviour
-        issued ~265k sendall/s at full rate and overfilled the 200-slot queue on
-        a single flush, blocking the parser mid-flush — which stopped it reading
-        the socket and pushed the loss into lSPAD's FIFO.
+        The wire format is unchanged for marker buffers and for wire_mode
+        'baseline' — frames are simply concatenated before the write, which
+        the receiver cannot tell apart from separate writes. One queue item
+        and one sendall per flush instead of one per pixel: at 320 active
+        pixels that collapses 326 syscalls into 1. The old behaviour issued
+        ~265k sendall/s at full rate and overfilled the 200-slot queue on a
+        single flush, blocking the parser mid-flush — which stopped it
+        reading the socket and pushed the loss into lSPAD's FIFO.
+
+        Photon buffers (int keys) only, under wire_mode 'raw'/'delta', are
+        re-encoded here instead of shipped as plain int64: markers
+        (dwell/line/frame calibration) always stay baseline-format,
+        regardless of the session's wire_mode, since calibration needs full
+        ps precision and is not part of the encoding being compared.
         """
         parts = []
         for key in (bufs if keys is None else keys):
@@ -440,7 +481,13 @@ def run(sock: socket.socket,
             if buf:
                 arr     = np.concatenate(buf)
                 key_id  = key if isinstance(key, int) else SPECIAL_KEY[key]
-                payload = arr.tobytes()
+                if isinstance(key, int) and wire_mode == 'delta':
+                    payload = wire_format.encode_deltas(arr)
+                elif isinstance(key, int) and wire_mode == 'raw':
+                    r, c, f = wire_format.split_int64(arr, PS_PER_COUNT, COUNTS_PER_RESET)
+                    payload = wire_format.pack_raw_columns(r, c, f)
+                else:
+                    payload = arr.tobytes()
                 parts.append(struct.pack('>II', key_id, len(payload)))
                 parts.append(payload)
                 bufs[key] = []
@@ -1101,6 +1148,11 @@ def _run_acquisition_cmd(params: dict, stop_event: threading.Event,
         output_dir = params['output_dir']
         duration   = float(params['duration'])
         test_mode  = bool(params.get('test', False))
+        # Live wire-encoding bake-off confirmation
+        # (docs/raw_timestamp_wire_encoding_bakeoff.md); 'baseline' when
+        # absent, so an older master (or a plain standalone run) behaves
+        # exactly as before.
+        wire_mode  = params.get('wire_mode', 'baseline')
 
         send_ctrl({'status': 'connecting'})
         sock = connect_receiver(recv_host, recv_port)
@@ -1111,7 +1163,7 @@ def _run_acquisition_cmd(params: dict, stop_event: threading.Event,
         try:
             stats = run(sock, output_dir, duration, test_mode, stop_event,
                         log_fn=lambda msg: send_ctrl({'status': 'log', 'msg': msg}),
-                        soft_event=soft_event)
+                        soft_event=soft_event, wire_mode=wire_mode)
         finally:
             sock.close()
 
