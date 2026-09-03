@@ -74,6 +74,9 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+import node_backend
+import wire_format
+
 # Detector time is picoseconds throughout.
 PS_PER_S = 1_000_000_000_000
 
@@ -102,11 +105,18 @@ class Channel:
     """
 
     def __init__(self, node: int, pixel: int, offset: int = 0,
-                 check_monotonic: bool = False) -> None:
+                 check_monotonic: bool = False, wire_mode: str = 'baseline') -> None:
         self.node = node
         self.pixel = pixel
         self.offset = int(offset)
         self.check_monotonic = check_monotonic
+        # Live wire-encoding bake-off confirmation
+        # (docs/raw_timestamp_wire_encoding_bakeoff.md): decides how drain()
+        # turns queued raw bytes back into int64. Immutable for this
+        # channel's lifetime, same as offset -- changing it means a fresh
+        # ChannelGraph (Disable -> re-Derive -> re-Enable), same as a mask
+        # or pair-list change already requires.
+        self.wire_mode = wire_mode
 
         self.q: queue.Queue = queue.Queue()
         self.pending: list = []
@@ -155,8 +165,18 @@ class Channel:
             # `- self.offset` allocates, which also detaches us from the
             # payload bytes. Those bytes are now shared by every subscriber
             # (see merge_hooks), so holding a frombuffer view would both pin
-            # them and expose a read-only array downstream.
-            chunk = np.frombuffer(raw, dtype=np.int64) - self.offset
+            # them and expose a read-only array downstream. Decode is mode-
+            # aware; every mode ends up with the same offset-corrected int64
+            # everything downstream of drain() already assumes.
+            if self.wire_mode == 'raw':
+                r, c, f = wire_format.unpack_raw_columns(raw)
+                chunk = wire_format.combine_to_int64(
+                    r, c, f, node_backend.PS_PER_COUNT, node_backend.COUNTS_PER_RESET
+                ) - self.offset
+            elif self.wire_mode == 'delta':
+                chunk = wire_format.decode_deltas(raw) - self.offset
+            else:
+                chunk = np.frombuffer(raw, dtype=np.int64) - self.offset
             if chunk.size == 0:
                 continue
             if self.check_monotonic and self.last_ts is not None and chunk[0] < self.last_ts:
@@ -240,22 +260,24 @@ class ChannelGraph:
                  stall_tolerance_ps: float = DEFAULT_STALL_TOL_PS,
                  idle_after_s: float = DEFAULT_IDLE_AFTER_S,
                  check_monotonic: bool = False,
-                 clock=time.monotonic) -> None:
+                 clock=time.monotonic,
+                 wire_mode: str = 'baseline') -> None:
         self.tmax = float(tmax_ps)
         self.offset = int(offset)
         self.stall_grace_s = float(stall_grace_s)
         self.stall_tolerance_ps = float(stall_tolerance_ps)
         self.idle_after_s = float(idle_after_s)
         self.clock = clock
+        self.wire_mode = wire_mode
 
         self.pairs = [(p.p1, p.p2) for p in pair_list.pairs]
         self.partners1 = pair_list.partners_node1()
         self.partners2 = pair_list.partners_node2()
 
         # Node 2 carries the clock offset; node 1 is the reference.
-        self.ch1 = {p: Channel(1, p, 0, check_monotonic)
+        self.ch1 = {p: Channel(1, p, 0, check_monotonic, wire_mode=wire_mode)
                     for p in pair_list.channels_node1}
-        self.ch2 = {p: Channel(2, p, self.offset, check_monotonic)
+        self.ch2 = {p: Channel(2, p, self.offset, check_monotonic, wire_mode=wire_mode)
                     for p in pair_list.channels_node2}
 
         self.accumulating = False
