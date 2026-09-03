@@ -46,6 +46,23 @@ measuring total work (node CPU + wire bytes + master CPU + correlator CPU)
 for each candidate on the same real data — not by picking one on the
 strength of an argument.
 
+**A second, equally load-bearing goal: characterize the hardware demand each
+candidate places on every physical component in the chain** — node PC, master
+PC, and the ethernet link between them — not just total CPU-seconds. A
+candidate can win on CPU-seconds and still be the wrong choice if it pushes
+one specific resource on one specific machine past what that machine
+actually has: node-side RAM headroom for the encode buffer, master-side RAM
+for decode/demux buffers, either machine's CPU **utilization** (not just
+work done — a candidate that finishes in less wall-clock time but pegs a
+core at 100% leaves no headroom for the rest of node.py/master_backend.py),
+and the ethernet link's realized throughput and packet rate against the
+LAN's actual rated capacity. Wire bytes/event alone can hide a packet-rate
+problem: many small fixed-size records (raw 3-column) versus fewer,
+variable-length delta-encoded blocks can hit NIC interrupt/CPU overhead
+limits before either hits a bandwidth limit, so packet count matters
+alongside byte count. This is measured per candidate, per machine, per
+resource — not folded into the single CPU-seconds figure above.
+
 One fact holds regardless of which encoding wins: **node1's 116 Mcps
 flood-illuminated capture is ~8× over the measured parser ceiling**, and the
 team's own analysis found no software-only fix at the 2–3× scale closes an
@@ -136,21 +153,64 @@ approximation:
    encoder's segment-split logic (new segment whenever the next delta is
    `< 0` or `>= 2**32`) as a standalone function purely for this
    measurement.
-2. **Wire bytes**: sum actual bytes/event each candidate produces across
+2. **Node-side live max-load ceiling, no shipping** — this is the piece
+   item 1 can't answer on its own: item 1 times the encode step in
+   isolation, extracted from the real loop, so it can't see queueing,
+   thread contention with the command-server thread, or GC/allocation
+   churn under sustained load. Run the actual `node_backend.run()` loop
+   (not an extracted function) on the **node PC itself**, fed by
+   `tools/replay.py`'s existing `ReplaySocket` replaying both real
+   captures back-to-back **unpaced** (`replay()` already runs ~14× real
+   time with no pacing, since chunks are served immediately on `recv()`) —
+   but **not** through `replay()` as it stands today: that helper pipes
+   `run()`'s output into a real `master_backend.run_session_loop()` over a
+   loopback socketpair, in the *same process*, which would (a) actually
+   ship and write `px_*.bin`, contradicting "no shipping", and (b) have
+   node and master contending for the same CPU, confounding exactly the
+   per-machine measurement item 6 wants. This needs a genuine discard
+   variant: keep `ReplaySocket` as the lSPAD-side input, but replace the
+   `master_backend` receiver thread with one that just drains the far end
+   of the socketpair and throws the bytes away — nothing written, nothing
+   parsed downstream. Run it standalone on the node PC's own hardware
+   (not the dev machine this plan's other items may run on), since that
+   hardware is specifically what's being characterized. `run()` already
+   returns exactly the diagnostic signals needed to locate the ceiling per
+   its own docstring: `lag_max_s` and `queue_max` climbing (parser
+   stalling on `sq.put()` — the ceiling is ours) versus `overflow` alone
+   rising (the detector's own readout is the limit, not the software). Do
+   this for both candidates, and separately for the 81-pixel and 40-pixel
+   pixel counts, since Stage 2's own prior finding was that the bottleneck
+   scales with active-pixel count, not just event rate.
+3. **Wire bytes**: sum actual bytes/event each candidate produces across
    the whole capture, separately for the 81-pixel flood (mean 1.43 Mcps/px,
    max 1.82) and the 40-pixel run (1.64-2.97 Mcps) — the real compression
    ratio at both ends of the measured rate range, not an assumed one.
-3. **Correlator-side kernel cost**: a numba `nogil` microbenchmark isolating
+4. **Correlator-side kernel cost**: a numba `nogil` microbenchmark isolating
    just the arithmetic difference — one `int64` subtraction vs. the 3-term
    weighted form (`dr*6_553_600_000 + dc*100_000 + df`) — per candidate
    pair, at the scale already on record (8.76M t1 events, `n_shift=5`) to
    quantify the extra correlator-side cost raw columns would add, without
    committing to the full `ChannelGraph` rewrite yet.
-4. **Master-side decode cost**: re-verify (don't just cite) the ~250M
+5. **Master-side decode cost**: re-verify (don't just cite) the ~250M
    events/s decode figure by prototyping `decode_deltas()` against the real
    captures on the current machine — `wire_format.py` doesn't exist in the
    tree yet, so that number was a scratch measurement from the original
    investigation, not checked-in, tested code.
+6. **Per-machine hardware resource characterization**, run alongside 1, 2
+   and 5 (not a separate pass — resource use under the real encode/decode
+   load is the point): on the node PC during item 2's live run and the
+   master PC during decode/demux, sample peak RSS via the same `ctypes`
+   `PeakWorkingSetSize` read `correlate_multi.py` already uses (no new
+   dependency — `psutil` is deliberately not in `requirements.txt`, every
+   sender node installs from it), and CPU **utilization** via
+   `time.process_time()` deltas against wall-clock deltas over the run
+   (fraction of a core, not just total CPU-seconds already captured in
+   1/2/4/5). For the ethernet link: realized throughput (bytes/s actually
+   moved, from the same byte counts as item 3) and packet/record rate for
+   each candidate against the LAN's rated capacity, since raw 3-column's
+   fixed small records and delta-encoding's variable-length blocks can hit
+   a NIC's per-packet overhead ceiling at different rates even at
+   identical byte throughput.
 
 ### Output: a decision table
 
@@ -159,6 +219,14 @@ correlator CPU-seconds for both candidates, at both measured rate regimes —
 plus the already-known blast-radius column (files touched, whether
 `px_NNN.bin`/offline tools change). This table is what "reduce total work
 across the chain" gets decided against.
+
+Alongside it, a **per-machine hardware-demand table** (also both candidates,
+both rate regimes): node PC peak RSS and CPU utilization %, master PC peak
+RSS and CPU utilization %, and the ethernet link's realized throughput and
+packet rate against its rated capacity. This is what the second goal above
+gets decided against — a candidate can win the CPU-seconds table and still
+lose here if it leaves less headroom on a machine or link that is already
+close to its ceiling.
 
 ## Phase 3 — Decide, then build the winning approach
 
@@ -206,7 +274,7 @@ at all.
 | file | change |
 |---|---|
 | `node_backend.py` | Phase 1: fused-slot/bincount bucketing (replaces the `O(chunk×N)` scan) |
-| `tools/bench_wire_encoding.py` (new) | Phase 2: standalone bake-off harness, not wired into the real pipeline |
+| `tools/bench_wire_encoding.py` (new) | Phase 2: standalone bake-off harness, not wired into the real pipeline; item 2 needs a discard-sink variant of `tools/replay.py`'s loopback (drain-and-drop instead of a real `master_backend` receiver) and must run on the node PC's own hardware, not wherever the rest of the harness runs |
 | *(Phase 3, delta-encoding path)* `wire_format.py` (new), `master_backend.py`, 3 mechanical hook-consumer edits | decode-to-int64 at master; `px_NNN.bin`/kernel/offline tools unchanged |
 | *(Phase 3, raw-column path)* `node_backend.py`, `master_backend.py`, `correlate_engine.py`, `correlate_kernel.py`, `correlate_multi.py` | full raw pipeline as originally scoped |
 | `tests/test_epoch_fix.py`, `tests/test_channel_graph.py`, `tests/test_write_lock.py` | extended per whichever Phase 3 path is taken |
