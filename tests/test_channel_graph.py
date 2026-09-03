@@ -27,6 +27,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))), 'tools'))
 
 import pair_map
+import node_backend
+import wire_format
 from correlate_engine import PS_PER_S, ChannelGraph
 
 TMAX = 500_000          # +-500 ns, the correlator default
@@ -131,7 +133,7 @@ def build(mode, **kw):
     clock = kw.pop('clock', None) or FakeClock()
     tmax = kw.pop('tmax', TMAX)
     gkw = {k: kw.pop(k) for k in
-           ('offset', 'stall_grace_s', 'stall_tolerance_ps', 'check_monotonic')
+           ('offset', 'stall_grace_s', 'stall_tolerance_ps', 'check_monotonic', 'wire_mode')
            if k in kw}
     pl = pair_map.derive(mode, **kw)
     g = ChannelGraph(pl, tmax, clock=clock, **gkw)
@@ -781,6 +783,65 @@ def test_offset_change_while_accumulating_is_refused():
         check('changing offset mid-session raises', False, 'no exception')
     except RuntimeError:
         check('changing offset mid-session raises', True)
+
+
+def _put_encoded(ch, ts: np.ndarray, mode: str) -> None:
+    """Encode ts under `mode` and put it on `ch`'s queue, the way a real
+    session's flush() would have shipped it."""
+    if mode == 'raw':
+        r, c, f = wire_format.split_int64(ts, node_backend.PS_PER_COUNT, node_backend.COUNTS_PER_RESET)
+        ch.q.put(wire_format.pack_raw_columns(r, c, f))
+    elif mode == 'delta':
+        ch.q.put(wire_format.encode_deltas(ts))
+    else:
+        ch.q.put(ts.astype(np.int64).tobytes())
+
+
+def test_wire_mode_raw_and_delta_reconstruct_the_same_coincidences():
+    """Live wire-encoding bake-off confirmation
+    (docs/raw_timestamp_wire_encoding_bakeoff.md): a ChannelGraph built with
+    wire_mode='raw' or 'delta' must reconstruct the exact same coincidences
+    as 'baseline' fed the identical underlying timestamps, in several
+    chunks each (not one shot, so this also exercises merge()/drain() with
+    a decoded-not-raw source) -- switching wire representation must never
+    change the physics answer."""
+    rng = np.random.default_rng(30)
+    s1 = poisson_stream(rng, 1e6, 0.002)
+    s2 = poisson_stream(rng, 1e6, 0.002)
+    chunks1 = np.array_split(s1, 5)
+    chunks2 = np.array_split(s2, 5)
+
+    results = {}
+    for mode in ('baseline', 'raw', 'delta'):
+        _, g, clock, _ = build('identity', lo=150, hi=150, wire_mode=mode)
+        taus = []
+        for c1, c2 in zip(chunks1, chunks2):
+            if c1.size:
+                _put_encoded(g.ch1[150], c1, mode)
+            if c2.size:
+                _put_encoded(g.ch2[150], c2, mode)
+            clock.advance(0.5)
+            g.drain_all()
+            rel = g.release()
+            for p1, p2, t1b, t2a in rel.batches:
+                taus.extend(brute_taus(t1b, t2a))
+        # Flush the tail: a far-future sentinel on node 2 releases node 1's rest.
+        _put_encoded(g.ch2[150], np.array([int(s1.max()) + FAR], dtype=np.int64), mode)
+        clock.advance(0.5)
+        g.drain_all()
+        rel = g.release()
+        for p1, p2, t1b, t2a in rel.batches:
+            taus.extend(brute_taus(t1b, t2a))
+        results[mode] = sorted(taus)
+
+    check('raw reconstructs the same coincidences as baseline',
+          results['raw'] == results['baseline'],
+          f"{len(results['raw'])} vs {len(results['baseline'])}")
+    check('delta reconstructs the same coincidences as baseline',
+          results['delta'] == results['baseline'],
+          f"{len(results['delta'])} vs {len(results['baseline'])}")
+    check('the comparison is not vacuous', len(results['baseline']) > 0,
+          str(len(results['baseline'])))
 
 
 def test_offset_matches_post_hoc_subtraction():
