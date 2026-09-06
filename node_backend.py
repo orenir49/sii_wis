@@ -400,6 +400,7 @@ def open_lspad_tmode_stream(duration: float, log_fn=print) -> tuple:
             f'(replied {d_reply_text!r}) -- refusing to start, since this '
             f"session's Run folder would land somewhere neither this code "
             f'nor the master is looking.')
+    log_fn(f'{d_reply_text} is set as data directory\n')
 
     spad_sock.sendall(b'T,v,1\n')
     tdc_reply, tdc_n = drain_lspad(spad_sock, quiet_for=0.2,
