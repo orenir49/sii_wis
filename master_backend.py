@@ -37,6 +37,7 @@ SPECIAL_KEY_TO_FILENAME = {
     324: 'slave_line.bin',
     325: 'slave_frame.bin',
 }
+SLAVE_DWELL_KEY = 323   # what master.py's sparse dwell calibration actually fits on
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -95,7 +96,7 @@ def check_connection(sock: socket.socket) -> bool:
 def run_session_loop(conn: socket.socket, log_fn=print,
                      pixel_hooks: dict | None = None,
                      event_accum: list | None = None,
-                     on_first_chunk=None,
+                     on_first_dwell_chunk=None,
                      write_hooked: bool = True) -> None:
     """
     Handle back-to-back acquisition sessions on an accepted connection.
@@ -115,10 +116,15 @@ def run_session_loop(conn: socket.socket, log_fn=print,
     event_accum:  optional single-element list [int]; the inner loop adds
                   n_bytes//8 for every pixel chunk (key_id < 320) so the
                   caller can poll it for a count-rate display.
-    on_first_chunk: optional callable, invoked once per session when the first
-                  data chunk arrives. Marks the moment acquisition is genuinely
-                  under way — several seconds after START, since the sender
-                  still has to reach the receiver and negotiate with lSPAD.
+    on_first_dwell_chunk: optional callable, invoked once per session when the
+                  first SLAVE_DWELL_KEY (323) chunk arrives -- not merely the
+                  first chunk of any key. The one consumer (master.py's sparse
+                  dwell calibration) fits its offset from slave_dwell
+                  specifically, so anything else arriving first (a master-chip
+                  file completing before the slave one under T-mode, say)
+                  must not start that calibration's wait-timeout clock: doing
+                  so left it counting down against data that had not started
+                  arriving yet.
     write_hooked: when False, NOTHING is written -- no px_*.bin, no sync files,
                   and the output directory is not even created. Hooked keys are
                   fed to their queues only; everything else is discarded. Live
@@ -196,11 +202,12 @@ def run_session_loop(conn: socket.socket, log_fn=print,
                            f'written now, so those files are not this session — '
                            f'do not analyse them against this run.')
 
-            chunks    = 0
-            unknown   = 0
-            written   = 0      # bytes committed to disk this session
-            skipped   = 0      # bytes deliberately not written (write_hooked=False)
-            write_s   = 0.0    # seconds spent inside handle.write
+            chunks       = 0
+            unknown      = 0
+            written      = 0      # bytes committed to disk this session
+            skipped      = 0      # bytes deliberately not written (write_hooked=False)
+            write_s      = 0.0    # seconds spent inside handle.write
+            dwell_seen   = False  # fires on_first_dwell_chunk at most once per session
             try:
                 while True:
                     header          = readall(stream, 8)
@@ -208,8 +215,10 @@ def run_session_loop(conn: socket.socket, log_fn=print,
                     if key_id == KEY_END:
                         break
                     payload = readall(stream, n_bytes)
-                    if chunks == 0 and on_first_chunk is not None:
-                        on_first_chunk()
+                    if (not dwell_seen and key_id == SLAVE_DWELL_KEY
+                            and on_first_dwell_chunk is not None):
+                        dwell_seen = True
+                        on_first_dwell_chunk()
 
                     # Tee, never divert: every payload is persisted whether or not
                     # a live consumer is also watching this key. Hooks are read

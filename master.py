@@ -519,7 +519,7 @@ class NodePanel:
                         log_fn=log_fn,
                         pixel_hooks=hooks,
                         event_accum=self._event_accum,
-                        on_first_chunk=(
+                        on_first_dwell_chunk=(
                             (lambda: self._on_first_data_fn(self.node_id))
                             if self._on_first_data_fn else None),
                         write_hooked=write_hooked,
@@ -1207,12 +1207,19 @@ class ReceiverGUI:
             self._schedule_progress(step_ms, 1, self._run_id)
 
         if any(c.is_enabled for c in self._correlators):
-            # Wait for data to actually flow before opening the calibration
-            # window. Between START and the first timestamp the sender still has
-            # to reach the receiver and negotiate with lSPAD (STOP, drain,
-            # T,v,1, SB) — seconds. Timing the window from the button press
-            # spent most of it on an idle link and captured only the tail of the
-            # sparse-pulse waveform, so the fit had too few pulses to converge.
+            # Wait for slave_dwell data specifically (not just any chunk)
+            # before opening the calibration window. Between START and the
+            # first timestamp the sender still has to reach the receiver and
+            # negotiate with lSPAD — seconds. Timing the window from the
+            # button press spent most of it on an idle link and captured only
+            # the tail of the sparse-pulse waveform, so the fit had too few
+            # pulses to converge. Under T-mode specifically, dwell data
+            # arrives in one burst per completed file rather than a trickle,
+            # so gating on ANY chunk (a master-chip file, or an early
+            # slave-chip file with no dwell marker in it yet, completing
+            # first) would start CAL_ARM_TIMEOUT_MS's countdown before
+            # slave_dwell data exists at all — see
+            # master_backend.run_session_loop's on_first_dwell_chunk.
             self._cal_waiting = {n.node_id for n in (self.node1, self.node2)
                                  if n.is_ready()}
             self._cal_run = self._run_id
@@ -1220,7 +1227,7 @@ class ReceiverGUI:
                 f'Sparse cal: waiting for data from node(s) '
                 f'{sorted(self._cal_waiting)} …\n')
             self._set_cal_status('● Waiting for data …', color='#cc8800')
-            # Fallback: never hang if a node never delivers a first chunk.
+            # Fallback: never hang if a node never delivers slave_dwell data.
             self.root.after(CAL_ARM_TIMEOUT_MS,
                             lambda rid=self._run_id: self._arm_sparse_cal(rid, timed_out=True))
 
@@ -1473,6 +1480,23 @@ class ReceiverGUI:
         """Detector-time span of a timestamp array, in seconds."""
         return 0.0 if arr.size < 2 else float(arr.max() - arr.min()) / 1e12
 
+    @staticmethod
+    def _trim_to_window(arr: np.ndarray, window_s: float = SPARSE_CAL_WAVEFORM_S) -> np.ndarray:
+        """Keep only `arr`'s leading `window_s` of detector time.
+
+        Under T-mode, dwell timestamps arrive one file at a time rather than
+        in a near-continuous trickle, so a burst that finally clears
+        `_poll_sparse_cal`'s span check can carry many multiples of one
+        waveform period. `estimate_offset()`'s own docstring calls a
+        `search_window` mandatory above ~2000 events to avoid O(N^2) memory;
+        trimming each node's array independently to one period up front
+        (matching the amount SB's trickle used to hand it anyway) keeps the
+        fit sized the way it always was, with no cross-node reference point.
+        """
+        if arr.size == 0:
+            return arr
+        return arr[arr <= arr.min() + int(round(window_s * 1e12))]
+
     def _arm_sparse_cal(self, run_id: int, timed_out: bool = False) -> None:
         """Open the calibration window now that data is flowing on every node."""
         if run_id != self._run_id or self._cal_armed_run == run_id:
@@ -1500,6 +1524,13 @@ class ReceiverGUI:
         and too few pulses to converge. Waiting for the dwell timestamps to
         actually span a period makes the pulse count independent of throughput;
         it just takes longer when the sender is behind.
+
+        Under T-mode, dwell data lands in one burst per completed file rather
+        than a continuous trickle, so this span check can pass with several
+        periods already collected in a single poll — the burst that finally
+        clears `SPARSE_CAL_WAVEFORM_S` is not trimmed to size here; that is
+        `_apply_sparse_dwell_offset`'s `_trim_to_window` step, done once at
+        the point of the fit rather than on every poll.
         """
         if run_id != self._run_id:
             self._enqueue_log(
@@ -1554,6 +1585,15 @@ class ReceiverGUI:
 
         t1, m1 = self._cal_acc[self.node1.node_id]   # slave_dwell, master_dwell
         t2, m2 = self._cal_acc[self.node2.node_id]
+
+        # T-mode hands this callback whatever arrived in the file that finally
+        # cleared the span check -- possibly several waveform periods' worth.
+        # Trim each node's arrays independently back to one period before
+        # fitting; see _trim_to_window.
+        t1 = self._trim_to_window(t1)
+        t2 = self._trim_to_window(t2)
+        m1 = self._trim_to_window(m1)
+        m2 = self._trim_to_window(m2)
 
         MIN_EVENTS = 5
         if t1.size < MIN_EVENTS or t2.size < MIN_EVENTS:
