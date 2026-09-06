@@ -10,7 +10,6 @@ Or run standalone:
 """
 
 import argparse
-import glob
 import json
 import os
 import select
@@ -55,15 +54,20 @@ TDC_CALIB_S       = 180.0   # T,c,1 runs for minutes
 # lSPAD restart, so the folder is discovered by diffing the directory listing
 # before/after sending T,, never guessed from a counter.
 #
-# LSPAD_SEARCH_ROOT/LSPAD_SUBDIR match ssh_launcher.py's constants of the
-# same name -- that module locates lSPAD.exe over SSH (the master launching
-# it); this one locates it on the local filesystem (this code runs ON the
-# node, where lSPAD.exe already is).
-LSPAD_SEARCH_ROOT = r'C:\Program Files (x86)\SPADlambda'
-LSPAD_SUBDIR      = 'lSPAD_standalone_win64'
-TMODE_RUN_ROOT    = os.path.join('data', 'tdc')   # relative to lSPAD.exe's own directory
-TMODE_RUN_WAIT_S  = 10.0    # new Run folder must appear within this long
-TMODE_POLL_S      = 0.05    # file-lane poll interval while a file might still be arriving
+# lSPAD's own default save location is under its install directory
+# (C:\Program Files (x86)\SPADlambda\...); a node user may not have write
+# access there. `D,<dir>` (LSPAD_CLI.md) redirects it, so open_lspad_tmode_
+# stream() points it at this repo's own gitignored spad_data/ instead, where
+# the node always has write access. Verified live against real lSPAD
+# (2026-09-06): it appends its fixed "data/tdc/RunNNN/" suffix to whatever
+# `D,<dir>` was sent via a plain string concatenation with NO separator
+# inserted -- a `dir` with no trailing separator produced the nonsense path
+# "...spad_data\tdcdata/tdc/RunNNN/". TMODE_SAVE_DIR must end in one.
+TMODE_SAVE_DIR   = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                'spad_data') + os.sep
+TMODE_RUN_ROOT   = os.path.join(TMODE_SAVE_DIR, 'data', 'tdc')
+TMODE_RUN_WAIT_S = 10.0    # new Run folder must appear within this long
+TMODE_POLL_S     = 0.05    # file-lane poll interval while a file might still be arriving
 
 # ---------------------------------------------------------------------------
 # Physics
@@ -306,29 +310,29 @@ def reconstruct_tmode_epochs(pixel: np.ndarray, coarse: np.ndarray, fine: np.nda
     return time_ps[keep], pixel[keep], next_offset
 
 
-def find_tmode_run_dir(before: set, lspad_cwd_root: str, log_fn=print,
+def find_tmode_run_dir(before: set, log_fn=print,
                        wait_s: float = TMODE_RUN_WAIT_S) -> str:
-    """Poll `TMODE_RUN_ROOT` under `lspad_cwd_root` for a Run folder not in
-    `before` (a snapshot taken just before sending T,). Diffing the listing
-    rather than tracking/guessing the run number is deliberate: the counter
-    increments per T, command for the life of the lSPAD.exe process and
-    resets on restart (verified empirically), so guessing it would silently
-    break the first time something else touches this lSPAD."""
-    root = os.path.join(lspad_cwd_root, TMODE_RUN_ROOT)
+    """Poll TMODE_RUN_ROOT for a Run folder not in `before` (a snapshot taken
+    just before sending T,). Diffing the listing rather than tracking/
+    guessing the run number is deliberate: the counter increments per T,
+    command for the life of the lSPAD.exe process and resets on restart
+    (verified empirically), so guessing it would silently break the first
+    time something else touches this lSPAD."""
     deadline = time.time() + wait_s
     while time.time() < deadline:
         try:
-            current = set(os.listdir(root))
+            current = set(os.listdir(TMODE_RUN_ROOT))
         except OSError:
             current = set()
         new = current - before
         if new:
-            return os.path.join(root, sorted(new)[0])
+            return os.path.join(TMODE_RUN_ROOT, sorted(new)[0])
         time.sleep(TMODE_POLL_S)
     raise RuntimeError(
-        f'No new Run folder appeared under {root} within {wait_s:.0f} s of '
-        f'sending T, -- lSPAD may not be running on this machine, or its '
-        f'working directory differs from expected.')
+        f'No new Run folder appeared under {TMODE_RUN_ROOT} within '
+        f'{wait_s:.0f} s of sending T, -- lSPAD may not have accepted the '
+        f'D,<dir> save-path command (see open_lspad_tmode_stream), or is '
+        f'not running on this machine.')
 
 
 def is_text_reply(data: bytes) -> bool:
@@ -353,24 +357,13 @@ def check_connection(sock: socket.socket) -> bool:
         return False
 
 
-def find_lspad_dir_local() -> str | None:
-    """Return the directory containing lSPAD.exe on this machine, or None.
-
-    The local-filesystem counterpart to ssh_launcher.find_lspad_dir() (which
-    does the same search over SSH, from the master). This code runs ON the
-    node, where lSPAD.exe already is, so it just walks the local disk.
-    """
-    target = os.path.join(LSPAD_SEARCH_ROOT, LSPAD_SUBDIR)
-    matches = glob.glob(os.path.join(target, '**', 'lSPAD.exe'), recursive=True)
-    return os.path.dirname(matches[0]) if matches else None
-
-
 def open_lspad_tmode_stream(duration: float, log_fn=print) -> tuple:
-    """Connect to lSPAD, clear any leftover acquisition, check the TDC
-    calibration, and start a T-mode acquisition. Returns (spad_sock, run_dir)
-    -- run_dir is the newly-created Run folder this session's files land in,
-    discovered by diffing lSPAD's data\\tdc\\ listing from just before the T,
-    command was sent (see find_tmode_run_dir()).
+    """Connect to lSPAD, clear any leftover acquisition, point its save path
+    at this repo's spad_data/ (TMODE_SAVE_DIR), check the TDC calibration,
+    and start a T-mode acquisition. Returns (spad_sock, run_dir) -- run_dir
+    is the newly-created Run folder this session's files land in, discovered
+    by diffing TMODE_RUN_ROOT's listing from just before the T, command was
+    sent (see find_tmode_run_dir()).
 
     Same STOP-drain-then-calibrate handshake as the retired SB path (see
     docs/lspad_streaming_throttle.md, docs/raw_timestamp_wire_encoding_
@@ -394,6 +387,20 @@ def open_lspad_tmode_stream(duration: float, log_fn=print) -> tuple:
         log_fn(f'pre-START STOP: discarded {pre_n / 1e6:,.0f} MB of '
                f'leftover stream in {dt:.1f} s before lSPAD went quiet\n')
 
+    # lSPAD requires the directory to already exist (an unrecognised path
+    # replies 'Incorrect path' -- verified live) and echoes the given path
+    # back verbatim on success.
+    os.makedirs(TMODE_SAVE_DIR, exist_ok=True)
+    spad_sock.sendall(f'D,{TMODE_SAVE_DIR}\n'.encode('utf8'))
+    d_reply, _ = drain_lspad(spad_sock, quiet_for=0.2, cap=LSPAD_HANDSHAKE_S)
+    d_reply_text = d_reply.decode('utf8', errors='replace').strip()
+    if d_reply_text != TMODE_SAVE_DIR:
+        raise RuntimeError(
+            f'lSPAD rejected the save-path command D,{TMODE_SAVE_DIR} '
+            f'(replied {d_reply_text!r}) -- refusing to start, since this '
+            f"session's Run folder would land somewhere neither this code "
+            f'nor the master is looking.')
+
     spad_sock.sendall(b'T,v,1\n')
     tdc_reply, tdc_n = drain_lspad(spad_sock, quiet_for=0.2,
                                    cap=LSPAD_HANDSHAKE_S)
@@ -408,18 +415,13 @@ def open_lspad_tmode_stream(duration: float, log_fn=print) -> tuple:
         log_fn(drain_lspad(spad_sock, quiet_for=2.0, cap=TDC_CALIB_S)[0]
                .decode('utf8', errors='replace'))
 
-    lspad_dir = find_lspad_dir_local()
-    if lspad_dir is None:
-        raise RuntimeError(
-            f'lSPAD.exe not found under {LSPAD_SEARCH_ROOT}\\{LSPAD_SUBDIR} '
-            f'on this machine -- cannot locate its data\\tdc\\ output.')
-    run_root = os.path.join(lspad_dir, TMODE_RUN_ROOT)
-    before = set(os.listdir(run_root)) if os.path.isdir(run_root) else set()
+    before = (set(os.listdir(TMODE_RUN_ROOT))
+             if os.path.isdir(TMODE_RUN_ROOT) else set())
 
     spad_sock.settimeout(None)   # main loop drives its own select()
     spad_sock.sendall(f'T,{int(duration * 1000)}\n'.encode('utf8'))
 
-    run_dir = find_tmode_run_dir(before, lspad_dir, log_fn)
+    run_dir = find_tmode_run_dir(before, log_fn)
     log_fn(f'T-mode acquisition started, output: {run_dir}\n')
     return spad_sock, run_dir
 
