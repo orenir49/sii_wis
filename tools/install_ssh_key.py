@@ -6,7 +6,7 @@ Run this in YOUR OWN terminal so the password never leaves your machine:
 
     cd C:\\Users\\npk\\Documents\\code\\sii_wis
     .venv\\Scripts\\python.exe <this script> 192.168.1.11 labcomp1
-    .venv\\Scripts\\python.exe <this script> 192.168.1.12 oreni
+    .venv\\Scripts\\python.exe <this script> 192.168.2.11 oreni
 
 It authenticates once with the password, appends the public key to the right
 authorized_keys file for that account, fixes the ACLs, then reconnects using

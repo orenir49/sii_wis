@@ -23,7 +23,7 @@ import raw_dump
 import ssh_launcher
 
 NODES = ((1, '192.168.1.11', 'labcomp1'),
-         (2, '192.168.1.12', 'oreni'))
+         (2, '192.168.2.11', 'oreni'))
 
 
 def fetch(node_id, host, user, remote_rel, outdir, log=print):

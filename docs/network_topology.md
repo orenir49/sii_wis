@@ -107,6 +107,24 @@ the shared switch entirely — the master needs one dedicated port per node
 2-node case). This removes the contention completely rather than managing
 around it, and costs nothing in the software stack.
 
+**Implemented 2026-09-05.** Node1 keeps its address (192.168.1.11) but now
+reaches the master over a dedicated cable into the master's native
+192.168.1.10 port instead of through the shared switch. Node2 moved to a
+second subnet, 192.168.2.11, on its own dedicated cable into a second
+adapter on the master, 192.168.2.10. No software change was needed for the
+data-channel handshake: `recv_host` (`master.py`) is read from
+`self._ctrl_sock.getsockname()[0]` — the local address of the control
+connection to that specific node — so it already resolves to the correct
+master-side NIC per node via normal OS routing, with no per-node branching
+in the code. The parts that did need updating were the *defaults* baked in
+as literals: `master.py`'s `NodePanel` default IPs, the `NODES` tuples in
+`tools/push_mask.py` and `tools/fetch_capture.py`, the usage example in
+`tools/install_ssh_key.py`, and `setup_node.ps1`'s `$SUBNET` filter
+(widened from `192.168.1.*` to `192.168.*` so the Private-profile
+persistence task still matches whichever node it runs on). Verified from
+the master: ICMP and the node command port (50010) both reachable on
+192.168.1.11 and 192.168.2.11.
+
 ## Topology for the future: dozens of nodes into one master
 
 A dedicated physical port per node does not scale past a handful of

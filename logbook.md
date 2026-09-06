@@ -275,3 +275,8 @@ Reverting to 2:1 fiber splitter, new spectral alignment.
   - Added Windows Defender exclusions (sii_wis dir + python.exe/pythonw.exe/lSPAD.exe) on both nodes and the master -- genuinely helped node2's headroom, but wasn't node1's actual problem.
   - Fix for now: give node1 and node2 each their own dedicated cable to master, bypassing the shared switch. Topology recommendation for scaling to dozens of nodes written up in docs/network_topology.md.
   - Wire-encoding live confirmation itself succeeded once run at a rate the (then-shared) network could sustain: baseline/raw/delta gave statistically indistinguishable g2 results (833M/831M/834M total taus, matching mean/std) at pixel 164, 2 min each -- see docs/raw_timestamp_wire_encoding_bakeoff.md.
+
+## 05-09-26
+- Installed the dedicated per-node links from the 3-9-26 fix: node1 stays on 192.168.1.11 but now runs a private cable into the master's 192.168.1.10 port, and node2 moved off the shared subnet onto its own private cable, 192.168.2.11 into the master's second port at 192.168.2.10. Shared switch is out of the data path entirely.
+- Confirmed both links up from the master: ICMP and the node command port (50010) both reachable on 192.168.1.11 and 192.168.2.11.
+- Updated the default sender IPs baked into the GUI and the SFTP tools (`master.py`, `tools/push_mask.py`, `tools/fetch_capture.py`, `tools/install_ssh_key.py` usage) and widened `setup_node.ps1`'s subnet filter to `192.168.*` so it still matches node2 on its new subnet. See docs/network_topology.md for the full writeup.
