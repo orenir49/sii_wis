@@ -114,6 +114,8 @@ class NodePanel:
         self._event_accum: list = [0]              # [int] — incremented by data thread, read by GUI
         self._data_streaming = False
         self._session_active = False   # START sent, 'done'/'error' not yet received
+        self._parse_progress = ''      # "m12/45, s10/45" from the node's last 'progress' message
+        self._last_rate_str = ''       # count-rate string from the last 10 s tick
         self._pending_mode = 'timestamp'   # which receive loop the next accepted connection needs
 
         self._build_ui(parent, default_sender_ip, default_cmd_port, default_data_port, default_ssh_user)
@@ -401,6 +403,10 @@ class NodePanel:
             n = msg.get('lines', 0)
             self.log_fn(f'[N{self.node_id}] Intensity measurement done — '
                         f'{n} line(s) written to {self._output_dir}/node{self.node_id}.txt\n')
+        elif s == 'progress':
+            self._gui(lambda: self._set_parse_progress(
+                msg.get('m_idx', 0), msg.get('m_total', 0),
+                msg.get('s_idx', 0), msg.get('s_total', 0)))
         elif s == 'log':
             self.log_fn(f'[N{self.node_id}] {msg.get("msg", "")}\n')
         elif s == 'error':
@@ -827,8 +833,13 @@ class NodePanel:
 
     def _set_data_status(self, state: str) -> None:
         self._data_streaming = (state == 'streaming')
+        if state != 'streaming':
+            # A new run's rate/progress must not show leftovers from the
+            # previous one -- both are only ever set while streaming.
+            self._parse_progress = ''
+            self._last_rate_str = ''
         if state == 'streaming':
-            self.data_status_var.set('  Data: ● Streaming')
+            self._refresh_streaming_label()
             self._data_lbl.config(fg='#33aa33')
         elif state == 'measuring':
             self.data_status_var.set('  Data: ● Measuring intensity')
@@ -846,6 +857,28 @@ class NodePanel:
             self.data_status_var.set('  Data: ● Idle')
             self._data_lbl.config(fg='#888888')
 
+    def _refresh_streaming_label(self) -> None:
+        """Compose the one 'Data: streaming' line from whatever pieces are
+        currently known -- count rate (every 10 s) and T-mode ingestion
+        progress (every LAG_CHECK_S from the node) update independently, so
+        neither may simply overwrite the other's contribution."""
+        parts = ['  Data: ● Streaming']
+        if self._last_rate_str:
+            parts.append(self._last_rate_str)
+        if self._parse_progress:
+            parts.append(self._parse_progress)
+        self.data_status_var.set('   '.join(parts))
+
+    def _set_parse_progress(self, m_idx: int, m_total: int,
+                            s_idx: int, s_total: int) -> None:
+        """Live T-mode ingestion progress from the node's periodic 'progress'
+        control message -- one line that updates in place, replacing the old
+        per-tick 'file ingestion is N.N s behind' log line that piled up a
+        new entry every LAG_CHECK_S for the whole run."""
+        self._parse_progress = f'parsing m{m_idx}/{m_total}, s{s_idx}/{s_total}'
+        if self._data_streaming:
+            self._refresh_streaming_label()
+
     def _schedule_rate_update(self) -> None:
         self.root.after(10_000, self._update_rate)
 
@@ -855,12 +888,12 @@ class NodePanel:
         if self._data_streaming:
             rate = count / 10.0
             if rate >= 1e6:
-                rate_str = f'{rate/1e6:.2f} Mcps'
+                self._last_rate_str = f'{rate/1e6:.2f} Mcps'
             elif rate >= 1e3:
-                rate_str = f'{rate/1e3:.1f} kcps'
+                self._last_rate_str = f'{rate/1e3:.1f} kcps'
             else:
-                rate_str = f'{rate:.0f} cps'
-            self.data_status_var.set(f'  Data: ● Streaming   {rate_str}')
+                self._last_rate_str = f'{rate:.0f} cps'
+            self._refresh_streaming_label()
         self._schedule_rate_update()
 
     def _gui(self, fn) -> None:

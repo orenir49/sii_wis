@@ -113,8 +113,7 @@ MARKER_NAMES = {
 ANOM_LOG_S     = 2.0   # min seconds between rollup lines for one (chip, id)
 ANOM_MAX_FIRST = 40    # cap on distinct first-sighting lines per session
 
-LAG_CHECK_S = 5.0      # how often to recompute parser lag
-LAG_WARN_S  = 2.0      # lag above this means data is queueing up
+LAG_CHECK_S = 5.0      # how often to recompute parser lag / report progress
 
 master_loc = np.array([PIXMAP[170 + i] for i in range(150)])
 slave_loc  = np.array([PIXMAP[i]       for i in range(170)])
@@ -427,13 +426,33 @@ def open_lspad_tmode_stream(duration: float, log_fn=print) -> tuple:
     return spad_sock, run_dir
 
 
+def _tmode_latest_index(run_dir: str, chip: str) -> int:
+    """Highest NNN among data_{chip}NNN.txt files currently in run_dir, or -1
+    if none exist yet -- used only for the live "parsing file m X/Y" progress
+    report, not for deciding what to read next (find_tmode_run_dir/_try_lane
+    already do that by existence-checking, not by scanning for a maximum)."""
+    best = -1
+    prefix, suffix = f'data_{chip}', '.txt'
+    try:
+        names = os.listdir(run_dir)
+    except OSError:
+        return best
+    for name in names:
+        if name.startswith(prefix) and name.endswith(suffix):
+            digits = name[len(prefix):-len(suffix)]
+            if digits.isdigit():
+                best = max(best, int(digits))
+    return best
+
+
 def run(sock: socket.socket,
         output_dir: str,
         duration: float,
         test_mode: bool,
         stop_event: threading.Event,
         log_fn=print,
-        soft_event: threading.Event | None = None) -> dict:
+        soft_event: threading.Event | None = None,
+        progress_fn=None) -> dict:
     """
     Run one acquisition session over an already-connected socket.
     Sends KEY_SETUP, streams data chunks, then sends KEY_END. Does NOT close
@@ -455,6 +474,15 @@ def run(sock: socket.socket,
     ceiling. Lag climbing first, or queue_max approaching QUEUE_MAXSIZE, means
     the blocking sq.put() stalled the parser — so the ceiling is ours, and the
     photons were lost downstream of the detector rather than by it.
+
+    progress_fn: optional callable(m_idx, m_total, s_idx, s_total), invoked
+                 every LAG_CHECK_S during T-mode ingestion (test_mode ignores
+                 it). m_idx/s_idx is the next file each lane is about to read;
+                 m_total/s_total is the highest-numbered file currently on
+                 disk for that chip (_tmode_latest_index) -- so the caller can
+                 show "how far behind" as a file count instead of a growing
+                 stream of timestamped WARNING lines, one line that updates
+                 rather than one appended every tick.
     """
     stats = {'records': 0, 'overflow': 0, 'unknown': 0, 'abnormal': {},
              'lag_s': 0.0, 'lag_max_s': 0.0,
@@ -811,9 +839,9 @@ def run(sock: socket.socket,
                             stats['lag_s'] = round(lag, 2)
                             if lag > stats['lag_max_s']:
                                 stats['lag_max_s'] = round(lag, 2)
-                            if lag > LAG_WARN_S and not stopping:
-                                log_fn(f'WARNING: file ingestion is {lag:.1f} s '
-                                       f'behind the detector — data is queueing\n')
+                        if progress_fn is not None:
+                            progress_fn(m_next, _tmode_latest_index(run_dir, 'master'),
+                                       s_next, _tmode_latest_index(run_dir, 'slave'))
 
                     if m_done and s_done and reply_received:
                         break
@@ -1137,7 +1165,10 @@ def _run_acquisition_cmd(params: dict, stop_event: threading.Event,
         try:
             stats = run(sock, output_dir, duration, test_mode, stop_event,
                         log_fn=lambda msg: send_ctrl({'status': 'log', 'msg': msg}),
-                        soft_event=soft_event)
+                        soft_event=soft_event,
+                        progress_fn=lambda m_idx, m_total, s_idx, s_total: send_ctrl({
+                            'status': 'progress', 'm_idx': m_idx, 'm_total': m_total,
+                            's_idx': s_idx, 's_total': s_total}))
         finally:
             sock.close()
 
