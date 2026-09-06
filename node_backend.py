@@ -471,8 +471,16 @@ def run(sock: socket.socket,
              # stability-check sleep, the polars parse, epoch reconstruction,
              # and pixel bucketing. These + a small unmeasured residual
              # (syscalls, flush/dwell bookkeeping) should sum to elapsed_s.
+             # Bucketing itself measured live (2026-09-06) as the dominant
+             # cost -- ~58-59% of total elapsed, more than parse and
+             # epoch-reconstruct combined -- so it's split further: the
+             # SLOT_DEST lookup, the stable argsort, gathering the sorted
+             # timestamps + bincount, and the per-destination Python loop
+             # that appends each slice into bufs.
              'file_wait_s': 0.0, 'stability_sleep_s': 0.0,
-             'parse_s': 0.0, 'epoch_s': 0.0, 'bucket_s': 0.0}
+             'parse_s': 0.0, 'epoch_s': 0.0,
+             'bucket_slot_s': 0.0, 'bucket_sort_s': 0.0,
+             'bucket_gather_s': 0.0, 'bucket_append_s': 0.0}
 
     def is_soft() -> bool:
         return soft_event is not None and soft_event.is_set()
@@ -698,21 +706,30 @@ def run(sock: socket.socket,
                 slot = pixel_nr.astype(np.uint16) | (np.uint16(1 if is_mast else 0) << 8)
                 dest = SLOT_DEST[slot]
                 keep = dest >= 0
+                stats['bucket_slot_s'] += time.perf_counter() - t0
+
                 dwell_seen = False
                 n_events = 0
                 if keep.any():
+                    t0 = time.perf_counter()
                     dest_k = dest[keep]
                     order  = np.argsort(dest_k, kind='stable')
+                    stats['bucket_sort_s'] += time.perf_counter() - t0
+
+                    t0 = time.perf_counter()
                     ts_sorted = time_ps[keep][order]
                     counts = np.bincount(dest_k, minlength=N_DEST)
                     bounds = np.concatenate(([0], np.cumsum(counts)))
                     n_events = int(counts[:N_PHYS_DEST].sum())
+                    stats['bucket_gather_s'] += time.perf_counter() - t0
+
+                    t0 = time.perf_counter()
                     for d in np.nonzero(counts)[0]:
                         key = DEST_KEYS[d]
                         bufs[key].append(ts_sorted[bounds[d]:bounds[d + 1]])
                         if isinstance(key, tuple) and key[1] == 'dwell':
                             dwell_seen = True
-                stats['bucket_s'] += time.perf_counter() - t0
+                    stats['bucket_append_s'] += time.perf_counter() - t0
 
                 return next_idx + 1, epoch_offset, False, True, size1, n_events, dwell_seen
 
@@ -857,13 +874,19 @@ def run(sock: socket.socket,
         # file_wait_s is lSPAD's own file-write pace (not fixable here); the
         # rest is this code's own share. Residual = elapsed minus all of the
         # above (flush/dwell bookkeeping, syscalls -- expected to be small).
+        bucket_s = (stats['bucket_slot_s'] + stats['bucket_sort_s']
+                   + stats['bucket_gather_s'] + stats['bucket_append_s'])
         accounted = (stats['file_wait_s'] + stats['stability_sleep_s']
-                    + stats['parse_s'] + stats['epoch_s'] + stats['bucket_s'])
+                    + stats['parse_s'] + stats['epoch_s'] + bucket_s)
         log_fn(f'Ingestion breakdown: wait-for-file {stats["file_wait_s"]:.1f} s, '
                f'stability-check sleep {stats["stability_sleep_s"]:.1f} s, '
                f'parse {stats["parse_s"]:.1f} s, epoch-reconstruct '
-               f'{stats["epoch_s"]:.1f} s, bucket {stats["bucket_s"]:.1f} s '
+               f'{stats["epoch_s"]:.1f} s, bucket {bucket_s:.1f} s '
                f'(residual {elapsed - accounted:.1f} s of {elapsed:.1f} s total)\n')
+        log_fn(f'Bucket breakdown: SLOT_DEST lookup {stats["bucket_slot_s"]:.1f} s, '
+               f'stable argsort {stats["bucket_sort_s"]:.1f} s, gather+bincount '
+               f'{stats["bucket_gather_s"]:.1f} s, per-destination append '
+               f'{stats["bucket_append_s"]:.1f} s\n')
     return stats
 
 
