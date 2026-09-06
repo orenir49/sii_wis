@@ -13,6 +13,7 @@ import argparse
 import json
 import os
 import select
+import shutil
 import socket
 import struct
 import sys
@@ -820,7 +821,15 @@ def run(sock: socket.socket,
                 bufs, and update stats -- everything that must happen
                 exactly once and strictly in file order, regardless of
                 which pool thread computed the heavy work in
-                _process_tmode_file. Returns dwell_seen.
+                _process_tmode_file. Deletes the raw .txt once everything
+                above has succeeded (node disk can otherwise overflow well
+                before a long acquisition ends -- these files are
+                fully-parsed-into-memory by this point, so there is nothing
+                left on disk to lose; deletion happens here rather than in
+                the worker so a failure anywhere above -- including the
+                cross-file epoch check just below -- leaves the file in
+                place for debugging instead of racing its removal against
+                the check that might still reject it). Returns dwell_seen.
                 """
                 accumulated = accumulated_offset[chip]
                 seq0 = result['seq0']
@@ -892,6 +901,14 @@ def run(sock: socket.socket,
                 stats['bucket_append_s'] += time.perf_counter() - t0
 
                 accumulated_offset[chip] += result['local_reset_count']
+
+                try:
+                    os.remove(_tmode_file_path(run_dir, chip, idx))
+                except OSError as exc:
+                    log_fn(f'WARNING: could not delete {chip} file {idx} after '
+                           f'processing it -- {exc!r}. Disk usage will grow '
+                           f'faster than expected for the rest of this run.\n')
+
                 return dwell_seen
 
             with ThreadPoolExecutor(max_workers=TMODE_POOL_WORKERS,
@@ -1032,6 +1049,23 @@ def run(sock: socket.socket,
                             stats['file_wait_s'] += time.perf_counter() - t0
 
                     stats['recv_calls'] = n_files   # repurposed for T-mode: files read, not recv() calls
+
+                    # Every individual .txt was already deleted as it was
+                    # reassembled (_reassemble_tmode_file); this removes the
+                    # now-(normally-)empty Run folder itself, so a stale
+                    # RunNNN from an earlier session never sits around to
+                    # collide with lSPAD's own Run-counter resetting to the
+                    # same number after a restart -- find_tmode_run_dir's
+                    # before/after diff only detects a genuinely new folder
+                    # if "before" really means nothing has ever used that
+                    # name. Only reached on a clean finish -- an exception
+                    # above skips this and leaves the run's data in place to
+                    # debug.
+                    try:
+                        shutil.rmtree(run_dir)
+                    except OSError as exc:
+                        log_fn(f'WARNING: could not remove {run_dir} after '
+                               f'the run -- {exc!r}\n')
                 finally:
                     spad_sock.close()
 
