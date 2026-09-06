@@ -13,6 +13,7 @@ from tkinter import ttk
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from node_backend import run_command_server, DEFAULT_CMD_PORT
+import tmode_kernel
 
 
 class SpadSenderGUI:
@@ -26,6 +27,10 @@ class SpadSenderGUI:
         self._build_ui()
         self._poll_events()
         self._start_server()
+        # Compile tmode_kernel's numba kernels now, off the GUI thread, so
+        # the first real acquisition never eats a first-call JIT-compile
+        # stall (same reasoning as correlate_multi.py's own prewarm() call).
+        threading.Thread(target=tmode_kernel.prewarm, daemon=True).start()
 
     def _build_ui(self) -> None:
         frame = ttk.Frame(self.root, padding=20)

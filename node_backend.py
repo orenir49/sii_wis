@@ -23,6 +23,9 @@ import queue
 import time
 import traceback
 
+import tmode_kernel
+from tmode_kernel import PS_PER_COUNT, COUNTS_PER_RESET, RESET_ID
+
 # ---------------------------------------------------------------------------
 # Configuration (standalone defaults)
 # ---------------------------------------------------------------------------
@@ -69,11 +72,9 @@ TMODE_RUN_ROOT   = os.path.join(TMODE_SAVE_DIR, 'data', 'tdc')
 TMODE_RUN_WAIT_S = 10.0    # new Run folder must appear within this long
 TMODE_POLL_S     = 0.05    # file-lane poll interval while a file might still be arriving
 
-# ---------------------------------------------------------------------------
-# Physics
-# ---------------------------------------------------------------------------
-PS_PER_COUNT     = int((1 / 10e6) * 1e12)
-COUNTS_PER_RESET = 2**16
+# PS_PER_COUNT/COUNTS_PER_RESET/RESET_ID now live in tmode_kernel.py (imported
+# above) -- the fused epoch-reconstruction kernel needs them too, and one
+# definition avoids the two ever drifting apart.
 
 # ---------------------------------------------------------------------------
 # Pixel mapping
@@ -97,7 +98,7 @@ PIXMAP = np.array([
 ])
 
 SPECIAL = {225: 'dwell', 226: 'line', 228: 'frame'}
-RESET_ID          = 234      # coarse-counter reset marker
+# RESET_ID (234) imported from tmode_kernel at module top.
 OVERFLOW_ID       = 247      # detector FIFO overflow: photons already lost
 FILE_START_ID     = 239      # lSPAD file/stream-start marker -- expected once per session
 KNOWN_MARKER_IDS  = np.array(sorted(SPECIAL) + [RESET_ID, OVERFLOW_ID])
@@ -291,6 +292,13 @@ def reconstruct_tmode_epochs(pixel: np.ndarray, coarse: np.ndarray, fine: np.nda
     `<seq>` values (stored in the `fine` column for those rows) rather than
     trusted alone: a silent mismatch would misplace a whole file's
     timestamps by some multiple of 6.5536 ms with no other visible symptom.
+
+    The actual epoch/timestamp computation is tmode_kernel.reconstruct_epochs
+    (a fused numba kernel, proved bitwise-identical to the plain-numpy
+    reconstruct_epochs_ref by tmode_kernel's own _selftest()) -- this
+    function's job is just the cheap validation above, kept here in plain
+    Python for a readable ValueError rather than duplicated inside the
+    compiled kernel.
     """
     is_reset = pixel == RESET_ID
     if is_reset.any():
@@ -301,12 +309,7 @@ def reconstruct_tmode_epochs(pixel: np.ndarray, coarse: np.ndarray, fine: np.nda
                 f'T-mode epoch continuity mismatch: expected reset seq '
                 f'starting at {epoch_offset}, got {seq[:5].tolist()} '
                 f'(first 5 of {len(seq)})')
-    epoch = epoch_offset + np.cumsum(is_reset)
-    time_ps = ((epoch.astype(np.int64) * COUNTS_PER_RESET + coarse.astype(np.int64))
-               * PS_PER_COUNT + fine.astype(np.int64))
-    next_offset = epoch_offset + int(is_reset.sum())
-    keep = ~is_reset
-    return time_ps[keep], pixel[keep], next_offset
+    return tmode_kernel.reconstruct_epochs(pixel, coarse, fine, epoch_offset)
 
 
 def find_tmode_run_dir(before: set, log_fn=print,
@@ -738,52 +741,54 @@ def run(sock: socket.socket,
                     report_abnormal(abnormal, pixel_nr, is_mast_arr, time_ps,
                                     stats['records'] - len(pixel))
 
-                # Same fused-key bucketing pass the retired SB path used —
+                # Same fused-key bucketing the retired SB path used —
                 # is_mast is one value for the whole file here rather than a
                 # per-record array, which broadcasts into the slot formula
-                # unchanged.
+                # unchanged. The actual grouping is tmode_kernel's fused
+                # O(n) counting-sort kernel (bitwise-proved against the
+                # retired argsort-based path by tmode_kernel's own
+                # _selftest()) rather than np.argsort(kind='stable') -- that
+                # argsort measured live as ~46% of total T-mode ingestion
+                # time on real hardware (2026-09-06), the single largest
+                # cost in the whole pipeline, because a general O(n log n)
+                # comparison sort does not exploit dest_k's tiny, bounded
+                # alphabet (N_DEST, ~326 values) the way a counting sort does.
                 t0 = time.perf_counter()
                 slot = pixel_nr.astype(np.uint16) | (np.uint16(1 if is_mast else 0) << 8)
                 dest = SLOT_DEST[slot]
-                keep = dest >= 0
                 stats['bucket_slot_s'] += time.perf_counter() - t0
 
+                t0 = time.perf_counter()
+                ts_sorted, counts = tmode_kernel.counting_sort_bucket(dest, time_ps, N_DEST)
+                stats['bucket_sort_s'] += time.perf_counter() - t0
+
+                t0 = time.perf_counter()
+                bounds = np.concatenate(([0], np.cumsum(counts)))
+                n_events = int(counts[:N_PHYS_DEST].sum())
+                stats['bucket_gather_s'] += time.perf_counter() - t0
+
+                # Live incident count-rate estimate: this file's own
+                # photon count over its own timestamp span, not the rate
+                # data reaches the master at (that one lags badly, see
+                # docs/lspad_streaming_throttle.md -- it measures this
+                # code's own ingestion speed, not the detector). Photon
+                # timestamps only (dest < N_PHYS_DEST), not sync markers.
+                photon_ts = ts_sorted[:bounds[N_PHYS_DEST]]
+                if photon_ts.size >= 2:
+                    span_s = float(photon_ts.max() - photon_ts.min()) / 1e12
+                    rate_hz = n_events / span_s if span_s > 0 else 0.0
+                else:
+                    rate_hz = 0.0
+                stats['master_rate_hz' if is_mast else 'slave_rate_hz'] = rate_hz
+
                 dwell_seen = False
-                n_events = 0
-                if keep.any():
-                    t0 = time.perf_counter()
-                    dest_k = dest[keep]
-                    order  = np.argsort(dest_k, kind='stable')
-                    stats['bucket_sort_s'] += time.perf_counter() - t0
-
-                    t0 = time.perf_counter()
-                    ts_sorted = time_ps[keep][order]
-                    counts = np.bincount(dest_k, minlength=N_DEST)
-                    bounds = np.concatenate(([0], np.cumsum(counts)))
-                    n_events = int(counts[:N_PHYS_DEST].sum())
-                    stats['bucket_gather_s'] += time.perf_counter() - t0
-
-                    # Live incident count-rate estimate: this file's own
-                    # photon count over its own timestamp span, not the rate
-                    # data reaches the master at (that one lags badly, see
-                    # docs/lspad_streaming_throttle.md -- it measures this
-                    # code's own ingestion speed, not the detector). Photon
-                    # timestamps only (dest < N_PHYS_DEST), not sync markers.
-                    photon_ts = ts_sorted[:bounds[N_PHYS_DEST]]
-                    if photon_ts.size >= 2:
-                        span_s = float(photon_ts.max() - photon_ts.min()) / 1e12
-                        rate_hz = n_events / span_s if span_s > 0 else 0.0
-                    else:
-                        rate_hz = 0.0
-                    stats['master_rate_hz' if is_mast else 'slave_rate_hz'] = rate_hz
-
-                    t0 = time.perf_counter()
-                    for d in np.nonzero(counts)[0]:
-                        key = DEST_KEYS[d]
-                        bufs[key].append(ts_sorted[bounds[d]:bounds[d + 1]])
-                        if isinstance(key, tuple) and key[1] == 'dwell':
-                            dwell_seen = True
-                    stats['bucket_append_s'] += time.perf_counter() - t0
+                t0 = time.perf_counter()
+                for d in np.nonzero(counts)[0]:
+                    key = DEST_KEYS[d]
+                    bufs[key].append(ts_sorted[bounds[d]:bounds[d + 1]])
+                    if isinstance(key, tuple) and key[1] == 'dwell':
+                        dwell_seen = True
+                stats['bucket_append_s'] += time.perf_counter() - t0
 
                 return next_idx + 1, epoch_offset, False, True, size1, n_events, dwell_seen
 
