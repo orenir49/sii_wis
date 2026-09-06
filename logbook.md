@@ -277,7 +277,10 @@ Reverting to 2:1 fiber splitter, new spectral alignment.
   - Wire-encoding live confirmation itself succeeded once run at a rate the (then-shared) network could sustain: baseline/raw/delta gave statistically indistinguishable g2 results (833M/831M/834M total taus, matching mean/std) at pixel 164, 2 min each -- see docs/raw_timestamp_wire_encoding_bakeoff.md.
 
 ## 05-09-26
-- Installed the dedicated per-node links from the 3-9-26 fix: node1 stays on 192.168.1.11 but now runs a private cable into the master's 192.168.1.10 port, and node2 moved off the shared subnet onto its own private cable, 192.168.2.11 into the master's second port at 192.168.2.10. Shared switch is out of the data path entirely.
-- Confirmed both links up from the master: ICMP and the node command port (50010) both reachable on 192.168.1.11 and 192.168.2.11.
-- Updated the default sender IPs baked into the GUI and the SFTP tools (`master.py`, `tools/push_mask.py`, `tools/fetch_capture.py`, `tools/install_ssh_key.py` usage) and widened `setup_node.ps1`'s subnet filter to `192.168.*` so it still matches node2 on its new subnet. See docs/network_topology.md for the full writeup.
-- Live high-count-rate test on the fresh dedicated links: `mask_sparse.txt` (81 active pixels/node) pushed to both nodes' lSPAD directories, ~20 Mcps/node incident. Both nodes fell badly behind almost immediately -- parser lag climbed from 4.2 s to 38+ s within ~35 s of acquisition, essentially unable to keep up at all, aborted. This is `main`'s known, already-documented parser ceiling (per-active-pixel grouping loop in `node_backend.py`, unoptimized -- the Phase 1 fused-slot bucketing fix lives only on the unmerged `wire-encoding-bakeoff` branch, and per the 2026-08-27 finding even that 2.8-3.4x speedup wasn't going to close a gap this large). Not a network or hardware regression -- reproduces a previously-characterized limit, now confirmed live on the new wiring.
+- Installed dedicated per-node links, no more shared switch: node1 192.168.1.11, node2 192.168.2.11, each its own port on the master. docs/network_topology.md.
+- Live acquisition ~20 Mcps per node with new network topology; both nodes capping equally at ~4 Mcps (improvement over the switch, but still not fast enough).
+
+## 06-09-26
+- Problem traced to logic of lSPAD's "S" and "SB" live TCP streaming modes, which don't keep up with a high data rate.
+- These modes can keep working for tens of minutes after only a 60 sec acquisition.
+- Instead, the lSPAD default "T" mode writing data to .txt files is much quicker, and is now being investigated for a new pipeline methodology. docs/lspad_streaming_throttle.md, docs/tmode_architecture_feasibility.md.

@@ -368,6 +368,66 @@ See `docs/network_topology.md`'s closing section before finalizing Phase 3
 if the eventual deployment topology still shares an oversubscribed link
 across nodes rather than giving each a dedicated, adequately-sized path.
 
+### Second live stress test: mask_sparse overload, Phase 1 active (2026-09-05)
+
+After the dedicated per-node links (`docs/network_topology.md`) removed the
+shared-switch confound, re-ran `mask_sparse.txt` (81 active pixels/node,
+~20 Mcps/node incident — the same condition that had just failed on `main`'s
+unoptimized loop) on this branch's build (`66f9de0`, Phase 1 bucketing +
+wire-mode selector both active, confirmed via the `sender build` line at each
+relaunch), across all three wire modes:
+
+| mode | parser lag: first → last warning | approx. wall-clock span |
+|---|---|---|
+| baseline | 4.1 s → 52.7 s | ~48 s |
+| raw | 4.4 s → 58.1 s | ~58 s |
+| delta | 4.2 s → 72.1 s | ~68 s |
+
+All three grow at essentially the same rate — lag accumulates almost exactly
+as fast as real time elapses (lag ≈ elapsed wall clock throughout), meaning
+the parser makes near-zero net progress against the incident rate regardless
+of wire mode. This is the same signature `main`'s unoptimized loop showed at
+this exact mask/rate. Two things follow:
+
+- **Phase 1 alone does not rescue this overload.** Consistent with this
+  doc's own framing above: a 2.8–3.4× speedup cannot close a gap this doc
+  already measured at ~8× (node1's 116 Mcps flood vs. ~13.8 Mcps master
+  ceiling, node itself known up to 3.7× slower). 81 active pixels at ~20
+  Mcps/node sits in that same regime, not the ~2.7 Mcps/node clean-run
+  condition the live end-to-end confirmation above used.
+- **Wire mode choice is irrelevant to this specific bottleneck**, exactly as
+  the network-bottleneck investigation already found at a different (lower,
+  network-bound) rate: this one is node-CPU-bound in the parse stage, which
+  happens identically before any wire encoding is applied, so baseline/raw/
+  delta cannot be expected to differ here and did not.
+
+Net effect on the Phase 3 decision below: neither candidate is a fix for
+`mask_sparse`-scale flood conditions. The decision between raw and delta
+still turns on the Phase 2 bake-off numbers at *sustainable* rates, not on
+this stress test — this test's purpose was confirming Phase 1 + wire-mode
+plumbing survive a real overload without crashing (they do: no FIFO-overflow
+marker reported, no exception, no corrupted output on any of the three), not
+measuring throughput at a rate none of these candidates targets. All three
+runs were manually ended before the backlog could drain — the delta run's
+own log shows soft-stop escalating to a plain abort (remaining lSPAD buffer
+discarded, expected and harmless for a deliberate stress test); baseline and
+raw were ended by a direct abort with no attempted drain. None of this is
+evidence about the candidates themselves — an overload this far past the
+ceiling was never going to finish cleanly regardless of wire mode.
+
+**Follow-up (2026-09-06): the ceiling may not be in this repo's code at
+all.** A standalone script bypassing `node_backend.py` entirely (connects
+straight to lSPAD's own TCP port, does nothing but split records into two
+files by chip) kept up completely on a clean 10s run at this same mask/rate
+on both nodes, then showed a striking U-shaped throughput curve on a 60s
+run — a sustained low-throughput floor in the middle, independent of any
+wire encoding or bucketing choice, followed by a dramatic reacceleration
+once the acquisition window closed. See `docs/lspad_streaming_throttle.md`
+for the full writeup. This reframes the decision below: neither raw nor
+delta encoding, nor further bucketing work, can be expected to fix a
+throttle that happens inside lSPAD's own delivery of already-produced
+data, below where either candidate's code runs.
+
 ## Phase 3 — Decide, then build the winning approach
 
 - **If delta-encoding wins or ties**: build Stage 2b as designed
