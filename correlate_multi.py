@@ -56,6 +56,14 @@ from sii_calculator import SIICalculatorWindow
 MAX_PAIRS = 320           # guard: grid mode is how you ask for 6400 by accident
 DEFAULT_RAM_CAP_MB = 2000
 BACKLOG_WARN_S = 2.0
+POLL_MS = 200             # how often to check the queues for a new batch --
+                          # not a display-refresh throttle: T-mode delivers
+                          # dwell/pixel data in one burst per completed
+                          # source file rather than a trickle, so a batch
+                          # either isn't there yet (this poll is a no-op) or
+                          # is drained and shown in full the moment it is.
+                          # There is nothing left for a user-tunable "update
+                          # every N seconds" to trade off.
 
 
 
@@ -297,13 +305,9 @@ class MultiCorrelateWindow(tk.Toplevel):
         self.nshift_var = tk.StringVar(value='5')
         ttk.Entry(cfg, textvariable=self.nshift_var, width=6).grid(row=0, column=5, sticky='w')
 
-        ttk.Label(cfg, text='Update interval (s):').grid(row=1, column=0, padx=6, pady=4, sticky='w')
-        self.interval_var = tk.StringVar(value='1.5')
-        ttk.Entry(cfg, textvariable=self.interval_var, width=8).grid(row=1, column=1, sticky='w')
-
-        ttk.Label(cfg, text='RAM cap (MB):').grid(row=1, column=2, padx=(16, 6), sticky='w')
+        ttk.Label(cfg, text='RAM cap (MB):').grid(row=1, column=0, padx=6, pady=4, sticky='w')
         self.ramcap_var = tk.StringVar(value=str(DEFAULT_RAM_CAP_MB))
-        ttk.Entry(cfg, textvariable=self.ramcap_var, width=8).grid(row=1, column=3, sticky='w')
+        ttk.Entry(cfg, textvariable=self.ramcap_var, width=8).grid(row=1, column=1, sticky='w')
 
         ttk.Label(cfg, text='Suffix:').grid(row=2, column=0, padx=6, pady=4, sticky='w')
         self.suffix_var = tk.StringVar(value='g2multi')
@@ -828,12 +832,6 @@ class MultiCorrelateWindow(tk.Toplevel):
     # Polling
     # ------------------------------------------------------------------
 
-    def _interval_ms(self) -> int:
-        try:
-            return max(200, int(float(self.interval_var.get()) * 1000))
-        except ValueError:
-            return 1500
-
     def _ram_cap_bytes(self) -> int:
         # Multiply before truncating, so a fractional cap means what it says --
         # int(0.001) * 1e6 would silently round a 1 kB cap up to 1 MB.
@@ -847,7 +845,7 @@ class MultiCorrelateWindow(tk.Toplevel):
             self._tick()
         except Exception as exc:                      # never kill the poll loop
             self.status_var.set(f'Poll error: {exc}')
-        self.after(self._interval_ms(), self._poll_data)
+        self.after(POLL_MS, self._poll_data)
 
     def _tick(self) -> None:
         g = self._graph
