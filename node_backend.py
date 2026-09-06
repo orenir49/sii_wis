@@ -461,7 +461,18 @@ def run(sock: socket.socket,
              'queue_max': 0, 'queue_blocks': 0,
              'recv_calls': 0, 'recv_mean_b': 0, 'discarded_b': 0,
              'epoch_fixes': 0, 'stop_mode': 'duration',
-             'first_ts': None, 'last_ts': None}
+             'first_ts': None, 'last_ts': None,
+             # T-mode ingestion breakdown (docs/lspad_streaming_throttle.md,
+             # docs/tmode_architecture_feasibility.md): where the per-node
+             # effective throughput ceiling actually sits. 'file_wait_s' is
+             # time the main loop spent with nothing ready to read -- lSPAD's
+             # own file-write pace, not something this code can speed up.
+             # The rest is this code's own share: the deliberate anti-race
+             # stability-check sleep, the polars parse, epoch reconstruction,
+             # and pixel bucketing. These + a small unmeasured residual
+             # (syscalls, flush/dwell bookkeeping) should sum to elapsed_s.
+             'file_wait_s': 0.0, 'stability_sleep_s': 0.0,
+             'parse_s': 0.0, 'epoch_s': 0.0, 'bucket_s': 0.0}
 
     def is_soft() -> bool:
         return soft_event is not None and soft_event.is_set()
@@ -638,7 +649,9 @@ def run(sock: socket.socket,
                 next_path = _tmode_file_path(run_dir, chip, next_idx + 1)
                 if not os.path.exists(next_path) and not reply_received:
                     return next_idx, epoch_offset, False, False, 0, 0, False
+                t0 = time.perf_counter()
                 time.sleep(TMODE_POLL_S)
+                stats['stability_sleep_s'] += time.perf_counter() - t0
                 try:
                     size2 = os.path.getsize(path)
                 except OSError:
@@ -646,9 +659,14 @@ def run(sock: socket.socket,
                 if size1 != size2:
                     return next_idx, epoch_offset, False, False, 0, 0, False
 
+                t0 = time.perf_counter()
                 pixel, coarse, fine = read_tmode_file(path, skip_first_line=(next_idx == 0))
+                stats['parse_s'] += time.perf_counter() - t0
+
+                t0 = time.perf_counter()
                 time_ps, pixel_nr, epoch_offset = reconstruct_tmode_epochs(
                     pixel, coarse, fine, epoch_offset)
+                stats['epoch_s'] += time.perf_counter() - t0
 
                 stats['records'] += len(pixel)
                 n_overflow = int(np.sum(pixel_nr == OVERFLOW_ID))
@@ -676,6 +694,7 @@ def run(sock: socket.socket,
                 # is_mast is one value for the whole file here rather than a
                 # per-record array, which broadcasts into the slot formula
                 # unchanged.
+                t0 = time.perf_counter()
                 slot = pixel_nr.astype(np.uint16) | (np.uint16(1 if is_mast else 0) << 8)
                 dest = SLOT_DEST[slot]
                 keep = dest >= 0
@@ -693,6 +712,7 @@ def run(sock: socket.socket,
                         bufs[key].append(ts_sorted[bounds[d]:bounds[d + 1]])
                         if isinstance(key, tuple) and key[1] == 'dwell':
                             dwell_seen = True
+                stats['bucket_s'] += time.perf_counter() - t0
 
                 return next_idx + 1, epoch_offset, False, True, size1, n_events, dwell_seen
 
@@ -781,7 +801,9 @@ def run(sock: socket.socket,
                     if m_done and s_done and reply_received:
                         break
                     if not progressed:
+                        t0 = time.perf_counter()
                         time.sleep(TMODE_POLL_S)
+                        stats['file_wait_s'] += time.perf_counter() - t0
 
                 stats['recv_calls'] = n_files   # repurposed for T-mode: files read, not recv() calls
             finally:
@@ -830,6 +852,18 @@ def run(sock: socket.socket,
            f'(peak {stats["lag_max_s"]:.1f} s), queue peak '
            f'{stats["queue_max"]}/{QUEUE_MAXSIZE}, '
            f'{stats["recv_calls"]:,} recv of {stats["recv_mean_b"]:,} B mean')
+    if stats['recv_calls']:
+        # Where the T-mode ingestion loop's wall-clock time actually went --
+        # file_wait_s is lSPAD's own file-write pace (not fixable here); the
+        # rest is this code's own share. Residual = elapsed minus all of the
+        # above (flush/dwell bookkeeping, syscalls -- expected to be small).
+        accounted = (stats['file_wait_s'] + stats['stability_sleep_s']
+                    + stats['parse_s'] + stats['epoch_s'] + stats['bucket_s'])
+        log_fn(f'Ingestion breakdown: wait-for-file {stats["file_wait_s"]:.1f} s, '
+               f'stability-check sleep {stats["stability_sleep_s"]:.1f} s, '
+               f'parse {stats["parse_s"]:.1f} s, epoch-reconstruct '
+               f'{stats["epoch_s"]:.1f} s, bucket {stats["bucket_s"]:.1f} s '
+               f'(residual {elapsed - accounted:.1f} s of {elapsed:.1f} s total)\n')
     return stats
 
 
