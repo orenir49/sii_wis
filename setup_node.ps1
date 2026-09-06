@@ -11,7 +11,7 @@ $ErrorActionPreference = 'Stop'
 
 $REPO_URL  = 'https://github.com/orenir49/sii_wis.git'
 $REPO_DIR  = Join-Path $env:USERPROFILE 'Documents\code\sii_wis'
-$SUBNET    = '192.168.1.*'
+$SUBNET    = '192.168.*'   # node1 is on 192.168.1.x, node2 on 192.168.2.x (dedicated per-node links)
 $TASK_NAME = 'Force192PrivateNetwork'
 
 $warnings = [System.Collections.Generic.List[string]]::new()
@@ -63,7 +63,7 @@ Add-MpPreference -ExclusionProcess 'C:\Windows\System32\OpenSSH\sshd.exe' `
 Write-Ok 'Defender exclusion added for sshd.exe'
 
 # ---------------------------------------------------------------------------
-# Step 2 — Network profile persistence (192.168.1.x → Private)
+# Step 2 — Network profile persistence (192.168.x.x → Private)
 # ---------------------------------------------------------------------------
 Write-Step 'Step 2: Network profile persistence'
 
