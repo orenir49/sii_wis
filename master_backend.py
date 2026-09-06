@@ -26,11 +26,8 @@ DEFAULT_OUTPUT_DIR = './spad_data'
 # Wire protocol keys  (must match node_backend.py)
 # ---------------------------------------------------------------------------
 KEY_SETUP     = 0xFFFFFFFF
-KEY_SETUP_V2  = 0xFFFFFFFD   # payload: 1 wire-mode byte + utf-8 output dir; see node_backend.py
 KEY_END       = 0xFFFFFFFE
 KEY_INTENSITY = 326   # payload: utf-8 header + raw lSPAD `I` reply — see run_intensity_session()
-
-WIRE_MODE_FROM_BYTE = {1: 'raw', 2: 'delta'}   # 'baseline' never sends KEY_SETUP_V2 at all
 
 SPECIAL_KEY_TO_FILENAME = {
     320: 'master_dwell.bin',
@@ -99,8 +96,7 @@ def run_session_loop(conn: socket.socket, log_fn=print,
                      pixel_hooks: dict | None = None,
                      event_accum: list | None = None,
                      on_first_chunk=None,
-                     write_hooked: bool = True,
-                     on_wire_mode=None) -> None:
+                     write_hooked: bool = True) -> None:
     """
     Handle back-to-back acquisition sessions on an accepted connection.
     Blocks until the sender disconnects (ConnectionError).
@@ -147,14 +143,6 @@ def run_session_loop(conn: socket.socket, log_fn=print,
                   and then answers confidently from the wrong run. Now a data
                   directory either holds a whole run or was never touched, and
                   the run's own account lives in spad_data/log/ (run_log.py).
-    on_wire_mode: optional callable(str), invoked once per session with the
-                  resolved wire mode ('baseline'/'raw'/'delta') read off
-                  KEY_SETUP/KEY_SETUP_V2 -- live wire-encoding bake-off
-                  confirmation (docs/raw_timestamp_wire_encoding_bakeoff.md).
-                  The caller already knows which mode it asked for (same
-                  commit-time UI choice that produced write_hooked); this
-                  exists so it can assert the wire agrees, rather than trust
-                  its own recollection.
     """
     # Normalize the hook map once per connection so the inner loop stays
     # branch-light and legacy {key: Queue} callers keep working unchanged.
@@ -178,37 +166,12 @@ def run_session_loop(conn: socket.socket, log_fn=print,
             header          = readall(stream, 8)
             key_id, n_bytes = struct.unpack('>II', header)
 
-            if key_id == KEY_SETUP:
-                wire_mode  = 'baseline'
-                output_dir = readall(stream, n_bytes).decode('utf-8')
-            elif key_id == KEY_SETUP_V2:
-                setup_payload = readall(stream, n_bytes)
-                mode_byte     = setup_payload[0]
-                wire_mode     = WIRE_MODE_FROM_BYTE.get(mode_byte)
-                if wire_mode is None:
-                    raise RuntimeError(f'KEY_SETUP_V2: unknown wire-mode byte {mode_byte}')
-                output_dir = setup_payload[1:].decode('utf-8')
-            else:
-                raise RuntimeError(
-                    f'Expected KEY_SETUP or KEY_SETUP_V2, got 0x{key_id:08X}')
-
-            if wire_mode != 'baseline' and write_hooked:
-                # Writing raw/delta-encoded bytes to px_*.bin as if they were
-                # plain int64 would silently produce structurally-valid,
-                # numerically-wrong data. The UI is supposed to prevent this
-                # combination entirely (wire-mode selection is gated on
-                # write_hooked being False) -- this is the hard-fail backstop
-                # if that gate is ever bypassed.
-                raise RuntimeError(
-                    f'wire_mode={wire_mode!r} requires write_hooked=False; '
-                    f'refusing to write {wire_mode}-encoded bytes as plain '
-                    f'int64 px_*.bin')
-            if on_wire_mode is not None:
-                on_wire_mode(wire_mode)
+            if key_id != KEY_SETUP:
+                raise RuntimeError(f'Expected KEY_SETUP, got 0x{key_id:08X}')
+            output_dir = readall(stream, n_bytes).decode('utf-8')
 
             session   += 1
-            log_fn(f'[session {session}] Output: {output_dir}'
-                   + (f'  (wire mode: {wire_mode})' if wire_mode != 'baseline' else ''))
+            log_fn(f'[session {session}] Output: {output_dir}')
 
             handles: dict = {}
             if write_hooked:
