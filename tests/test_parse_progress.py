@@ -4,15 +4,17 @@ per-tick "file ingestion is N.N s behind" log spam).
 No pytest in requirements.txt, so this is plain asserts:
     .venv\\Scripts\\python.exe tests\\test_parse_progress.py
 
-Two things are under test:
+Three things are under test:
 
   * node_backend._tmode_latest_index() -- the pure directory-scan helper
     behind the Y/Z ("latest file present") half of the progress report.
-  * master.NodePanel's _set_data_status / _update_rate / _set_parse_progress
-    trio -- rate and parse-progress arrive independently (10 s ticks vs
-    LAG_CHECK_S ticks) and must compose into one line without either
-    clobbering the other, and a state change away from 'streaming' must
-    clear both rather than let stale text leak into the next run.
+  * master.NodePanel._format_rate() -- the Mcps/kcps/cps threshold logic.
+  * master.NodePanel's _set_data_status / _set_parse_progress pair -- file
+    progress and incident count rate arrive together in one 'progress'
+    control message (unlike the retired per-node-event-count rate, which
+    ticked independently every 10 s) and must compose into one line, and a
+    state change away from 'streaming' must clear both rather than let
+    stale text leak into the next run.
 """
 import os
 import sys
@@ -89,29 +91,41 @@ def test_latest_index_ignores_non_numeric_or_unrelated_names():
 
 
 # ---------------------------------------------------------------------------
+# master.NodePanel._format_rate
+# ---------------------------------------------------------------------------
+
+def test_format_rate_thresholds():
+    fmt = master.NodePanel._format_rate
+    check('below 1k -> plain cps', fmt(999) == '999 cps', fmt(999))
+    check('1k-1M -> kcps', fmt(1_500) == '1.5 kcps', fmt(1_500))
+    check('at or above 1M -> Mcps', fmt(2_340_000) == '2.34 Mcps', fmt(2_340_000))
+    check('zero -> plain cps, not a division error', fmt(0) == '0 cps', fmt(0))
+
+
+# ---------------------------------------------------------------------------
 # NodePanel's composed streaming label
 # ---------------------------------------------------------------------------
 
 class FakeNode:
-    """Only the state _set_data_status/_update_rate/_set_parse_progress read
-    or write, plus real Tk widgets for the two they touch directly."""
+    """Only the state _set_data_status/_set_parse_progress read or write,
+    plus real Tk widgets for the two they touch directly."""
 
     def __init__(self, root):
         self._data_streaming = False
         self._parse_progress = ''
         self._last_rate_str = ''
-        self._event_accum = [0]
         self.data_status_var = tk.StringVar(value='')
         self._data_lbl = tk.Label(root, textvariable=self.data_status_var)
 
     _set_data_status = master.NodePanel._set_data_status
     _refresh_streaming_label = master.NodePanel._refresh_streaming_label
     _set_parse_progress = master.NodePanel._set_parse_progress
-    _update_rate = master.NodePanel._update_rate
-    _schedule_rate_update = lambda self: None   # no timer loop needed in a test
+    # staticmethod() wrapper required -- a plain function attribute here
+    # would bind `self` as _format_rate's first (and only) positional arg.
+    _format_rate = staticmethod(master.NodePanel._format_rate)
 
 
-def test_progress_alone_composes_onto_the_streaming_line():
+def test_progress_carries_both_file_position_and_rate():
     root = tk.Tk()
     root.withdraw()
     try:
@@ -120,35 +134,40 @@ def test_progress_alone_composes_onto_the_streaming_line():
         check('bare streaming line has no progress/rate yet',
               n.data_status_var.get() == '  Data: ● Streaming')
 
-        n._set_parse_progress(12, 45, 10, 45)
-        check('progress appends onto the streaming line',
-              n.data_status_var.get() == '  Data: ● Streaming   parsing m12/45, s10/45',
+        n._set_parse_progress(12, 45, 10, 45, 1_500_000, 500_000)
+        check('one progress message carries file position AND the summed rate',
+              n.data_status_var.get()
+              == '  Data: ● Streaming   2.00 Mcps   parsing m12/45, s10/45',
               n.data_status_var.get())
     finally:
         root.destroy()
 
 
-def test_rate_and_progress_compose_without_clobbering_each_other():
+def test_rate_is_master_plus_slave_not_either_alone():
     root = tk.Tk()
     root.withdraw()
     try:
         n = FakeNode(root)
         n._set_data_status('streaming')
+        n._set_parse_progress(1, 1, 1, 1, 300_000, 400_000)
+        check('total rate is the sum of both chips, not just one',
+              '700.0 kcps' in n.data_status_var.get(), n.data_status_var.get())
+    finally:
+        root.destroy()
 
-        n._event_accum[0] = 20_000_000   # -> 2.00 Mcps over the 10 s tick
-        n._update_rate()
-        check('rate alone shows on the line',
-              'Mcps' in n.data_status_var.get(), n.data_status_var.get())
 
-        n._set_parse_progress(3, 9, 3, 9)
-        check('progress joins the rate rather than replacing it',
-              'Mcps' in n.data_status_var.get() and 'parsing m3/9, s3/9' in n.data_status_var.get(),
+def test_a_later_progress_message_replaces_the_earlier_one():
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        n = FakeNode(root)
+        n._set_data_status('streaming')
+        n._set_parse_progress(3, 9, 3, 9, 100_000, 100_000)
+        n._set_parse_progress(4, 10, 4, 10, 900_000, 900_000)
+        check('the line reflects only the most recent progress message',
+              n.data_status_var.get()
+              == '  Data: ● Streaming   1.80 Mcps   parsing m4/10, s4/10',
               n.data_status_var.get())
-
-        n._event_accum[0] = 6_000_000
-        n._update_rate()
-        check('a later rate tick keeps the still-current progress text',
-              'parsing m3/9, s3/9' in n.data_status_var.get(), n.data_status_var.get())
     finally:
         root.destroy()
 
@@ -162,7 +181,7 @@ def test_progress_is_a_no_op_while_not_streaming():
     try:
         n = FakeNode(root)
         n._set_data_status('idle')
-        n._set_parse_progress(1, 2, 1, 2)
+        n._set_parse_progress(1, 2, 1, 2, 100_000, 100_000)
         check('progress while idle does not touch the displayed line',
               n.data_status_var.get() == '  Data: ● Idle', n.data_status_var.get())
     finally:
@@ -175,9 +194,7 @@ def test_leaving_streaming_clears_progress_and_rate_for_the_next_run():
     try:
         n = FakeNode(root)
         n._set_data_status('streaming')
-        n._event_accum[0] = 1_000_000
-        n._update_rate()
-        n._set_parse_progress(40, 45, 40, 45)
+        n._set_parse_progress(40, 45, 40, 45, 1_000_000, 1_000_000)
         check('sanity: mid-run line carries both pieces',
               n._parse_progress and n._last_rate_str)
 

@@ -475,14 +475,20 @@ def run(sock: socket.socket,
     the blocking sq.put() stalled the parser — so the ceiling is ours, and the
     photons were lost downstream of the detector rather than by it.
 
-    progress_fn: optional callable(m_idx, m_total, s_idx, s_total), invoked
-                 every LAG_CHECK_S during T-mode ingestion (test_mode ignores
-                 it). m_idx/s_idx is the next file each lane is about to read;
-                 m_total/s_total is the highest-numbered file currently on
-                 disk for that chip (_tmode_latest_index) -- so the caller can
-                 show "how far behind" as a file count instead of a growing
-                 stream of timestamped WARNING lines, one line that updates
-                 rather than one appended every tick.
+    progress_fn: optional callable(m_idx, m_total, s_idx, s_total, m_rate_hz,
+                 s_rate_hz), invoked every LAG_CHECK_S during T-mode ingestion
+                 (test_mode ignores it). m_idx/s_idx is the next file each
+                 lane is about to read; m_total/s_total is the highest-
+                 numbered file currently on disk for that chip
+                 (_tmode_latest_index) -- so the caller can show "how far
+                 behind" as a file count instead of a growing stream of
+                 timestamped WARNING lines, one line that updates rather
+                 than one appended every tick. m_rate_hz/s_rate_hz is each
+                 chip's incident count rate from its own most recently
+                 parsed file (photon count over that file's own timestamp
+                 span) -- unlike a rate derived from data reaching the
+                 master, this is not slowed down by this code's own
+                 ingestion lag.
     """
     stats = {'records': 0, 'overflow': 0, 'unknown': 0, 'abnormal': {},
              'lag_s': 0.0, 'lag_max_s': 0.0,
@@ -508,7 +514,13 @@ def run(sock: socket.socket,
              'file_wait_s': 0.0, 'stability_sleep_s': 0.0,
              'parse_s': 0.0, 'epoch_s': 0.0,
              'bucket_slot_s': 0.0, 'bucket_sort_s': 0.0,
-             'bucket_gather_s': 0.0, 'bucket_append_s': 0.0}
+             'bucket_gather_s': 0.0, 'bucket_append_s': 0.0,
+             # Per-chip incident count-rate from the most recently parsed
+             # file of that chip (see the rate_hz comment in _try_lane below)
+             # -- stale (not zero) once a lane goes quiet, since "most
+             # recently parsed" is the whole point: the last real number
+             # beats no number.
+             'master_rate_hz': 0.0, 'slave_rate_hz': 0.0}
 
     def is_soft() -> bool:
         return soft_event is not None and soft_event.is_set()
@@ -751,6 +763,20 @@ def run(sock: socket.socket,
                     n_events = int(counts[:N_PHYS_DEST].sum())
                     stats['bucket_gather_s'] += time.perf_counter() - t0
 
+                    # Live incident count-rate estimate: this file's own
+                    # photon count over its own timestamp span, not the rate
+                    # data reaches the master at (that one lags badly, see
+                    # docs/lspad_streaming_throttle.md -- it measures this
+                    # code's own ingestion speed, not the detector). Photon
+                    # timestamps only (dest < N_PHYS_DEST), not sync markers.
+                    photon_ts = ts_sorted[:bounds[N_PHYS_DEST]]
+                    if photon_ts.size >= 2:
+                        span_s = float(photon_ts.max() - photon_ts.min()) / 1e12
+                        rate_hz = n_events / span_s if span_s > 0 else 0.0
+                    else:
+                        rate_hz = 0.0
+                    stats['master_rate_hz' if is_mast else 'slave_rate_hz'] = rate_hz
+
                     t0 = time.perf_counter()
                     for d in np.nonzero(counts)[0]:
                         key = DEST_KEYS[d]
@@ -841,7 +867,8 @@ def run(sock: socket.socket,
                                 stats['lag_max_s'] = round(lag, 2)
                         if progress_fn is not None:
                             progress_fn(m_next, _tmode_latest_index(run_dir, 'master'),
-                                       s_next, _tmode_latest_index(run_dir, 'slave'))
+                                       s_next, _tmode_latest_index(run_dir, 'slave'),
+                                       stats['master_rate_hz'], stats['slave_rate_hz'])
 
                     if m_done and s_done and reply_received:
                         break
@@ -1166,9 +1193,10 @@ def _run_acquisition_cmd(params: dict, stop_event: threading.Event,
             stats = run(sock, output_dir, duration, test_mode, stop_event,
                         log_fn=lambda msg: send_ctrl({'status': 'log', 'msg': msg}),
                         soft_event=soft_event,
-                        progress_fn=lambda m_idx, m_total, s_idx, s_total: send_ctrl({
+                        progress_fn=lambda m_idx, m_total, s_idx, s_total, m_rate_hz, s_rate_hz: send_ctrl({
                             'status': 'progress', 'm_idx': m_idx, 'm_total': m_total,
-                            's_idx': s_idx, 's_total': s_total}))
+                            's_idx': s_idx, 's_total': s_total,
+                            'm_rate_hz': m_rate_hz, 's_rate_hz': s_rate_hz}))
         finally:
             sock.close()
 

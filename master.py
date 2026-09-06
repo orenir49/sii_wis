@@ -111,15 +111,13 @@ class NodePanel:
         self._applied_mask: pair_map.MaskSource | None = None
         self._shutdown_thread: threading.Thread | None = None
         self._dwell_freq: float | None = None      # dwell clock Hz from last Launch R command
-        self._event_accum: list = [0]              # [int] — incremented by data thread, read by GUI
         self._data_streaming = False
         self._session_active = False   # START sent, 'done'/'error' not yet received
         self._parse_progress = ''      # "m12/45, s10/45" from the node's last 'progress' message
-        self._last_rate_str = ''       # count-rate string from the last 10 s tick
+        self._last_rate_str = ''       # incident-rate string from the node's last 'progress' message
         self._pending_mode = 'timestamp'   # which receive loop the next accepted connection needs
 
         self._build_ui(parent, default_sender_ip, default_cmd_port, default_data_port, default_ssh_user)
-        self._schedule_rate_update()
 
 
     # ------------------------------------------------------------------
@@ -406,7 +404,8 @@ class NodePanel:
         elif s == 'progress':
             self._gui(lambda: self._set_parse_progress(
                 msg.get('m_idx', 0), msg.get('m_total', 0),
-                msg.get('s_idx', 0), msg.get('s_total', 0)))
+                msg.get('s_idx', 0), msg.get('s_total', 0),
+                msg.get('m_rate_hz', 0.0), msg.get('s_rate_hz', 0.0)))
         elif s == 'log':
             self.log_fn(f'[N{self.node_id}] {msg.get("msg", "")}\n')
         elif s == 'error':
@@ -524,7 +523,6 @@ class NodePanel:
                         conn,
                         log_fn=log_fn,
                         pixel_hooks=hooks,
-                        event_accum=self._event_accum,
                         on_first_dwell_chunk=(
                             (lambda: self._on_first_data_fn(self.node_id))
                             if self._on_first_data_fn else None),
@@ -869,32 +867,32 @@ class NodePanel:
             parts.append(self._parse_progress)
         self.data_status_var.set('   '.join(parts))
 
-    def _set_parse_progress(self, m_idx: int, m_total: int,
-                            s_idx: int, s_total: int) -> None:
+    @staticmethod
+    def _format_rate(hz: float) -> str:
+        if hz >= 1e6:
+            return f'{hz/1e6:.2f} Mcps'
+        elif hz >= 1e3:
+            return f'{hz/1e3:.1f} kcps'
+        else:
+            return f'{hz:.0f} cps'
+
+    def _set_parse_progress(self, m_idx: int, m_total: int, s_idx: int, s_total: int,
+                            m_rate_hz: float, s_rate_hz: float) -> None:
         """Live T-mode ingestion progress from the node's periodic 'progress'
         control message -- one line that updates in place, replacing the old
         per-tick 'file ingestion is N.N s behind' log line that piled up a
-        new entry every LAG_CHECK_S for the whole run."""
+        new entry every LAG_CHECK_S for the whole run.
+
+        The count rate is each chip's incident rate from its own most
+        recently parsed file (node_backend.run()'s progress_fn docstring),
+        approximated as master + slave -- NOT derived from data reaching
+        this GUI, which lags behind the detector under T-mode and would
+        understate the true incident rate by however far ingestion is behind.
+        """
         self._parse_progress = f'parsing m{m_idx}/{m_total}, s{s_idx}/{s_total}'
+        self._last_rate_str = self._format_rate(m_rate_hz + s_rate_hz)
         if self._data_streaming:
             self._refresh_streaming_label()
-
-    def _schedule_rate_update(self) -> None:
-        self.root.after(10_000, self._update_rate)
-
-    def _update_rate(self) -> None:
-        count = self._event_accum[0]
-        self._event_accum[0] = 0
-        if self._data_streaming:
-            rate = count / 10.0
-            if rate >= 1e6:
-                self._last_rate_str = f'{rate/1e6:.2f} Mcps'
-            elif rate >= 1e3:
-                self._last_rate_str = f'{rate/1e3:.1f} kcps'
-            else:
-                self._last_rate_str = f'{rate:.0f} cps'
-            self._refresh_streaming_label()
-        self._schedule_rate_update()
 
     def _gui(self, fn) -> None:
         self.root.after(0, fn)
