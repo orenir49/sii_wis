@@ -484,7 +484,6 @@ def launch_node(host: str, username: str,
                 mask_filename: str, log_fn,
                 lspad_port: int = SPAD_PORT,
                 mask_pixel: int | None = None,
-                raw_dump: str | None = None,
                 mask_sink=None) -> float:
     """
     Full launch sequence for one sender node.
@@ -498,12 +497,6 @@ def launch_node(host: str, username: str,
     and for `mask_pixel` it generated the contents but wrote them only there.
     The correlator needs the active-pixel set, and reading it back from here
     beats keeping a hand-made master-side duplicate that can silently disagree.
-    `raw_dump`, if given, enables node_backend's verbatim lSPAD capture
-    (SII_WIS_RAW_DUMP) — the Stage 2a replay reference. It has to be set in the
-    sender's own environment at launch, which is why start_detached takes an env
-    at all. Prefer a RELATIVE path (spad_data then the filename): it resolves
-    against this node's own repo, whereas an absolute path from the master would
-    name a home directory that does not exist under the other node's username.
     Returns the dwell clock frequency (Hz) from the R command.
     Raises RuntimeError on fatal errors.
     """
@@ -579,19 +572,8 @@ def launch_node(host: str, username: str,
             log_fn(f'Killed stale node.py (pid {killed.replace(chr(10), ", ")}).\n')
         pythonw = sii_dir + r'\.venv\Scripts\pythonw.exe'
         node_py = sii_dir + r'\node.py'
-        env = None
-        if raw_dump:
-            # A relative path is resolved against THIS node's repo. The two
-            # nodes run under different usernames, so an absolute path from the
-            # master would point at a home directory that does not exist here.
-            if not os.path.splitdrive(raw_dump)[0]:
-                raw_dump = sii_dir + chr(92) + raw_dump.lstrip(chr(92) + '/')
-            env = {'SII_WIS_RAW_DUMP': raw_dump}
-            run_ps(client, f"New-Item -ItemType Directory -Force "
-                           f"'{os.path.dirname(raw_dump)}' | Out-Null")
-            log_fn(f'RAW CAPTURE enabled -> {raw_dump}\n')
         # lspad_dir, not sii_dir: the .cmd must not land in the git repo.
-        start_detached(client, pythonw, node_py, sii_dir, env=env,
+        start_detached(client, pythonw, node_py, sii_dir,
                        script_dir=lspad_dir)
         log_fn('node.py launched.\n')
 
