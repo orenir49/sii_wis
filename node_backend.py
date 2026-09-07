@@ -301,6 +301,15 @@ def reconstruct_tmode_epochs(pixel: np.ndarray, coarse: np.ndarray, fine: np.nda
     `234,0,54`). So epoch tracking here is a plain inclusive cumsum of
     RESET_ID rows, offset by what was carried in from earlier files.
 
+    `<seq>` is itself a 16-bit hardware register (confirmed 7-9-26: a
+    high-rate run crossed it mid-file, seq0 in the 65k range with enough
+    resets in that one file to wrap), so it wraps back to 0 at
+    COUNTS_PER_RESET (65536) regardless of how many resets came before --
+    unlike epoch_offset/the return value here, which must keep counting
+    unboundedly since it multiplies directly into time_ps. The cross-check
+    below therefore compares mod COUNTS_PER_RESET; the epoch math itself
+    (tmode_kernel.reconstruct_epochs) never wraps.
+
     The carried epoch_offset is cross-checked against the markers' own
     `<seq>` values (stored in the `fine` column for those rows) rather than
     trusted alone: a silent mismatch would misplace a whole file's
@@ -316,12 +325,12 @@ def reconstruct_tmode_epochs(pixel: np.ndarray, coarse: np.ndarray, fine: np.nda
     is_reset = pixel == RESET_ID
     if is_reset.any():
         seq = fine[is_reset]
-        expected_seq = epoch_offset + np.arange(len(seq))
+        expected_seq = (epoch_offset + np.arange(len(seq))) % COUNTS_PER_RESET
         if not np.array_equal(seq, expected_seq):
             raise ValueError(
                 f'T-mode epoch continuity mismatch: expected reset seq '
-                f'starting at {epoch_offset}, got {seq[:5].tolist()} '
-                f'(first 5 of {len(seq)})')
+                f'starting at {epoch_offset % COUNTS_PER_RESET}, got '
+                f'{seq[:5].tolist()} (first 5 of {len(seq)})')
     return tmode_kernel.reconstruct_epochs(pixel, coarse, fine, epoch_offset)
 
 
@@ -357,6 +366,15 @@ def _process_tmode_file(path: str, skip_first_line: bool, is_mast: bool) -> dict
     the rare abnormal rows themselves are returned -- report_abnormal()'s
     throttled, order-sensitive logging still runs in _reassemble_tmode_file,
     on the main thread, unchanged from before this file was parallelized.
+
+    `<seq>` (the reset marker's own `fine` value) is a 16-bit hardware
+    register: it wraps to 0 at COUNTS_PER_RESET (65536) resets, regardless
+    of file boundaries. A file whose reset count crosses that wrap (confirmed
+    7-9-26 on a high-rate run: seq0 in the 65k range with enough resets in
+    that one file to cross it) must not be flagged as discontinuous, so the
+    contiguity check below compares mod COUNTS_PER_RESET. `seq0` is still
+    reported as the file's raw (wrapped) starting value -- that is what
+    _reassemble_tmode_file's cross-file check below compares against.
     """
     t0 = time.perf_counter()
     pixel, coarse, fine = read_tmode_file(path, skip_first_line)
@@ -368,7 +386,8 @@ def _process_tmode_file(path: str, skip_first_line: bool, is_mast: bool) -> dict
     seq0 = None
     if n_resets:
         seq = fine[is_reset]
-        if not np.array_equal(seq, seq[0] + np.arange(n_resets)):
+        expected = (seq[0] + np.arange(n_resets)) % COUNTS_PER_RESET
+        if not np.array_equal(seq, expected):
             raise ValueError(
                 f'T-mode epoch continuity mismatch within {path}: this '
                 f"file's own reset seq is not contiguous from its first "
@@ -833,11 +852,15 @@ def run(sock: socket.socket,
                 """
                 accumulated = accumulated_offset[chip]
                 seq0 = result['seq0']
-                if seq0 is not None and seq0 != accumulated:
+                # accumulated is the true unbounded reset count (correct as
+                # the epoch multiplier below) but the hardware's own <seq>
+                # wraps at COUNTS_PER_RESET (65536) -- compare mod, not raw
+                # (see _process_tmode_file).
+                if seq0 is not None and seq0 != accumulated % COUNTS_PER_RESET:
                     raise ValueError(
                         f'T-mode epoch continuity mismatch: expected reset '
-                        f'seq starting at {accumulated}, got {seq0} '
-                        f'(chip={chip}, file index {idx})')
+                        f'seq starting at {accumulated % COUNTS_PER_RESET}, '
+                        f'got {seq0} (chip={chip}, file index {idx})')
 
                 stats['parse_s']         += result['parse_s']
                 stats['epoch_s']         += result['epoch_s']

@@ -22,7 +22,8 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from node_backend import (RESET_ID, COUNTS_PER_RESET, PS_PER_COUNT,
-                          reconstruct_tmode_epochs, read_tmode_file)
+                          reconstruct_tmode_epochs, read_tmode_file,
+                          _process_tmode_file)
 
 
 def build(rows):
@@ -105,6 +106,33 @@ def test_cross_file_continuity_matches_real_capture_pattern():
     check('offset continues past file1', offset_after_file1 == 55)
 
 
+def test_seq_wraps_at_16_bits_within_one_file():
+    """The reset marker's own <seq> is a 16-bit hardware register, not an
+    unbounded counter (confirmed 7-9-26: a high-rate run crossed it mid-file
+    and was wrongly flagged as discontinuous before this fix). A file whose
+    resets cross COUNTS_PER_RESET must NOT raise, and the epoch math itself
+    (unbounded) must still be correct across the wrap."""
+    pixel, coarse, fine = build([
+        (1, 100, 1),
+        (RESET_ID, 0, COUNTS_PER_RESET - 2),   # seq wraps partway through
+        (2, 50, 2),
+        (RESET_ID, 0, COUNTS_PER_RESET - 1),
+        (3, 25, 3),
+        (RESET_ID, 0, 0),                      # wrapped back to 0
+        (4, 10, 4),
+    ])
+    time_ps, out_pixel, next_offset = reconstruct_tmode_epochs(
+        pixel, coarse, fine, COUNTS_PER_RESET - 2)
+    check('no exception crossing the 16-bit wrap', True)
+    check('4 photons remain, 3 reset rows dropped', len(out_pixel) == 4)
+    check('epoch keeps counting unboundedly across the wrap (does not wrap itself)',
+          [int(t // (COUNTS_PER_RESET * PS_PER_COUNT)) for t in time_ps]
+          == [COUNTS_PER_RESET - 2, COUNTS_PER_RESET - 1, COUNTS_PER_RESET,
+              COUNTS_PER_RESET + 1])
+    check('next_offset carries the true (unbounded) count forward',
+          next_offset == COUNTS_PER_RESET + 1)
+
+
 def test_seq_mismatch_raises():
     pixel, coarse, fine = build([
         (1, 100, 1),
@@ -132,6 +160,27 @@ def test_same_tick_jitter_does_not_look_like_a_reset():
     check('jitter causes no epoch change', next_offset == 3)
     check('all three rows stay in the same epoch',
           len({int(t // (COUNTS_PER_RESET * PS_PER_COUNT)) for t in time_ps}) == 1)
+
+
+def test_process_tmode_file_does_not_flag_a_seq_wrap_as_discontinuous():
+    """Reproduces the production crash of 7-9-26: a real high-rate T-mode
+    file whose reset seq crosses the 16-bit wrap was raising 'T-mode epoch
+    continuity mismatch ... not contiguous from its first value' even
+    though the resets WERE contiguous once the wrap is accounted for."""
+    seq0 = COUNTS_PER_RESET - 3
+    rows = [f'1,100,1']
+    for k in range(6):                      # crosses the wrap (seq0 + 6 > 65536)
+        rows.append(f'{RESET_ID},0,{(seq0 + k) % COUNTS_PER_RESET}')
+        rows.append(f'{2 + k},{k},{k}')
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, 'data_master000.txt')
+        with open(path, 'wb') as f:
+            f.write('\r\n'.join(rows).encode())
+        result = _process_tmode_file(path, skip_first_line=False, is_mast=True)
+    check('seq0 reported as the raw (wrapped) starting value',
+          result['seq0'] == seq0, result['seq0'])
+    check('local_reset_count counts all 6 resets seen, unbounded',
+          result['local_reset_count'] == 6, result['local_reset_count'])
 
 
 def test_read_tmode_file_skips_the_file_start_marker():
