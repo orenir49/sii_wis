@@ -318,26 +318,89 @@ def test_end_to_end_comb():
             os.chdir(cwd)
             shutil.rmtree(tmp, ignore_errors=True)
 
-        # Overload policy.
-        w.set_write_to_disk(False)
-        w.ramcap_var.set('0.001')       # 1 kB -- trips on any retained tail
-        src.feed(w._graph, 0.002)
-        w._graph.drain_all()
-        w._tick()
-        check('RAM cap trips into HOLD and says photons are being lost',
-              w._held and 'HELD' in w.status_var.get()
-              and 'LOST' in w.status_var.get(), w.status_var.get())
-        w.set_write_to_disk(True)
-        w._tick()
-        check('with writes on, the same overload says the data is safe on disk',
-              'complete on disk' in w.status_var.get(), w.status_var.get())
-        w.ramcap_var.set('2000')
-        w._tick()
-        check('raising the cap releases the hold', not w._held)
-
         w._disable()
         check('disable stops accumulation and drops the hooks',
               not w.is_enabled and w.hooks_node1 == {})
+    finally:
+        root.destroy()
+
+
+def _setup_for_zero_count_test(root):
+    """A freshly enabled, single-pair (150,150) window with a live graph --
+    everything test_zero_count_warning_reports_loudly needs before it feeds
+    events by hand, factored out so each scenario gets an untouched graph
+    (no leftover channel state to worry about ordering against)."""
+    w, mtmp = masked_window(root, [150], [150])
+    w.mode_var.set('identity')
+    w.bw_var.set('250')
+    w.tmax_var.set('50000')     # +-50 ns
+    w.nshift_var.set('12')
+    w._show_preview = lambda *a, **k: None
+    w._derive()
+    w._enable()
+    w._graph.start(offset=0)
+    bw, tmax, nshift = w._get_params()
+    w._bins = correlate_multi.bin_edges(bw, tmax)
+    nbins = len(w._bins) - 1
+    return w, mtmp, bw, tmax, nshift, nbins
+
+
+def test_zero_count_warning_reports_loudly():
+    """A pair only reaches the kernel once ChannelGraph.release() has
+    released events on BOTH sides for it, so a batch with zero taus landing
+    within tmax is not "no data yet" -- it means the two streams have
+    drifted out of sync (or the dwell offset is wrong). This must be
+    reported loudly (red) exactly where the old live status line was.
+
+    Drives the real _correlate_bg()/_poll_results() (not the synchronous
+    test-only stand-ins install_sync_tick installs), since the warning
+    logic lives in _poll_results itself.
+    """
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        w, mtmp, bw, tmax, nshift, nbins = _setup_for_zero_count_test(root)
+        try:
+            # node 1's events all cluster near t=0; node 2 gets one event
+            # far outside +-tmax -- far enough to make node 2's watermark
+            # release node 1's cluster, but nowhere near it in time, so no
+            # pair can land in range. A real desync/offset bug looks exactly
+            # like this: both sides delivering, nothing lining up.
+            w._graph.ch1[150].q.put(np.array([1000, 1500, 2000], dtype=np.int64).tobytes())
+            w._graph.ch2[150].q.put(np.array([1_000_000], dtype=np.int64).tobytes())
+            w._graph.drain_all()
+            rel = w._graph.release()
+            check('the desynced batch DID release on both sides (not "no data yet")',
+                  bool(rel.batches), rel.batches)
+
+            w._correlate_bg(rel, bw, tmax, nbins, nshift)
+            w._poll_results()
+            check('0 in-range taus is reported CRITICAL, in red',
+                  'CRITICAL' in w.status_var.get()
+                  and '150' in w.status_var.get()
+                  and str(w.status_lbl.cget('foreground')) == '#cc3333',
+                  f'{w.status_var.get()!r} fg={w.status_lbl.cget("foreground")!r}')
+            check('_zero_count_warning is latched', w._zero_count_warning)
+        finally:
+            shutil.rmtree(mtmp, ignore_errors=True)
+
+        w2, mtmp2, bw2, tmax2, nshift2, nbins2 = _setup_for_zero_count_test(root)
+        try:
+            # A batch where the taus DO land in range must never be flagged.
+            w2._graph.ch1[150].q.put(np.array([3000], dtype=np.int64).tobytes())
+            w2._graph.ch2[150].q.put(np.array([3010, 2_000_000], dtype=np.int64).tobytes())
+            w2._graph.drain_all()
+            rel2 = w2._graph.release()
+            check('the in-range batch released on both sides too', bool(rel2.batches))
+            w2._correlate_bg(rel2, bw2, tmax2, nbins2, nshift2)
+            w2._poll_results()
+            check('an in-range batch is never flagged',
+                  not w2._zero_count_warning
+                  and 'CRITICAL' not in w2.status_var.get()
+                  and str(w2.status_lbl.cget('foreground')) != '#cc3333',
+                  f'{w2.status_var.get()!r} fg={w2.status_lbl.cget("foreground")!r}')
+        finally:
+            shutil.rmtree(mtmp2, ignore_errors=True)
     finally:
         root.destroy()
 

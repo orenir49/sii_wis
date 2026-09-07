@@ -434,6 +434,47 @@ def _process_tmode_file(path: str, skip_first_line: bool, is_mast: bool) -> dict
     }
 
 
+def clear_stale_tmode_run_dirs(root: str = TMODE_RUN_ROOT, log_fn=print) -> list:
+    """Remove every entry under `root`. Called once at node.py launch (see
+    node.py's SpadSenderGUI.__init__), not lazily deferred to the next
+    acquisition start.
+
+    lSPAD's own Run-counter resets to 0 on every lSPAD.exe restart (verified
+    empirically -- see find_tmode_run_dir), and lSPAD is fine writing into a
+    name that already exists -- it knows to overwrite. Our own new-folder
+    detection is what cannot cope: find_tmode_run_dir only recognises a Run
+    folder that is genuinely new in a before/after listing diff, so a
+    leftover folder from an earlier session (run()'s own rmtree cleanup is
+    skipped on any exception, deliberately, to leave a crashed run's data in
+    place to debug -- see run()) is already in the next session's `before`
+    snapshot and can never be seen as new again. One crash then silently
+    wedges every subsequent T-mode start with "No new Run folder appeared",
+    even though lSPAD itself would have happily reused/overwritten it.
+
+    node.py is what actually gets relaunched after a crash (master.py's
+    recovery flow kills and restarts it before retrying), so clearing here
+    reliably runs before every retry. The crashed run's data still survives
+    until that relaunch -- exactly one more session's worth of debugging
+    time -- rather than being deleted the instant it crashed.
+
+    Returns the paths actually removed.
+    """
+    removed = []
+    if not os.path.isdir(root):
+        return removed
+    for stale in os.listdir(root):
+        stale_path = os.path.join(root, stale)
+        try:
+            shutil.rmtree(stale_path)
+            removed.append(stale_path)
+            log_fn(f'Removed stale Run folder from an earlier session: '
+                   f'{stale_path}\n')
+        except OSError as exc:
+            log_fn(f'WARNING: could not remove stale Run folder '
+                   f'{stale_path} -- {exc!r}\n')
+    return removed
+
+
 def find_tmode_run_dir(before: set, log_fn=print,
                        wait_s: float = TMODE_RUN_WAIT_S) -> str:
     """Poll TMODE_RUN_ROOT for a Run folder not in `before` (a snapshot taken

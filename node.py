@@ -12,7 +12,8 @@ import tkinter as tk
 from tkinter import ttk
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from node_backend import run_command_server, DEFAULT_CMD_PORT
+from node_backend import (run_command_server, DEFAULT_CMD_PORT,
+                          clear_stale_tmode_run_dirs)
 import tmode_kernel
 
 
@@ -23,6 +24,12 @@ class SpadSenderGUI:
         self.root.resizable(False, False)
 
         self._event_queue: queue.Queue = queue.Queue()
+
+        # A folder left here by an earlier crashed run would otherwise wedge
+        # every T-mode start until this process is relaunched (see
+        # clear_stale_tmode_run_dirs's own docstring) -- so do it now, at
+        # that relaunch, rather than waiting for the next acquisition.
+        clear_stale_tmode_run_dirs()
 
         self._build_ui()
         self._poll_events()

@@ -19,11 +19,9 @@ WHAT THIS WINDOW PROMISES ABOUT DATA LOSS
     The retired CorrelateWindow's docstring said "nothing is dropped … raw data
     is still complete on disk". With the receiver's write-to-disk checkbox off
     that is simply false, and falling behind becomes permanent photon loss. So this
-    window is told the flag (`set_write_to_disk`) and says the right thing:
-    while writes are on, a backlog is only a delay; while they are off, an
-    overload is unrecoverable. On overload the policy is HOLD, not subsample --
-    stop draining, freeze, and report in red how far behind and how much is
-    held. Never degrade silently.
+    window is told the flag (`set_write_to_disk`) and records it (`write_to_disk`
+    in the saved .npz meta): while writes are on, a backlog is only a delay;
+    while they are off, an overload is unrecoverable.
 """
 from __future__ import annotations
 
@@ -54,7 +52,6 @@ from correlate_kernel import (PairPool, bin_edges, prewarm, rebin_diffs,
 from sii_calculator import SIICalculatorWindow
 
 MAX_PAIRS = 320           # guard: grid mode is how you ask for 6400 by accident
-DEFAULT_RAM_CAP_MB = 2000
 BACKLOG_WARN_S = 2.0
 POLL_MS = 200             # how often to check the queues for a new batch --
                           # not a display-refresh throttle: T-mode delivers
@@ -207,7 +204,7 @@ class MultiCorrelateWindow(tk.Toplevel):
         self._accumulating = False
         self._offset: int | None = None
         self._correlating = False
-        self._held = False             # RAM cap tripped: draining stopped
+        self._zero_count_warning = False   # last batch had a pair with 0 in-range taus
         self._write_to_disk = True
         # Diff-capture: independent of _write_to_disk (that one tracks raw
         # px_*.bin writes, this one tracks streaming filtered per-pair time
@@ -218,10 +215,7 @@ class MultiCorrelateWindow(tk.Toplevel):
         self._diff_session_dir: str | None = None
         self._result_q: queue.Queue = queue.Queue()
         self._last_kernel_s = 0.0
-        # Scale measurements the plan asks for at 4 -> 16 -> 80 pairs. Peak, not
-        # instantaneous: the status line's "MB buffered" is whatever the last
-        # poll happened to see, which is not what a RAM cap has to be sized
-        # against.
+        # Scale measurements the plan asks for at 4 -> 16 -> 80 pairs.
         self._kernel_s_total = 0.0
         self._kernel_batches = 0
 
@@ -304,10 +298,6 @@ class MultiCorrelateWindow(tk.Toplevel):
         ttk.Label(cfg, text='n_shift:').grid(row=0, column=4, padx=(16, 6), sticky='w')
         self.nshift_var = tk.StringVar(value='5')
         ttk.Entry(cfg, textvariable=self.nshift_var, width=6).grid(row=0, column=5, sticky='w')
-
-        ttk.Label(cfg, text='RAM cap (MB):').grid(row=1, column=0, padx=6, pady=4, sticky='w')
-        self.ramcap_var = tk.StringVar(value=str(DEFAULT_RAM_CAP_MB))
-        ttk.Entry(cfg, textvariable=self.ramcap_var, width=8).grid(row=1, column=1, sticky='w')
 
         ttk.Label(cfg, text='Suffix:').grid(row=2, column=0, padx=6, pady=4, sticky='w')
         self.suffix_var = tk.StringVar(value='g2multi')
@@ -720,7 +710,6 @@ class MultiCorrelateWindow(tk.Toplevel):
         self._graph = ChannelGraph(self._pairs, tmax, offset=0)
         self._active = True
         self._set_accumulating(False)
-        self._held = False
         self.status_var.set(
             f'Enabled — {len(self._pairs)} pairs, waiting for DWELL calibration …')
 
@@ -738,7 +727,6 @@ class MultiCorrelateWindow(tk.Toplevel):
         self._bins = None
         self._offset = None
         self._set_accumulating(False)
-        self._held = False
         self._kernel_s_total = 0.0
         self._kernel_batches = 0
         if self._graph is not None:
@@ -824,21 +812,12 @@ class MultiCorrelateWindow(tk.Toplevel):
         self._counts.clear()
         self._bins = None
         self._set_accumulating(True)
-        self._held = False
         self.status_var.set(f'Accumulating — offset {offset:+,} ps, '
                             f'{len(self._pairs)} pairs')
 
     # ------------------------------------------------------------------
     # Polling
     # ------------------------------------------------------------------
-
-    def _ram_cap_bytes(self) -> int:
-        # Multiply before truncating, so a fractional cap means what it says --
-        # int(0.001) * 1e6 would silently round a 1 kB cap up to 1 MB.
-        try:
-            return max(1, int(float(self.ramcap_var.get()) * 1_000_000))
-        except ValueError:
-            return DEFAULT_RAM_CAP_MB * 1_000_000
 
     def _poll_data(self) -> None:
         try:
@@ -852,26 +831,11 @@ class MultiCorrelateWindow(tk.Toplevel):
         if g is None or not self._accumulating:
             return
 
-        # HOLD policy. Stop draining, freeze, report -- no subsampling, no
-        # silent skipping. Which sentence is true depends on the disk flag, so
-        # say the one that is.
-        if g.nbytes >= self._ram_cap_bytes():
-            self._held = True
-            lost = ('photons are being LOST — write-to-disk is OFF'
-                    if not self._write_to_disk else
-                    'raw data is still complete on disk')
-            self._set_status(
-                f'⛔ HELD at {g.nbytes / 1e6:.0f} MB (cap {self._ram_cap_bytes() / 1e6:.0f} MB) — '
-                f'correlator cannot keep up; {lost}', bad=True)
-            return
-        self._held = False
-
         g.drain_all()
         if self._correlating:
             return
         rel = g.release()
         if not rel.batches:
-            self._set_status(g.status(), bad=bool(rel.excluded))
             return
 
         try:
@@ -911,6 +875,8 @@ class MultiCorrelateWindow(tk.Toplevel):
 
     def _poll_results(self) -> None:
         drawn = False
+        zero_pairs = []   # pairs whose batch released events on both sides
+                          # this poll, yet none paired up within tmax
         while True:
             try:
                 res = self._result_q.get_nowait()
@@ -922,6 +888,8 @@ class MultiCorrelateWindow(tk.Toplevel):
             _, hists, sizes, rel, dt, diffs = res
             self._last_kernel_s = dt
             for key, h in hists.items():
+                if int(h.sum()) == 0:
+                    zero_pairs.append(key)
                 cur = self._hist.get(key)
                 if cur is None or cur.shape != h.shape:
                     self._hist[key] = h.copy()
@@ -945,20 +913,30 @@ class MultiCorrelateWindow(tk.Toplevel):
                         f.flush()
             drawn = True
         if drawn:
+            if zero_pairs:
+                # A pair only reaches the kernel once both sides have
+                # released events this poll (ChannelGraph.release()), so
+                # this is not "no data yet" -- it is a batch that DID have
+                # events on both sides and still put none within [-tmax,
+                # tmax] of each other. At real coincidence rates that means
+                # one node has drifted far enough behind the other (or the
+                # dwell offset is wrong) that the two streams are no longer
+                # lined up -- report it where the old live status line was,
+                # loudly, instead of silently accumulating a flat histogram.
+                self._zero_count_warning = True
+                names = ', '.join(f'{p1} × {p2}' for p1, p2 in zero_pairs[:6])
+                more = f' +{len(zero_pairs) - 6}' if len(zero_pairs) > 6 else ''
+                self._set_status(
+                    f'⛔ CRITICAL: 0 time differences landed in-range this poll '
+                    f'for {len(zero_pairs)} pair(s) ({names}{more}) — nodes may '
+                    f'have drifted out of sync',
+                    bad=True)
+            elif self._zero_count_warning:
+                self._zero_count_warning = False
+                self._set_status('Recovered — time differences landing in-range again.')
             # Exactly ONE redraw per batch, not one per pair. The old windows
             # called _update_plot (tight_layout + draw_idle) once per pair.
             self._redraw()
-            g = self._graph
-            if g is not None:
-                mean_ms = (self._kernel_s_total / self._kernel_batches * 1000
-                           if self._kernel_batches else 0.0)
-                rss = _peak_rss_bytes()
-                self._set_status(
-                    f'{g.status()} — kernel {self._last_kernel_s * 1000:.0f} ms/batch '
-                    f'(mean {mean_ms:.0f}), {len(self._hist)} pairs accumulating, '
-                    f'peak buf {g.peak_nbytes / 1e6:.0f} MB'
-                    + (f', peak RSS {rss / 1e6:.0f} MB' if rss else ''),
-                    bad=any(c.excluded for c in g.channels))
         self.after(250, self._poll_results)
 
     def _set_status(self, text: str, bad: bool = False) -> None:
