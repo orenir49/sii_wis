@@ -287,6 +287,22 @@ Reverting to 2:1 fiber splitter, new spectral alignment.
 - Built the full T-mode pipeline on wire-encoding-bakeoff, replacing SB entirely on this branch; `tools/replay_tmode.py --selftest` (326 checks) is the new end-to-end harness. Also fixed sparse dwell calibration for T-mode's bursty per-file delivery (gate on first slave_dwell chunk, trim to one waveform period before fitting).
 - First live run at mask_sparse.txt scale (81 active/node, ~20 Mcps): 0 overflow, but ~150s elapsed for a 30s request. Traced the overhead to `np.argsort(kind='stable')` bucketing (46% of total time) and epoch reconstruction -- a general O(n log n) sort not exploiting the tiny (~326-value) destination alphabet.
 - Replaced both with fused numba kernels (`tmode_kernel.py`, O(n+k) counting sort) -- 7-8x speedup on real captured data, zero mismatches -- then parallelized ingestion across files with a thread pool (node PCs' idle cores now genuinely used).
-- Live result: node1 now 31.6s elapsed for a 30s request (0.6s lag, essentially real-time); node2 46-52s (14-21s lag). Both down from ~150s. 0 overflow throughout every run today.
+- Live result at ~20/25 Mcps per node: node1 now 31.6s elapsed for a 30s request (0.6s lag, essentially real-time); node2 46-52s (14-21s lag). Both down from ~150s. 0 overflow throughout every run today.
 - Found and fixed a disk-safety gap: each T-mode .txt is now deleted right after parsing, and the whole RunNNN folder after the run. Node2 in particular could otherwise overflow disk mid-run; a stale RunNNN colliding with lSPAD's own restart-reset Run-counter was also the root cause of an intermittent "no new Run folder appeared" launch failure.
-- Hardware note: node1 (16c/22t, 1.4GHz base) now clearly outpaces node2 (12c/14t, 1.7GHz base) once cross-file parallelism is in play -- a reversal from before parallelism, when node2's higher clock made it faster single-threaded. Core count looks like it matters more than clock speed for this workload once parallelized -- a rate sweep (80/40/20/10/5 active pixels) is planned to confirm this holds across the range before Phase 3 (diffs write mode + live correlation, which stress the master instead of the node).
+- Hardware note: node1 (16c/22t, 1.4GHz base) now clearly outpaces node2 (12c/14t, 1.7GHz base) once cross-file parallelism is in play -- a reversal from before parallelism, when node2's higher clock made it faster single-threaded. Core count looks like it matters more than clock speed for this workload once parallelized -- a rate sweep (80/40/20/10/5 active pixels) is planned to confirm this holds across the range before Phase 3 (diffs write mode + live correlation, which stress the master instead of the node). **Correction, 7-9-26: this attribution was wrong.** A pure-I/O bench with no parsing at all (`bench_tmode_io.py --local`) still shows node2 diverging from real-time earlier than node1 (mask_sweep_12: node2 ratio 2.08 vs node1 1.01) -- with no parser present, core count can't be the explanation. The actual cause is a difference in lSPAD's own file-write pacing/I/O behavior between the two nodes, not CPU/core count. See `docs/tmode_rate_and_io_characterization.md` Stage 4.
+
+## 07-09-26
+
+- Incident countrate sweep on both nodes: how long does a 30 sec acquisition really last? results summarized in figs\7-9-26
+  - Sweep both node 1 and node 2 between roughly 2 Mcps- 100 Mcps globally. 100 is the practical limit we will ever need.
+  - Break down runtime: LSPAD writing .txt files, node_backend.py parsing .txt files, node_backend.py processing stamps, master.py handling data.
+  - Three regimes uncovered: 
+    - up to ~15-20 Mcps, pipeline keeps up with1 incoming data. 
+    - at intermediate count rates, CPU may struggle to keep up with incoming data rate.
+    - at high count rates, the SPAD can't write stamps to .txt fast enough, and this is the bottleneck for the entire pipeline.
+  
+- Repeated the sweep, running only locally on nodes to isolate LSPAD I/O.
+  - Clear differences between the two nodes: maybe due to hardware; need a synthetic I/O test to verify.
+  - Clear I/O bottleneck. We stand to gain a lot from solving this issue.
+  - Along the way, we've discovered that deleting the .txt files on-the-go actually helps speed things up on the node side.
+- Full writeup: `docs/tmode_rate_and_io_characterization.md`. Figures + data: `figs/7-9-26/`.
