@@ -71,7 +71,7 @@ TDC_CALIB_S       = 180.0   # T,c,1 runs for minutes
 TMODE_SAVE_DIR   = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 'spad_data') + os.sep
 TMODE_RUN_ROOT   = os.path.join(TMODE_SAVE_DIR, 'data', 'tdc')
-TMODE_RUN_WAIT_S = 10.0    # new Run folder must appear within this long
+TMODE_RUN_WAIT_S = 30.0    # new Run folder must appear within this long
 TMODE_POLL_S     = 0.05    # file-lane poll interval while a file might still be arriving
 
 # Cross-file parallelism (docs/lspad_streaming_throttle.md): once the fused
