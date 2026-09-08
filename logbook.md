@@ -306,3 +306,22 @@ Reverting to 2:1 fiber splitter, new spectral alignment.
   - Clear I/O bottleneck. We stand to gain a lot from solving this issue.
   - Along the way, we've discovered that deleting the .txt files on-the-go actually helps speed things up on the node side.
 - Full writeup: `docs/tmode_rate_and_io_characterization.md`. Figures + data: `figs/7-9-26/`.
+
+## 08-09-26
+
+- Overnight acquisition with f=30" collimator; ~250kcps per pixel; 10 pixels on each node. Acquisition crashed after accumulating about 500k counts per 200ps bin. Expected bunching rate of 1% seems to have been ruled out by this measurement.
+  - In the morning, node1 was still operational;
+  - Node 2 was completely disconnected, and network category set to public: Either the network category flipped and killed the connection, or the PC restarted which caused the network category to flip. 
+  - Immediately upon restarting the nodes, I took arc frames. Each node's trace is nearly identical to yesterday. There is still near perfect registration of pixels in the central region of the detector; spectral drift seems to be ruled out as cause of no-signal.
+- Switched back to old f=400mm collimator.
+- Real-time bunching acquisition with 5 pixels (143, 147, 151, 164, 168) at ~6 Mcps global
+  per node; pipeline kept up with incoming data throughout. 150 ps bins, ±200 ns range,
+  n_shift=10. `spad_data\g2 histograms\g2multi.npz`. Expected bunching excess ~0.5%.
+  - Pixels 164 and 168 show a peak at τ ≈ 14 ns (13.45 ns / 13.6 ns tallest bin) with
+    0.73% / 0.59% excess, SNR 5.7 / 4.4 — roughly the expected excess.
+  - Pixels 143, 147, 151 show no bunching peak near τ = 14 ns (excess 0.18% / −0.02% /
+    0.10%, SNR ≤ 1.4 there); their histogram maxima land at unrelated delays
+    (139.75 ns, −125.6 ns, −135.2 ns respectively), consistent with noise rather than
+    a real peak.
+  - Also the first real test of T-mode Phase 3 (diffs write mode + live correlation):
+    pipeline kept up at this rate with the correlator running, not just raw capture.
