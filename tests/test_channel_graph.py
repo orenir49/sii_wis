@@ -745,6 +745,92 @@ def test_asymmetric_lag_does_not_starve_the_delivering_pairs():
 
 
 # ---------------------------------------------------------------------------
+# Lag-safe correlator (docs/lag_safe_correlator.md)
+# ---------------------------------------------------------------------------
+
+def _node_lag_case(stall_tolerance_ps, n_chunks=20, lag_chunks=8):
+    """Node 2 trails node 1 by a fixed number of chunks throughout the run --
+    unlike test_whole_node_lag_catches_up_bit_identical's hold-then-burst, it
+    never goes silent (something arrives almost every poll, well within any
+    wall-clock grace); its detector-time watermark just stays `lag_chunks`
+    chunks behind node 1's the whole way through. This is the shape of node
+    2's own real write-pacing divergence
+    (docs/tmode_rate_and_io_characterization.md, Stage 4 / mask_ten): steadily
+    still producing data, just too slowly to keep pace -- which is exactly
+    what a wall-clock-silence check cannot catch, and what
+    `stall_tolerance_ps` exists to catch instead.
+    """
+    rng = np.random.default_rng(44)
+    streams = {}
+    for p in (150, 151):
+        streams[(1, p)] = poisson_stream(rng, 1e6, 0.002)
+        streams[(2, p)] = poisson_stream(rng, 1e6, 0.002)
+
+    _, g0, _, d0 = build('identity', lo=150, hi=151)
+    for feed in _interleaved_feed(streams, n_chunks):
+        d0.step(feed)
+    d0.flush()
+
+    _, g1, c1, d1 = build('identity', lo=150, hi=151,
+                          stall_grace_s=1e9, stall_tolerance_ps=stall_tolerance_ps)
+    c1_chunks = {p: chunk(streams[(1, p)], n_chunks) for p in (150, 151)}
+    c2_chunks = {p: chunk(streams[(2, p)], n_chunks) for p in (150, 151)}
+    for i in range(n_chunks + lag_chunks):
+        feed = {}
+        if i < n_chunks:
+            for p in (150, 151):
+                feed[(1, p)] = c1_chunks[p][i]
+        j = i - lag_chunks
+        if 0 <= j < n_chunks:
+            for p in (150, 151):
+                feed[(2, p)] = c2_chunks[p][j]
+        d1.step(feed, dt=0.5)
+    d1.flush()
+    return g0, d0, g1, d1
+
+
+def test_lagging_partner_loses_coincidences_today():
+    """Pins today's bug. Node 2 is never dead -- it delivers everything by the
+    end -- but once its detector-time lag crosses stall_tolerance_ps, the
+    lag-exclusion path in `_cut_for` treats it exactly like a dead partner:
+    node 1's whole held-up backlog is force-released this same poll against
+    whatever sliver of node 2 has arrived so far, and node 1's array is then
+    cleared. When the matching node-2 data trickles in on a later poll, there
+    is nothing left on the node-1 side to pair it with. This is the mask_ten
+    failure from docs/tmode_rate_and_io_characterization.md, reproduced
+    synthetically.
+
+    If this ever passes, ChannelGraph has changed enough that this test (and
+    not test_lagging_partner_recovers_without_loss) is the one that stopped
+    meaning anything -- check what changed before deleting it."""
+    g0, d0, g1, d1 = _node_lag_case(stall_tolerance_ps=2e8)
+    want = sum(len(v) for v in d0.taus.values())
+    got = sum(len(v) for v in d1.taus.values())
+    check(f'today, crossing stall_tolerance_ps loses coincidences even though '
+          f'the partner was only late, never dead ({got} of {want})',
+          got < want and want > 500, f'got {got}, want {want}')
+
+
+def test_lagging_partner_recovers_without_loss():
+    """Acceptance test for docs/lag_safe_correlator.md's disk-spill design.
+    A partner that lags past stall_tolerance_ps but keeps delivering must
+    cost no coincidences once it catches up -- the same bit-identical
+    standard test_whole_node_lag_catches_up_bit_identical already holds a
+    dead-partner-free run to, but with the lag-exclusion trigger actually
+    engaged this time instead of set unreachably high.
+
+    FAILS today -- see test_lagging_partner_loses_coincidences_today for the
+    mechanism. Expected to start passing once a `lagging` (still delivering)
+    partner gets a disk-backed tail instead of the force-release-on-exclusion
+    path `dead` partners keep."""
+    g0, d0, g1, d1 = _node_lag_case(stall_tolerance_ps=2e8)
+    same = all(sorted(d1.taus[p]) == sorted(d0.taus[p]) for p in g0.pairs)
+    check('a partner lagging past tolerance but still delivering loses nothing',
+          same and sum(len(v) for v in d0.taus.values()) > 500,
+          f'{[(p, len(d1.taus[p]), len(d0.taus[p])) for p in g0.pairs]}')
+
+
+# ---------------------------------------------------------------------------
 # Mechanics
 # ---------------------------------------------------------------------------
 
