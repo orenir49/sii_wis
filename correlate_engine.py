@@ -68,6 +68,7 @@ What changed from QuadCorrelateWindow
 """
 from __future__ import annotations
 
+import os
 import queue
 import time
 from dataclasses import dataclass, field
@@ -92,6 +93,18 @@ DEFAULT_STALL_TOL_PS = 5 * PS_PER_S  # detector-time lag behind the leader
 DEFAULT_IDLE_AFTER_S = 3.0
 
 
+@dataclass
+class SpillFile:
+    """One spilled segment on disk: a contiguous, sorted slice of a channel's
+    former `arr`. `min_ts`/`max_ts` let callers decide whether the whole file
+    is safe to reload without touching disk -- see Channel.spill/reload_up_to
+    and docs/lag_safe_correlator.md."""
+    path: str
+    n: int
+    min_ts: int
+    max_ts: int
+
+
 class Channel:
     """One distinct (node, pixel) tap: queue -> pending chunks -> accumulated array.
 
@@ -101,18 +114,33 @@ class Channel:
 
     Node-2 channels hold offset-corrected timestamps from drain() onward, so no
     consumer has to remember which side needs correcting.
+
+    Optional disk-backed tail (docs/lag_safe_correlator.md, Phase 2): a
+    channel with `spill_dir` set can move its oldest events to disk via
+    spill() and bring them back via reload_up_to(). Channel only provides the
+    mechanism -- deciding *when* and *how much* to spill is ChannelGraph's
+    job (not wired in until Phase 3). Leaving `spill_dir` unset (the default)
+    means spill_files always stays empty and every method below behaves
+    exactly as it did before this existed.
     """
 
     def __init__(self, node: int, pixel: int, offset: int = 0,
-                 check_monotonic: bool = False) -> None:
+                 check_monotonic: bool = False, spill_dir: str | None = None) -> None:
         self.node = node
         self.pixel = pixel
         self.offset = int(offset)
         self.check_monotonic = check_monotonic
+        self.spill_dir = spill_dir
 
         self.q: queue.Queue = queue.Queue()
         self.pending: list = []
         self.arr = np.empty(0, dtype=np.int64)
+
+        # Spilled segments, oldest first. Always chronological: spill() only
+        # ever takes a prefix of a sorted arr, so each file's max_ts <= the
+        # next file's min_ts <= whatever remains in arr.
+        self.spill_files: list[SpillFile] = []
+        self._spill_seq = 0
 
         # Newest timestamp ever observed, corrected. Survives arr being trimmed
         # to size 0 -- that is the whole point.
@@ -127,6 +155,18 @@ class Channel:
     # -- ingestion ---------------------------------------------------------
 
     def reset(self) -> None:
+        # Delete leftover spill files rather than orphan them: a fresh start
+        # (including the very first one) must not inherit disk state from
+        # whatever this Channel was doing before -- e.g. a prior run that
+        # ended mid-spill. Same disk-safety rule as everywhere else spilled
+        # data is deleted: nothing to wait for once accumulation resets.
+        for sf in self.spill_files:
+            try:
+                os.remove(sf.path)
+            except OSError:
+                pass
+        self.spill_files = []
+        self._spill_seq = 0
         self.pending = []
         self.arr = np.empty(0, dtype=np.int64)
         self.last_ts = None
@@ -180,6 +220,80 @@ class Channel:
             self.arr = np.concatenate([self.arr] + self.pending)
             self.pending = []
 
+    # -- disk-backed tail (docs/lag_safe_correlator.md, Phase 2) -----------
+
+    def spill(self, cut: int) -> int:
+        """Move the oldest `cut` events of `arr` to one new file on disk.
+
+        A mechanism only -- Channel doesn't decide when or how much to spill;
+        that policy belongs to ChannelGraph (not wired in until Phase 3).
+        Operates on `arr` alone, so call merge() first if `pending` is
+        non-empty -- spilling half-merged data would put a chunk's events on
+        both sides of a file boundary for no reason.
+
+        No-op (returns 0) if `cut <= 0` or `arr` is empty, so a caller need
+        not special-case "nothing to spill". Raises if `spill_dir` was never
+        configured -- that is a caller error, not a runtime condition to
+        tolerate silently.
+        """
+        if self.spill_dir is None:
+            raise RuntimeError(
+                f'spill() called on n{self.node}px{self.pixel} with no spill_dir configured')
+        if cut <= 0 or self.arr.size == 0:
+            return 0
+        cut = min(cut, self.arr.size)
+        piece = self.arr[:cut]
+        os.makedirs(self.spill_dir, exist_ok=True)
+        path = os.path.join(
+            self.spill_dir, f'n{self.node}_px{self.pixel:03d}_{self._spill_seq:06d}.bin')
+        self._spill_seq += 1
+        piece.tofile(path)
+        self.spill_files.append(SpillFile(path=path, n=int(piece.size),
+                                           min_ts=int(piece[0]), max_ts=int(piece[-1])))
+        self.arr = self.arr[cut:]
+        return int(piece.size)
+
+    def reload_up_to(self, ts_limit: int) -> int:
+        """Merge back and delete every spill file entirely at or before
+        `ts_limit`, oldest first.
+
+        Chronological order (see spill_files' own invariant) means this only
+        ever pops a prefix: once one file's max_ts clears the limit, every
+        file spilled before it does too, so a single forward scan suffices.
+
+        NOT necessarily a prepend to `arr`. A single reload_up_to call that
+        clears every spill file at once could safely prepend, since they are
+        then all older than the whole (never-touched) arr -- but Phase 3
+        calls this incrementally, once per poll, with whatever the partner's
+        watermark currently allows. After an earlier partial reload, `arr`'s
+        front is itself already-reloaded data, and the next batch being
+        reloaded is chronologically *between* that front and arr's
+        still-untouched tail, not before all of it. searchsorted finds the
+        one correct insertion point regardless of how much prior reloading
+        has already happened.
+
+        Reload and delete happen together, not in two steps -- the caller
+        must only call this once it already knows the reloaded data is about
+        to be handed to the kernel this same cycle (docs/lag_safe_correlator.md's
+        "delete right after use" rule). Returns the number of events
+        reloaded, 0 if nothing qualified yet.
+        """
+        ready = []
+        while self.spill_files and self.spill_files[0].max_ts <= ts_limit:
+            ready.append(self.spill_files.pop(0))
+        if not ready:
+            return 0
+        combined = np.concatenate([np.fromfile(sf.path, dtype=np.int64) for sf in ready])
+        at = int(np.searchsorted(self.arr, combined[0]))
+        self.arr = np.concatenate([self.arr[:at], combined, self.arr[at:]])
+        for sf in ready:
+            os.remove(sf.path)
+        return sum(sf.n for sf in ready)
+
+    @property
+    def spill_nbytes(self) -> int:
+        return sum(sf.n * 8 for sf in self.spill_files)
+
     # -- cheap queries that must not force a merge -------------------------
 
     @property
@@ -188,10 +302,20 @@ class Channel:
 
     @property
     def nbytes(self) -> int:
+        """RAM held by this channel -- spilled data lives on disk instead and
+        is tracked separately by spill_nbytes."""
         return self.arr.nbytes + sum(c.nbytes for c in self.pending)
 
     def earliest(self):
-        """Oldest un-released timestamp, or None. Reads pending without merging."""
+        """Oldest un-released timestamp, or None. Reads pending without
+        merging, and spill_files without touching disk.
+
+        Spilled data is always older than whatever remains in arr or pending
+        -- spill() only ever takes a prefix of a sorted arr -- so a channel
+        with spill files reports the oldest spilled file's min_ts first.
+        """
+        if self.spill_files:
+            return self.spill_files[0].min_ts
         if self.arr.size:
             return int(self.arr[0])
         for c in self.pending:
@@ -211,8 +335,10 @@ class Channel:
         return e if e is not None else self.last_ts
 
     def __repr__(self) -> str:
+        spill = (f' spill={len(self.spill_files)}f/{self.spill_nbytes}B'
+                 if self.spill_files else '')
         return (f'<Channel n{self.node} px{self.pixel} '
-                f'buf={self.n_buffered} last_ts={self.last_ts}>')
+                f'buf={self.n_buffered} last_ts={self.last_ts}{spill}>')
 
 
 @dataclass
