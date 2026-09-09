@@ -1578,13 +1578,26 @@ class ReceiverGUI:
                 if new.size:
                     acc[i] = np.concatenate([acc[i], new])
 
-        spans = [self._span_s(acc[0]) for acc in self._cal_acc.values()]
-        if spans and min(spans) >= SPARSE_CAL_WAVEFORM_S:
+        # Checked separately, not mixed: a mask with zero slave-chip pixels
+        # active (e.g. a single master-chip pixel) never accumulates any
+        # slave_dwell at all, so its span sits at 0 s forever -- only master's
+        # own span can ever clear the window in that case. Fitting node1's
+        # slave dwell against node2's master dwell would be comparing two
+        # different signals, so each channel's readiness is judged across
+        # both nodes on its own, matching which one _apply_sparse_dwell_offset
+        # will actually fit (slave preferred, master fallback).
+        slave_spans  = [self._span_s(acc[0]) for acc in self._cal_acc.values()]
+        master_spans = [self._span_s(acc[1]) for acc in self._cal_acc.values()]
+        slave_ready  = bool(slave_spans)  and min(slave_spans)  >= SPARSE_CAL_WAVEFORM_S
+        master_ready = bool(master_spans) and min(master_spans) >= SPARSE_CAL_WAVEFORM_S
+        if slave_ready or master_ready:
             self._apply_sparse_dwell_offset(run_id)
             return
         if time.time() >= self._cal_deadline:
+            best = max(min(slave_spans) if slave_spans else 0.0,
+                      min(master_spans) if master_spans else 0.0)
             self._enqueue_log(
-                f'Sparse cal: only {min(spans) if spans else 0:.2f} s of dwell '
+                f'Sparse cal: only {best:.2f} s of dwell '
                 f'collected after {CAL_MAX_WAIT_S:.0f} s — calibrating anyway.\n')
             self._apply_sparse_dwell_offset(run_id)
             return
@@ -1627,13 +1640,18 @@ class ReceiverGUI:
         m2 = self._trim_to_window(m2)
 
         MIN_EVENTS = 5
-        if t1.size < MIN_EVENTS or t2.size < MIN_EVENTS:
+        have_slave  = t1.size >= MIN_EVENTS and t2.size >= MIN_EVENTS
+        have_master = m1.size >= MIN_EVENTS and m2.size >= MIN_EVENTS
+
+        if not have_slave and not have_master:
             self._enqueue_log(
-                f'Sparse cal failed: {t1.size} / {t2.size} slave dwell events '
-                f'(need ≥{MIN_EVENTS} each). Setting offset = 0.\n'
+                f'Sparse cal failed: {t1.size}/{t2.size} slave dwell events, '
+                f'{m1.size}/{m2.size} master dwell events (need ≥{MIN_EVENTS} '
+                f'each, on either chip). Setting offset = 0.\n'
             )
             self._set_cal_status(
-                f'● Calibration failed ({t1.size}/{t2.size} events) — offset = 0',
+                f'● Calibration failed ({t1.size}/{t2.size} slave, '
+                f'{m1.size}/{m2.size} master) — offset = 0',
                 color='#cc3333')
             for c in self._correlators:
                 c.start_with_offset(0)
@@ -1642,32 +1660,46 @@ class ReceiverGUI:
             return
 
         cluster_tol = 10_000  # 10 ns: excludes ±32 ns TDC doublet sidelobes
-        slave_offset_ps, slave_details = estimate_offset(
-            t1, t2, cluster_tol=cluster_tol, return_details=True)
 
-        if m1.size >= MIN_EVENTS and m2.size >= MIN_EVENTS:
-            master_offset_ps, master_details = estimate_offset(
-                m1, m2, cluster_tol=cluster_tol, return_details=True)
+        # Both are fit whenever there's enough data, same as before this
+        # fallback existed (previously master was diagnostic-only and never
+        # applied). Slave dwell is still preferred when it's usable -- node2's
+        # own master-vs-slave chip comparison (9-9-26) shows master dwell
+        # carries visibly worse jitter and a lower match rate there, so this
+        # is a fallback, not an equal alternative. It only takes over when
+        # slave dwell can't be fit at all (e.g. a mask with zero slave-chip
+        # pixels active, needed to correlate a master-chip pixel live instead
+        # of forcing offset=0 for the whole run).
+        slave_offset_ps, slave_details = (
+            estimate_offset(t1, t2, cluster_tol=cluster_tol, return_details=True)
+            if have_slave else (float('nan'), None))
+        master_offset_ps, master_details = (
+            estimate_offset(m1, m2, cluster_tol=cluster_tol, return_details=True)
+            if have_master else (float('nan'), None))
+
+        if have_slave:
+            offset_ps, details, source = slave_offset_ps, slave_details, 'slave'
         else:
-            master_offset_ps, master_details = float('nan'), None
+            offset_ps, details, source = master_offset_ps, master_details, 'master'
+            self._enqueue_log(
+                f'Sparse cal: no usable slave dwell data '
+                f'({t1.size}/{t2.size} events) -- falling back to master '
+                f'dwell.\n')
 
-        slave_offset = int(round(slave_offset_ps))
+        offset = int(round(offset_ps))
 
-        # Master offset above is still fit (diagnostic only -- master_offset_ps
-        # is never applied, only slave_offset is), but logging it, the
-        # per-node collection stats, and the SEM/stream-count detail was noise
-        # on every run. Only the number actually used goes to the log.
         self._enqueue_log(
-            f'Slave offset = {slave_offset:+,} ps '
-            f'({slave_details["n_matched"]} matched pairs)\n'
+            f'{source.capitalize()} offset = {offset:+,} ps '
+            f'({details["n_matched"]} matched pairs)\n'
         )
         self._enqueue_log('Acquiring\n')
 
         self._set_cal_status(
-            f'● Calibrated — offset {slave_offset:+,} ps, acquisition running',
+            f'● Calibrated — offset {offset:+,} ps ({source} dwell), '
+            f'acquisition running',
             color='#228822')
         for c in self._correlators:
-            c.start_with_offset(slave_offset)
+            c.start_with_offset(offset)
         self.node1.start_dwell_drain()
         self.node2.start_dwell_drain()
 

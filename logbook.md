@@ -323,3 +323,16 @@ Reverting to 2:1 fiber splitter, new spectral alignment.
     0.10%, SNR ≤ 1.4 there); their histogram maxima land at unrelated delays
     (139.75 ns, −125.6 ns, −135.2 ns respectively), consistent with noise rather than
     a real peak.
+- Real time acquisition with mask_seven.txt
+  - Only slave pixels show bunching: 162, 164, 166. ALl around ~14 ns.
+  - Master pixels: no bunching; maybe an uncalibrated offset? 
+  - Saved timestamps show master offset = slave offset, so no surprises there.
+  - Curiously, the three slave pixels appear to have different bunching rates.
+
+  ## 09-09-26
+
+  - Arc frames: spectral alignment essentially perfect.
+  - Light blocking test: without a pulsed laser, this is a cheap test of whether master/slaved are synchronized. During a live measurement, I physically covered the light source, creating a distinct real world event in the data; master and slave agree on these time to within 5 ms.
+  - Single master pixel acquisition (151 vs 151) shows no bunching after 1 hour, even in 10 microsecond range. 
+  - Easy sanity check: run the same acquisition with the previous version of the code (main branch). Successful detetion of bunching would isolate the problem to the software changes; no detection would hint a more complicated, physical effect.
+  - Resource-monitor check during a live T-mode run (mask_sweep_40, 30s request, both nodes): RAM/disk `Get-Counter` sampling across a 120s window bracketing the acquisition shows the OS disk queue length and % disk time stay flat throughout (queue never above 0.05) -- disk contention is ruled out. What jumps 30-60x, exactly for the acquisition window on both nodes, is lSPAD.exe's own reported working-set memory (node1 ~0.13 GB -> 5.9 GB peak, node2 ~0.13 GB -> 7.6 GB peak) and its own IO-write-bytes/sec counter (0 -> 200-250 MB/s), both snapping back to baseline right after. Node2's peak footprint is noticeably higher than node1's for the identical mask, adding a concrete number to the existing node1-vs-node2 I/O-pacing asymmetry. Figure: `figs/9-9-26/resource_monitor_9-9-26.png`; data + new tools: `figs/9-9-26/data/`, `tools/tmode_resource_experiment.py`, `tools/plot_resource_experiment.py`.

@@ -24,6 +24,7 @@ import socket
 import struct
 import sys
 import threading
+import time
 
 import numpy as np
 
@@ -160,6 +161,62 @@ class FakeNode:
         self.drain_calls += 1
 
 
+# ---------------------------------------------------------------------------
+# _poll_sparse_cal -- span check must consider master dwell too
+# ---------------------------------------------------------------------------
+
+class FakeRoot:
+    def after(self, ms, fn):
+        pass  # tests replace this per-case when they need to observe it
+
+
+def test_poll_sparse_cal_fires_early_on_master_span_when_slave_is_empty():
+    """Zero slave-chip pixels active -> slave span never grows past 0 s.
+    Master reaching one full waveform period on both nodes must still
+    trigger calibration immediately, not wait for the CAL_MAX_WAIT_S
+    wall-clock backstop."""
+    period_ps = int(round(master.SPARSE_CAL_WAVEFORM_S * 1e12))
+    master_arr = np.arange(0, period_ps + 1, period_ps // 40, dtype=np.int64)
+
+    g = object.__new__(master.ReceiverGUI)
+    g._run_id = 1
+    g.root = FakeRoot()
+    g.node1, g.node2 = FakeNode(1), FakeNode(2)
+    g._cal_acc = {
+        1: [np.empty(0, dtype=np.int64), master_arr.copy()],       # no slave dwell
+        2: [np.empty(0, dtype=np.int64), master_arr.copy() + 3],
+    }
+    g._cal_deadline = time.time() + 1000  # far off -- must not be why it fires
+    g._enqueue_log = lambda *a, **k: None
+    applied = []
+    g._apply_sparse_dwell_offset = lambda run_id: applied.append(run_id)
+
+    master.ReceiverGUI._poll_sparse_cal(g, 1)
+
+    check('master span alone triggers calibration, not the wall-clock deadline',
+          applied == [1], applied)
+
+
+def test_poll_sparse_cal_waits_when_neither_span_is_ready():
+    g = object.__new__(master.ReceiverGUI)
+    g._run_id = 1
+    g.root = FakeRoot()
+    g.node1, g.node2 = FakeNode(1), FakeNode(2)
+    tiny = np.array([0, 1, 2], dtype=np.int64)
+    g._cal_acc = {1: [tiny.copy(), tiny.copy()], 2: [tiny.copy(), tiny.copy()]}
+    g._cal_deadline = time.time() + 1000
+    g._enqueue_log = lambda *a, **k: None
+    applied = []
+    g._apply_sparse_dwell_offset = lambda run_id: applied.append(run_id)
+    rescheduled = []
+    g.root.after = lambda ms, fn: rescheduled.append(ms)
+
+    master.ReceiverGUI._poll_sparse_cal(g, 1)
+
+    check('neither span ready -> reschedules instead of calibrating',
+          applied == [] and len(rescheduled) == 1, (applied, rescheduled))
+
+
 def test_apply_sparse_dwell_offset_trims_an_oversized_burst_before_fitting():
     """A T-mode file can hand this several waveform periods at once. The fit
     must only ever see one period's worth, per node, independently."""
@@ -199,6 +256,46 @@ def test_apply_sparse_dwell_offset_trims_an_oversized_burst_before_fitting():
               span_a <= period_ps and span_b <= period_ps,
               f'{span_a} / {span_b} vs {period_ps}')
     check('both nodes drained after calibration',
+          g.node1.drain_calls == 1 and g.node2.drain_calls == 1)
+
+
+def test_apply_sparse_dwell_offset_falls_back_to_master_when_slave_unusable():
+    """A mask with zero slave-chip pixels active never produces slave_dwell
+    data at all -- this must calibrate from master_dwell instead of forcing
+    offset=0, so a master-chip-only pixel can still be correlated live."""
+    period_ps = int(round(master.SPARSE_CAL_WAVEFORM_S * 1e12))
+    step = period_ps // 40
+    master_arr = np.arange(0, period_ps, step, dtype=np.int64)
+
+    g = object.__new__(master.ReceiverGUI)
+    g._run_id = 1
+    g.node1, g.node2 = FakeNode(1), FakeNode(2)
+    g._cal_acc = {
+        1: [np.empty(0, dtype=np.int64), master_arr.copy()],       # no slave dwell
+        2: [np.empty(0, dtype=np.int64), master_arr.copy() + 7],
+    }
+    g._correlators = []
+    logs = []
+    g._enqueue_log = logs.append
+    g._set_cal_status = lambda *a, **k: None
+
+    captured = []
+    def fake_estimate_offset(a, b, **kw):
+        captured.append((a, b))
+        return 7.0, {'n_matched': min(a.size, b.size)}
+    real_estimate_offset = master.estimate_offset
+    master.estimate_offset = fake_estimate_offset
+    try:
+        master.ReceiverGUI._apply_sparse_dwell_offset(g, 1)
+    finally:
+        master.estimate_offset = real_estimate_offset
+
+    check('no slave dwell -> estimate_offset called once, on master arrays only',
+          len(captured) == 1, len(captured))
+    check('fallback logged', any('falling back to master' in m for m in logs), logs)
+    check('applied offset labeled as master dwell',
+          any('master dwell' in m for m in logs), logs)
+    check('both nodes drained after fallback calibration',
           g.node1.drain_calls == 1 and g.node2.drain_calls == 1)
 
 

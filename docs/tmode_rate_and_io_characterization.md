@@ -172,13 +172,77 @@ the logbook's 7-9-26 entry for the correction.
 
 ## Not yet done
 
-- A true synthetic disk-write test (write N ~52 MB files with no lSPAD
+- ~~A true synthetic disk-write test (write N ~52 MB files with no lSPAD
   involved at all) would still isolate "raw disk speed" from "lSPAD's own
-  write-pacing software" more cleanly than Stage 4 does — Stage 4 confirms
-  the *measurement* is now representative, but doesn't by itself separate
-  those two remaining causes for node2's earlier divergence.
-- Confirm the Windows Defender exclusions noted in `logbook.md` (3-9-26,
+  write-pacing software" more cleanly than Stage 4 does~~ — **done 9-9-26,
+  conclusive.** `tools/bench_synthetic_disk_write.py` (node-local, same
+  convention as `bench_tmode_io.py --local`, no lSPAD/parsing involved at
+  all): 20 x 52.4 MB files, plain `open`/`write`/`fsync`, on the same drive
+  as lSPAD's own `data\tdc` output.
+
+  | | throughput | per-file time |
+  |---|---|---|
+  | node1 | 1602.6 MB/s (no-delete) / 1554.0 (delete-as-you-go) | ~29-38 ms, tight |
+  | node2 | 1051.4 MB/s (no-delete) / 990.9 (delete-as-you-go) | 31-110 ms, several 2-3x outliers |
+
+  **Raw disk hardware is not the bottleneck on either node** — both exceed
+  lSPAD's own real T-mode throughput (~40-60 MB/s peak) by more than an
+  order of magnitude. Node2's disk is genuinely slower in absolute terms
+  (~35%) and its per-file timing is visibly less consistent, but that gap
+  is far too small to explain the 2-5x+ divergence seen in real T-mode runs
+  (Stage 4, mask_sweep_12/24) — this rules out "node2's disk is just slow"
+  as the explanation. Delete-as-you-go made no measurable difference here
+  (990.9 vs 1051.4 MB/s) — contrast with Stage 3's real lSPAD-driven
+  20-45% improvement from the same toggle, which means that effect is
+  specific to something in lSPAD's own write-pacing software, not a
+  generic filesystem/accumulation cost. **Conclusion: the two remaining
+  candidates from Stage 4 (node2's disk vs. lSPAD's own write-pacing
+  software) are now resolved — it is lSPAD's software, not the disk.**
+  Data: `figs/9-9-26/data/synth_io_bench_summary.json` +
+  per-node `synth_io_bench_node{1,2}.json`.
+- ~~Confirm the Windows Defender exclusions noted in `logbook.md` (3-9-26,
   `sii_wis` dir + `python.exe`/`pythonw.exe`/`lSPAD.exe`) are still
-  identically applied on both nodes — a partial or missing exclusion on
-  just one node would produce exactly this kind of persistent,
-  node-specific slowdown without it being a hardware disk-speed difference.
+  identically applied on both nodes~~ — **checked 9-9-26, ruled out.**
+  `Get-MpPreference` via SSH on both nodes: `ExclusionPath` = {lSPAD install
+  dir, sii_wis dir} and `ExclusionProcess` = {sshd.exe, lSPAD.exe,
+  python.exe, pythonw.exe} on both, byte-for-byte identical (only the
+  per-user sii_wis path differs, as expected — labcomp1 vs oreni). Not the
+  explanation for node2's I/O divergence. The synthetic disk-write test
+  above is the one remaining untested root-cause candidate.
+- ~~mask_ten at ~11 Mcps global (8-9-26): live correlator ran fine for several
+  minutes, then some pixel pairs started contributing zero time
+  differences on every poll~~ — **re-run 9-9-26 with a fresh mask_ten (10
+  slave-chip pixels closest to 160: 150-168 even) and `POLL_MS=5s` in place:
+  confirmed NOT fixed, and now unambiguous.** `session_stats.json`: node1
+  lag_s=0.4 (peak 0.59), node2 lag_s=20.16 (peak 0.59 -> both nodes ingest
+  ~10-11 Mcps, node1 stays under a second, node2 falls 20+ s behind and
+  never recovers). `exclusion_history` in the saved `.npz` meta shows all
+  10 pairs excluded on node 2, all citing "11.8 s behind in detector time"
+  — `ChannelGraph` behaved correctly; the 5 s poll interval was never the
+  cause (release is watermark-gated, as expected) and this run proves it
+  cleanly. This is the same node2-diverges-first finding as Stage 4 above,
+  now reproduced live at 10 slave-only pixels. Root cause still traced only
+  as far as "node2's own file-write pacing/I/O", per Stage 4 — the two
+  bullets above (synthetic disk-write test, Defender exclusion parity) are
+  the next real steps, not a correlator-side fix.
+- **Master-chip pixels show no bunching signal at any delay (9-9-26),
+  marked undecidable for now — deferred to the end of this list.** Every
+  tested slave-chip pixel (160/162/164/166/168) shows the expected ~14 ns
+  peak; every tested master-chip pixel (143/147/151/161/163/165/167) does
+  not, even with full statistics and no exclusions (`master_check.npz`,
+  86 min, zero exclusions). Ruled out: bulk clock offset, bin-width
+  smearing, a shifted peak elsewhere in ±1 us, TDC/fine-value quantization
+  difference between chips, and a naively-measured "~100 ns node2 anomaly"
+  that turned out to be a coarse-tick (100 ns) counting artifact, not a
+  real delay (the genuine node2 master-vs-slave sub-tick residual is only
+  ~1.5-1.8 ns, reproducible across sessions, too small to explain a total
+  absence of signal). Not yet ruled out: something specific to the T-mode
+  pipeline itself vs. a genuine hardware/optical difference between the
+  two chips. **Cheap, decisive next check**: the pre-T-mode SB-based
+  pipeline is still intact on `main` (this branch replaced it entirely,
+  per the 6-9-26 entry) — an independent code path with different parsing
+  and epoch handling. Run the same master-chip-pixel bunching test there:
+  if master-chip pixels also show no signal under SB mode, the cause is
+  hardware/optical, not this branch's software; if they *do* show a real
+  peak under SB mode, the bug is isolated to the T-mode pipeline. For now,
+  the main plan proceeds with slave-chip pixels only.

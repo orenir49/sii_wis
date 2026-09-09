@@ -53,14 +53,17 @@ from sii_calculator import SIICalculatorWindow
 
 MAX_PAIRS = 320           # guard: grid mode is how you ask for 6400 by accident
 BACKLOG_WARN_S = 2.0
-POLL_MS = 200             # how often to check the queues for a new batch --
+POLL_MS = 5000            # how often to check the queues for a new batch --
                           # not a display-refresh throttle: T-mode delivers
                           # dwell/pixel data in one burst per completed
                           # source file rather than a trickle, so a batch
                           # either isn't there yet (this poll is a no-op) or
                           # is drained and shown in full the moment it is.
-                          # There is nothing left for a user-tunable "update
-                          # every N seconds" to trade off.
+                          # Raised from 200 ms 8-9-26 to cut poll overhead at
+                          # mask_ten scale; release is watermark-gated
+                          # (correlate_engine.py) so a longer interval only
+                          # delays draining, it doesn't change which taus end
+                          # up in-window.
 
 
 
