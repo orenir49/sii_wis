@@ -185,10 +185,14 @@ truncation-in-place (see the file-rotation decision under "Open questions").
    its oldest, which delays reclaim. Start simple; move to size-capped
    rotation only if Phase 4's live validation shows the per-poll file count
    is actually a problem.
-4. How `ChannelGraph.status()` and the GUI should represent "spilling to
+4. ~~How `ChannelGraph.status()` and the GUI should represent "spilling to
    disk, N MB, waiting on node X" as a distinct, non-alarming state,
-   separate from today's `LOSING COINCIDENCES` red line — the whole point
-   of this plan is that nothing is lost while spilling.
+   separate from today's `LOSING COINCIDENCES` red line.~~ **Done (Phase
+   3):** `status()` now has a `lagging (nothing lost): N channel(s) behind
+   (...) — <reason>; X MB spilled to disk` line, checked ahead of the
+   generic `waiting_on` report. The GUI itself (`correlate_multi.py`) isn't
+   touched yet -- it doesn't call `status()` any differently than before,
+   this is just the string available to it once it does.
 5. Test plan: extend `tests/test_channel_graph.py` with a synthetic case
    that reproduces `test_detector_time_lag_triggers_exclusion`'s scenario
    but keeps the lagging partner delivering indefinitely, and asserts the
@@ -206,9 +210,49 @@ truncation-in-place (see the file-rotation decision under "Open questions").
 - **Phase 2**: give `Channel` an optional disk-backed tail (spill/reload),
   with no behavioural change unless a caller invokes it — testable in
   isolation from `ChannelGraph`.
-- **Phase 3**: wire it into `ChannelGraph` for `lagging` (not `dead`)
-  partners, replacing today's force-release-and-lose path; Phase 1's test
-  should now pass.
-- **Phase 4**: live hardware validation — rerun the mask_ten scenario and
-  confirm the previously-dropped pairs now show coincidences, at an
-  acceptable disk footprint.
+- **Phase 3 (done):** wired into `ChannelGraph`. `_refresh_exclusions` now
+  splits `dead` (`c.excluded`, wall-clock silence only) from `lagging`
+  (`c.lagging`, detector-time lag) instead of setting `excluded` for both.
+  Because `_cut_for`/`_keep_for`/`_would_release` only ever check
+  `.excluded`, this one split is the entire correctness fix, on **both**
+  sides symmetrically: a `lagging` partner is treated exactly like any
+  other still-live, still-being-waited-for channel, so `test_lagging_partner_recovers_without_loss`
+  now passes purely from the pre-existing in-RAM gating -- no code in
+  `_cut_for`/`_keep_for` itself changed. `ChannelGraph.status()` gained a
+  `lagging (nothing lost)` line, distinct from `LOSING COINCIDENCES`
+  (resolves open question 4 with a first-pass wording).
+
+  The disk-spill half is wired in for the documented real-world direction
+  only: a node-1 channel (`ch1`) blocked on a `lagging` node-2 partner spills
+  its oldest excess past a new `spill_tail_bytes` cap (`_spill_overflow`,
+  called at the end of `release()`) and reloads it before the next cut that
+  can use it (`_reload_ready_spills`, called at the start), verified
+  end-to-end by `test_lagging_partner_spills_and_reloads` (real files
+  written, read back, and deleted, final result bit-identical to an
+  undelayed baseline). **Known gap, not yet handled:** the symmetric case --
+  node 1 lagging, node-2 channels (`ch2`) backlogging while `_keep_for` holds
+  old data for a still-`lagging`-not-`dead` node-1 partner -- gets the same
+  correctness fix (it was never excluded from `_keep_for`'s limits either)
+  but no disk-spill RAM-bounding yet; `ch2`'s RAM can still grow unboundedly
+  in that direction. Left as a follow-up since it isn't the observed
+  real-world failure (mask_ten is node-2-lags-node-1-backlogs), not because
+  it's architecturally hard.
+
+  `spill_tail_bytes` ships with a placeholder default
+  (`DEFAULT_SPILL_TAIL_BYTES = 16_000_000`, ~2M events/channel) -- open
+  question 1 (real tail-window sizing) and open question 2 (a disk-usage
+  ceiling for a partner that lags forever) are both still open; nothing
+  currently stops `spill_nbytes` from growing without bound if a lagging
+  partner never recovers and never dies. `spill_dir` defaults to `None`
+  (disabled) and no caller in this repo passes one yet --
+  `correlate_multi.py`'s live `ChannelGraph(...)` call is unchanged, so nothing
+  about today's running GUI is different until Phase 4 wires a real
+  session-scoped path through it.
+- **Phase 4**: wire `correlate_multi.py`'s `ChannelGraph(...)` call to a real
+  session-scoped `spill_dir` (`spad_data/spill/<session>/`, per the
+  "Relationship to existing disk features" path above) -- the live GUI opts
+  into nothing from this plan until that lands. Then live hardware
+  validation: rerun the mask_ten scenario and confirm the previously-dropped
+  pairs now show coincidences, at an acceptable disk footprint; use that run
+  to settle the still-open tail-window sizing (question 1) and disk-usage
+  ceiling (question 2) with real numbers instead of the placeholder default.

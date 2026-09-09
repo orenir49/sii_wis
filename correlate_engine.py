@@ -92,6 +92,13 @@ DEFAULT_STALL_TOL_PS = 5 * PS_PER_S  # detector-time lag behind the leader
 # stream going quiet is, which is what this measures.
 DEFAULT_IDLE_AFTER_S = 3.0
 
+# RAM to let a channel hold while blocked on a `lagging` (not dead) partner
+# before spilling the oldest excess to disk (docs/lag_safe_correlator.md,
+# Phase 3). A placeholder, not a benchmarked figure -- open question 1 in
+# that doc calls out real tail-window sizing as still needing a pass against
+# a genuine lagging-node capture (mask_ten) before this is trusted as final.
+DEFAULT_SPILL_TAIL_BYTES = 16_000_000  # ~2M int64 events per channel
+
 
 @dataclass
 class SpillFile:
@@ -149,7 +156,8 @@ class Channel:
         self.n_events = 0           # ever ingested
         self.n_released = 0         # ever handed to the kernel (node 1 only)
         self.n_violations = 0       # chunks arriving out of order
-        self.excluded = False       # currently dropped from partners' min
+        self.excluded = False       # DEAD: currently dropped from partners' min
+        self.lagging = False        # still delivering, just behind -- kept, spilled if large
         self.exclude_reason = ''
 
     # -- ingestion ---------------------------------------------------------
@@ -173,6 +181,7 @@ class Channel:
         self.last_arrival = None
         self.n_events = self.n_released = self.n_violations = 0
         self.excluded = False
+        self.lagging = False
         self.exclude_reason = ''
         while not self.q.empty():
             try:
@@ -337,15 +346,17 @@ class Channel:
     def __repr__(self) -> str:
         spill = (f' spill={len(self.spill_files)}f/{self.spill_nbytes}B'
                  if self.spill_files else '')
+        state = ' DEAD' if self.excluded else (' lagging' if self.lagging else '')
         return (f'<Channel n{self.node} px{self.pixel} '
-                f'buf={self.n_buffered} last_ts={self.last_ts}{spill}>')
+                f'buf={self.n_buffered} last_ts={self.last_ts}{spill}{state}>')
 
 
 @dataclass
 class Release:
     """One release cycle's output plus everything the status line must say."""
     batches: list = field(default_factory=list)     # (p1, p2, t1_batch, t2_arr)
-    excluded: list = field(default_factory=list)    # (node, pixel, reason)
+    excluded: list = field(default_factory=list)    # (node, pixel, reason) -- DEAD only
+    lagging: list = field(default_factory=list)     # (node, pixel, reason) -- still delivering
     lost_pairs: list = field(default_factory=list)  # (p1, p2) released with no partner
     waiting_on: list = field(default_factory=list)  # (node, pixel, backlog_ps)
     merged: bool = False
@@ -368,12 +379,22 @@ class ChannelGraph:
                  stall_tolerance_ps: float = DEFAULT_STALL_TOL_PS,
                  idle_after_s: float = DEFAULT_IDLE_AFTER_S,
                  check_monotonic: bool = False,
+                 spill_dir: str | None = None,
+                 spill_tail_bytes: int = DEFAULT_SPILL_TAIL_BYTES,
                  clock=time.monotonic) -> None:
         self.tmax = float(tmax_ps)
         self.offset = int(offset)
         self.stall_grace_s = float(stall_grace_s)
         self.stall_tolerance_ps = float(stall_tolerance_ps)
         self.idle_after_s = float(idle_after_s)
+        # docs/lag_safe_correlator.md, Phase 3: a channel blocked on a
+        # `lagging` (not dead) partner spills its oldest excess past
+        # spill_tail_bytes to disk instead of growing RAM without bound.
+        # spill_dir=None (the default) disables this entirely -- no caller
+        # in this repo opts in yet (see correlate_multi.py), so today's
+        # behavior is unchanged unless a caller explicitly asks for it.
+        self.spill_dir = spill_dir
+        self.spill_tail_bytes = int(spill_tail_bytes)
         self.clock = clock
 
         self.pairs = [(p.p1, p.p2) for p in pair_list.pairs]
@@ -381,9 +402,9 @@ class ChannelGraph:
         self.partners2 = pair_list.partners_node2()
 
         # Node 2 carries the clock offset; node 1 is the reference.
-        self.ch1 = {p: Channel(1, p, 0, check_monotonic)
+        self.ch1 = {p: Channel(1, p, 0, check_monotonic, spill_dir=self.spill_dir)
                     for p in pair_list.channels_node1}
-        self.ch2 = {p: Channel(2, p, self.offset, check_monotonic)
+        self.ch2 = {p: Channel(2, p, self.offset, check_monotonic, spill_dir=self.spill_dir)
                     for p in pair_list.channels_node2}
 
         self.accumulating = False
@@ -443,18 +464,46 @@ class ChannelGraph:
     def nbytes(self) -> int:
         return sum(c.nbytes for c in self.channels)
 
+    @property
+    def spill_nbytes(self) -> int:
+        """Total disk footprint across every channel's spill files. Not yet
+        capped (docs/lag_safe_correlator.md open question 2) -- a partner
+        that lags forever without ever recovering or dying will keep this
+        growing; only the RAM-side tail is bounded by spill_tail_bytes."""
+        return sum(c.spill_nbytes for c in self.channels)
+
     # -- stall detection ---------------------------------------------------
 
     def _leader_ts(self):
         seen = [c.last_ts for c in self.channels if c.last_ts is not None]
         return max(seen) if seen else None
 
-    def _refresh_exclusions(self, now: float) -> list:
-        """Decide which channels are too far behind to keep waiting for.
+    def _refresh_exclusions(self, now: float):
+        """Decide which channels are too far behind to keep waiting for, and
+        split that into two states (docs/lag_safe_correlator.md, Phase 3):
 
-        Two independent triggers, because they catch different failures:
-        wall-clock silence catches a pixel that stopped emitting, and
-        detector-time lag catches one still trickling but hopelessly behind.
+        DEAD (`c.excluded`)     wall-clock silence -- nothing has arrived at
+                                all for stall_grace_s. The channel is dead or
+                                the run has ended; its partners' held-up
+                                backlog is force-released and reported lost
+                                (`_cut_for`/`_keep_for`, unchanged).
+        LAGGING (`c.lagging`)  still delivering, just too far behind the
+                                leader in detector time (stall_tolerance_ps).
+                                NOT excluded: `_cut_for`/`_keep_for`/
+                                `_would_release` only ever check `.excluded`,
+                                so a lagging partner is treated exactly like
+                                any other still-live, still-being-waited-for
+                                channel -- its partner's backlog just keeps
+                                accumulating (subject to the spill cap in
+                                release(), see _spill_overflow) instead of
+                                being force-released. This is the whole fix:
+                                before Phase 3, both triggers set `excluded`,
+                                so a merely-late partner was treated exactly
+                                like a dead one and lost coincidences
+                                (test_detector_time_lag_triggers_exclusion /
+                                the mask_ten failure).
+
+        Returns (dead, lagging), each a list of (node, pixel, reason).
         """
         leader = self._leader_ts()
         since_start = (now - self._t_start) if self._t_start is not None else 0.0
@@ -471,35 +520,39 @@ class ChannelGraph:
         if self.stream_idle:
             for c in self.channels:
                 c.excluded = False
+                c.lagging = False
                 c.exclude_reason = ''
-            return []
+            return [], []
 
-        out = []
+        dead, lagging = [], []
         for c in self.channels:
             reason = ''
+            is_dead = False
             if c.last_ts is None:
                 # Never delivered. Not stalled until the grace period expires:
                 # at session start every channel looks like this, and excluding
                 # on sight is the original bug.
                 if since_start > self.stall_grace_s:
                     reason = f'no data at all for {since_start:.0f} s'
+                    is_dead = True
             else:
                 quiet = now - (c.last_arrival or now)
                 lag = (leader - c.last_ts) if leader is not None else 0
                 if quiet > self.stall_grace_s:
                     reason = f'silent for {quiet:.0f} s'
+                    is_dead = True
                 elif lag > self.stall_tolerance_ps:
                     reason = f'{lag / PS_PER_S:.1f} s behind in detector time'
-            was = c.excluded
-            c.excluded = bool(reason)
+                    is_dead = False
+            c.excluded = is_dead
+            c.lagging = bool(reason) and not is_dead
             c.exclude_reason = reason
-            if reason:
-                out.append((c.node, c.pixel, reason))
+            if is_dead:
+                dead.append((c.node, c.pixel, reason))
                 self.exclusion_history[(c.node, c.pixel)] = reason
-            elif was:
-                # Recovered -- worth not leaving a stale red line in the UI.
-                pass
-        return out
+            elif c.lagging:
+                lagging.append((c.node, c.pixel, reason))
+        return dead, lagging
 
     # -- the release decision ---------------------------------------------
 
@@ -549,12 +602,22 @@ class ChannelGraph:
         node-1 channel *before* any node-2 channel is trimmed, because a
         node-2 channel shared by two pairs must be kept as far back as the
         more conservative of the two.
+
+        Disk-spill bookkeeping (docs/lag_safe_correlator.md, Phase 3) brackets
+        the existing decision rather than threading through it: reload
+        happens first, so `_cut_for` sees any now-safe-to-correlate spilled
+        data already back in `arr` and the rest of this method is unchanged
+        from before Phase 3; spill happens last, against whatever is left
+        over once this cycle's actual releases have already trimmed `arr`
+        down. Both are no-ops when spill_dir was never configured.
         """
         now = self.clock() if now is None else now
         rel = Release()
-        rel.excluded = self._refresh_exclusions(now)
+        rel.excluded, rel.lagging = self._refresh_exclusions(now)
+        self._reload_ready_spills()
 
         if not self._would_release():
+            self._spill_overflow()
             rel.waiting_on = self._waiting_report()
             return rel
 
@@ -575,6 +638,7 @@ class ChannelGraph:
             rel.n_released += int(cut)
 
         if not any(b.size for b in batches.values()):
+            self._spill_overflow()
             rel.waiting_on = self._waiting_report()
             return rel
 
@@ -599,33 +663,106 @@ class ChannelGraph:
                 continue
             rel.batches.append((p1, p2, t1b, t2a))
 
+        self._spill_overflow()
         rel.waiting_on = self._waiting_report()
         return rel
 
-    def _cut_for(self, p1: int, c1: Channel):
-        """Index in c1.arr up to which events are safe to correlate.
+    def _reload_ready_spills(self) -> None:
+        """Bring back any spilled node-1 data that this poll's cut would now
+        reach, before that cut runs.
 
-        Returns (cut, all_partners_excluded). The release point is the min over
-        partners of `partner.last_ts - tmax`: an event at or before that has
-        had every partner observed past t1 + tmax, so no coincidence for it can
-        still arrive.
+        Uses the exact same limit `_cut_for` would compute, so a channel's
+        spill files and its in-RAM `arr` are always judged by one consistent
+        rule -- there is no separate "is it safe to reload" question, only
+        "is it safe to correlate", asked once. All-dead partners reload
+        everything (limit=inf) so `_cut_for`'s force-release-and-lose path
+        sees the whole backlog, on disk or not, exactly as it would have if
+        spilling had never happened. A no-op for any channel with no
+        spill_files (the overwhelmingly common case -- spilling only ever
+        happens for a channel genuinely blocked on a `lagging` partner).
         """
-        if c1.arr.size == 0:
-            return 0, False
+        for p1, c1 in self.ch1.items():
+            if not c1.spill_files:
+                continue
+            limit, all_dead = self._cut_limit_for(p1)
+            if all_dead:
+                c1.reload_up_to(float('inf'))
+            elif limit is not None:
+                c1.reload_up_to(limit)
+
+    def _spill_overflow(self) -> None:
+        """Cap RAM for a node-1 channel genuinely blocked on a `lagging` (not
+        dead, not simply not-yet-arrived) partner, moving its oldest excess
+        past spill_tail_bytes to disk instead of letting it grow without
+        bound -- the disk-spill half of docs/lag_safe_correlator.md's Phase 3.
+
+        Deliberately narrow: only fires for a channel whose backlog is both
+        oversized AND blocked by a partner we know is still coming back
+        (`lagging`), never for a healthy channel or one merely waiting out a
+        partner's startup grace period, so a normal run never touches disk.
+        The disk-usage ceiling for a partner that lags forever without ever
+        recovering or dying is still open question 2 in that doc -- this
+        bounds RAM, not disk.
+        """
+        if self.spill_dir is None:
+            return
+        for p1, c1 in self.ch1.items():
+            if c1.nbytes <= self.spill_tail_bytes:
+                continue
+            blocked_by_lagging = any(
+                self.ch2[p2].lagging for p2 in self.partners1.get(p1, ()) if p2 in self.ch2)
+            if not blocked_by_lagging:
+                continue
+            c1.merge()
+            excess_events = (c1.nbytes - self.spill_tail_bytes) // 8
+            if excess_events > 0:
+                c1.spill(excess_events)
+
+    def _cut_limit_for(self, p1: int):
+        """min over p1's non-dead partners of `partner.last_ts - tmax`, shared
+        by `_cut_for` (applies it to c1.arr) and `_reload_ready_spills`
+        (applies it to c1's spill files, so anything now safe to correlate
+        comes back from disk before the cut runs).
+
+        Returns (limit, all_dead): `all_dead` True means every partner is
+        DEAD (not merely `lagging` -- those are treated as normal, still-live
+        partners here, which is the Phase-3 fix) so there is nothing left to
+        wait for; `limit` is None while any live partner hasn't delivered yet
+        (must keep waiting, not release).
+        """
         limits = []
         for p2 in self.partners1.get(p1, ()):
             c2 = self.ch2.get(p2)
             if c2 is None or c2.excluded:
                 continue
             if c2.last_ts is None:
-                return 0, False     # inside its grace period: wait, do not lose it
+                return None, False   # inside its grace period: wait, do not lose it
             limits.append(c2.last_ts - self.tmax)
         if not limits:
-            # Every partner is excluded. Holding would grow without bound, so
+            return None, True        # every partner is dead: nothing to wait for
+        return min(limits), False
+
+    def _cut_for(self, p1: int, c1: Channel):
+        """Index in c1.arr up to which events are safe to correlate.
+
+        Returns (cut, all_partners_dead). The release point is the min over
+        partners of `partner.last_ts - tmax`: an event at or before that has
+        had every partner observed past t1 + tmax, so no coincidence for it can
+        still arrive.
+        """
+        if c1.arr.size == 0:
+            return 0, False
+        limit, all_dead = self._cut_limit_for(p1)
+        if all_dead:
+            # Every partner is DEAD. Holding would grow without bound, so
             # release -- these coincidences are genuinely lost, and Release
-            # says so rather than letting it look like physics.
+            # says so rather than letting it look like physics. (A `lagging`
+            # partner does NOT reach here -- _cut_limit_for treats it as a
+            # normal live partner, so this stays gated instead, per Phase 3.)
             return int(c1.arr.size), True
-        return int(np.searchsorted(c1.arr, min(limits), side='right')), False
+        if limit is None:
+            return 0, False
+        return int(np.searchsorted(c1.arr, limit, side='right')), False
 
     def _keep_for(self, p2: int, c2: Channel) -> int:
         """Index in c2.arr below which events can never be needed again."""
@@ -668,7 +805,7 @@ class ChannelGraph:
         return out
 
     def status(self) -> str:
-        """One line for the UI. Says which of the four states we are in."""
+        """One line for the UI. Says which of the five states we are in."""
         if self.stream_idle:
             buf = self.nbytes
             past = (f'; {len(self.exclusion_history)} channel(s) were excluded '
@@ -681,6 +818,19 @@ class ChannelGraph:
             more = f' +{len(exc) - 4}' if len(exc) > 4 else ''
             return (f'LOSING COINCIDENCES: {len(exc)} channel(s) excluded '
                     f'({names}{more}) — {exc[0].exclude_reason}')
+        # Deliberately distinct from LOSING COINCIDENCES: a `lagging` partner
+        # is still delivering, so nothing is lost -- it's either waiting in
+        # RAM or spilled to disk (docs/lag_safe_correlator.md, Phase 3), not
+        # dropped. Reported before the generic waiting_on line so a viewer
+        # sees *why* a channel is behind, not just that it is.
+        lag = [c for c in self.channels if c.lagging]
+        if lag:
+            names = ', '.join(f'n{c.node}px{c.pixel}' for c in lag[:4])
+            more = f' +{len(lag) - 4}' if len(lag) > 4 else ''
+            spilled = self.spill_nbytes
+            spill_note = f'; {spilled / 1e6:.1f} MB spilled to disk' if spilled else ''
+            return (f'lagging (nothing lost): {len(lag)} channel(s) behind '
+                    f'({names}{more}) — {lag[0].exclude_reason}{spill_note}')
         wait = self._waiting_report()
         if wait:
             node, pixel, backlog = wait[0]

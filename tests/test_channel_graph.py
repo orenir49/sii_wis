@@ -638,7 +638,13 @@ def test_channel_that_stops_mid_run():
 
 def test_detector_time_lag_triggers_exclusion():
     """The second trigger: a channel still delivering, but hopelessly behind in
-    detector time. Wall-clock silence would never catch this one."""
+    detector time. Wall-clock silence would never catch this one.
+
+    Since docs/lag_safe_correlator.md's Phase 3, this trigger no longer marks
+    the channel DEAD (`excluded`) -- only wall-clock silence does that. A
+    still-delivering-but-lagging channel is `lagging` instead, which
+    `_cut_for`/`_keep_for`/`_would_release` treat as a normal live partner
+    (see test_lagging_partner_recovers_without_loss for why that matters)."""
     clock = FakeClock()
     pl, g, clock, drv = build('grid', list1=[10], list2=[20, 21], clock=clock,
                               stall_grace_s=1e9, stall_tolerance_ps=2 * PS_PER_S)
@@ -647,10 +653,15 @@ def test_detector_time_lag_triggers_exclusion():
               (2, 20): np.array([base + 10 * PS_PER_S], dtype=np.int64),
               (2, 21): np.array([base], dtype=np.int64)}, dt=0.5)
     rel = drv.step(None, dt=0.5)
-    check('a channel 10 s behind in detector time is excluded despite delivering',
-          any(n == 2 and p == 21 for n, p, _ in rel.excluded)
+    check('a channel 10 s behind in detector time is LAGGING, not excluded (dead)',
+          any(n == 2 and p == 21 for n, p, _ in rel.lagging)
+          and not any(n == 2 and p == 21 for n, p, _ in rel.excluded)
+          and g.ch2[21].lagging and not g.ch2[21].excluded
           and 'behind in detector time' in g.ch2[21].exclude_reason,
-          f'{rel.excluded} / {g.ch2[21].exclude_reason!r}')
+          f'{rel.lagging} / {rel.excluded} / {g.ch2[21].exclude_reason!r}')
+    check('status reports it as lagging (nothing lost), not LOSING COINCIDENCES',
+          'lagging (nothing lost)' in g.status() and 'LOSING' not in g.status(),
+          g.status())
 
 
 # ---------------------------------------------------------------------------
@@ -789,45 +800,79 @@ def _node_lag_case(stall_tolerance_ps, n_chunks=20, lag_chunks=8):
     return g0, d0, g1, d1
 
 
-def test_lagging_partner_loses_coincidences_today():
-    """Pins today's bug. Node 2 is never dead -- it delivers everything by the
-    end -- but once its detector-time lag crosses stall_tolerance_ps, the
-    lag-exclusion path in `_cut_for` treats it exactly like a dead partner:
-    node 1's whole held-up backlog is force-released this same poll against
-    whatever sliver of node 2 has arrived so far, and node 1's array is then
-    cleared. When the matching node-2 data trickles in on a later poll, there
-    is nothing left on the node-1 side to pair it with. This is the mask_ten
-    failure from docs/tmode_rate_and_io_characterization.md, reproduced
-    synthetically.
-
-    If this ever passes, ChannelGraph has changed enough that this test (and
-    not test_lagging_partner_recovers_without_loss) is the one that stopped
-    meaning anything -- check what changed before deleting it."""
-    g0, d0, g1, d1 = _node_lag_case(stall_tolerance_ps=2e8)
-    want = sum(len(v) for v in d0.taus.values())
-    got = sum(len(v) for v in d1.taus.values())
-    check(f'today, crossing stall_tolerance_ps loses coincidences even though '
-          f'the partner was only late, never dead ({got} of {want})',
-          got < want and want > 500, f'got {got}, want {want}')
-
-
 def test_lagging_partner_recovers_without_loss():
-    """Acceptance test for docs/lag_safe_correlator.md's disk-spill design.
-    A partner that lags past stall_tolerance_ps but keeps delivering must
-    cost no coincidences once it catches up -- the same bit-identical
+    """Acceptance test for docs/lag_safe_correlator.md, satisfied as of
+    Phase 3. A partner that lags past stall_tolerance_ps but keeps delivering
+    must cost no coincidences once it catches up -- the same bit-identical
     standard test_whole_node_lag_catches_up_bit_identical already holds a
     dead-partner-free run to, but with the lag-exclusion trigger actually
     engaged this time instead of set unreachably high.
 
-    FAILS today -- see test_lagging_partner_loses_coincidences_today for the
-    mechanism. Expected to start passing once a `lagging` (still delivering)
-    partner gets a disk-backed tail instead of the force-release-on-exclusion
-    path `dead` partners keep."""
+    Before Phase 3 this failed: the lag trigger marked the channel `excluded`
+    exactly like a dead one, so `_cut_for` force-released node 1's held-up
+    backlog against whatever sliver of node 2 had arrived so far, then
+    cleared it -- so node 2's later, matching data had nothing left to pair
+    with (the mask_ten failure in docs/tmode_rate_and_io_characterization.md).
+    Phase 3 stops treating `lagging` as `excluded`, so this now passes purely
+    from the existing in-RAM gating (test_whole_node_lag_catches_up_bit_identical's
+    same mechanism) -- no spill_dir is configured here, so this specific test
+    never touches disk. test_lagging_partner_spills_and_reloads below is the
+    companion that actually exercises the disk path."""
     g0, d0, g1, d1 = _node_lag_case(stall_tolerance_ps=2e8)
     same = all(sorted(d1.taus[p]) == sorted(d0.taus[p]) for p in g0.pairs)
     check('a partner lagging past tolerance but still delivering loses nothing',
           same and sum(len(v) for v in d0.taus.values()) > 500,
           f'{[(p, len(d1.taus[p]), len(d0.taus[p])) for p in g0.pairs]}')
+
+
+def test_lagging_partner_spills_and_reloads():
+    """The disk half of Phase 3: with spill_dir configured and a small
+    spill_tail_bytes, node 1's backlog while node 2 lags must actually spill
+    to disk (not just grow RAM without bound), and reload+delete once node 2
+    catches up -- ending bit-identical to the undelayed baseline and with no
+    files left behind."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        rng = np.random.default_rng(45)
+        streams = {(1, 150): poisson_stream(rng, 1e6, 0.002),
+                   (2, 150): poisson_stream(rng, 1e6, 0.002)}
+        _, g0, _, d0 = build('identity', lo=150, hi=150)
+        for feed in _interleaved_feed(streams, 20):
+            d0.step(feed)
+        d0.flush()
+
+        pl = pair_map.derive('identity', lo=150, hi=150)
+        clock = FakeClock()
+        g1 = ChannelGraph(pl, TMAX, clock=clock, stall_grace_s=1e9,
+                          stall_tolerance_ps=2e8, spill_dir=d, spill_tail_bytes=2000)
+        g1.start()
+        drv = Driver(g1, clock)
+        n_chunks, lag_chunks = 20, 8
+        c1_chunks = chunk(streams[(1, 150)], n_chunks)
+        c2_chunks = chunk(streams[(2, 150)], n_chunks)
+        saw_spill_file = False
+        for i in range(n_chunks + lag_chunks):
+            feed = {}
+            if i < n_chunks:
+                feed[(1, 150)] = c1_chunks[i]
+            j = i - lag_chunks
+            if 0 <= j < n_chunks:
+                feed[(2, 150)] = c2_chunks[j]
+            drv.step(feed, dt=0.5)
+            if g1.ch1[150].spill_files:
+                saw_spill_file = True
+        drv.flush()
+
+        check('a small spill_tail_bytes actually forces a spill to disk',
+              saw_spill_file)
+        check('spilled data ends up bit-identical to the undelayed baseline',
+              sorted(drv.taus[(150, 150)]) == sorted(d0.taus[(150, 150)])
+              and sum(len(v) for v in d0.taus.values()) > 500,
+              f'{len(drv.taus[(150, 150)])} vs {len(d0.taus[(150, 150)])}')
+        check('every spill file was reloaded and deleted -- none left behind',
+              g1.ch1[150].spill_files == [] and os.listdir(d) == [],
+              f'{g1.ch1[150].spill_files} / {os.listdir(d)}')
 
 
 # ---------------------------------------------------------------------------
