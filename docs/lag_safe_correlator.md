@@ -243,16 +243,27 @@ truncation-in-place (see the file-rotation decision under "Open questions").
   question 1 (real tail-window sizing) and open question 2 (a disk-usage
   ceiling for a partner that lags forever) are both still open; nothing
   currently stops `spill_nbytes` from growing without bound if a lagging
-  partner never recovers and never dies. `spill_dir` defaults to `None`
-  (disabled) and no caller in this repo passes one yet --
-  `correlate_multi.py`'s live `ChannelGraph(...)` call is unchanged, so nothing
-  about today's running GUI is different until Phase 4 wires a real
-  session-scoped path through it.
-- **Phase 4**: wire `correlate_multi.py`'s `ChannelGraph(...)` call to a real
-  session-scoped `spill_dir` (`spad_data/spill/<session>/`, per the
-  "Relationship to existing disk features" path above) -- the live GUI opts
-  into nothing from this plan until that lands. Then live hardware
-  validation: rerun the mask_ten scenario and confirm the previously-dropped
-  pairs now show coincidences, at an acceptable disk footprint; use that run
-  to settle the still-open tail-window sizing (question 1) and disk-usage
+  partner never recovers and never dies.
+
+- **Phase 4, wiring done, live validation not yet run.**
+  `ChannelGraph.set_spill_dir()` lets a caller point every channel at a
+  (new) directory after construction but before `start()` -- needed because
+  `correlate_multi.py` builds the graph at Enable time, before a session's
+  stamped folder name exists (the same `<suffix>_<stamp>` convention the
+  `diffs` write mode already uses, just under `spad_data/spill/` instead of
+  `spad_data/diffs/`, and independent of write_mode -- spilling is an
+  internal RAM fallback, not a user-visible save feature). `start_with_offset()`
+  now calls it every session, so the live GUI has opted in: nothing is
+  created on disk unless some channel actually spills (`Channel.spill()`
+  still makes the directory lazily), and a healthy run costs one string
+  computed and assigned, nothing more. Also added `ChannelGraph.peak_spill_nbytes`
+  (mirrors `peak_nbytes` for disk) and `spill_dir`/`peak_spill_bytes` in the
+  saved `.npz` meta, so "what did this lag cost on disk" is answerable from
+  a saved run the same way the RAM and RSS figures already are.
+
+  **Still needs real hardware, not done in this session:** rerun the
+  mask_ten scenario and confirm the previously-dropped pairs now show
+  coincidences, at an acceptable disk footprint (`peak_spill_bytes` in the
+  saved file); use that run to settle the still-open tail-window sizing
+  (question 1) and disk-usage
   ceiling (question 2) with real numbers instead of the placeholder default.

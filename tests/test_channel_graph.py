@@ -914,6 +914,26 @@ def test_offset_change_while_accumulating_is_refused():
         check('changing offset mid-session raises', True)
 
 
+def test_set_spill_dir_propagates_and_is_refused_while_accumulating():
+    """docs/lag_safe_correlator.md, Phase 4: a caller (correlate_multi.py)
+    constructs the graph before a session's directory name is known, then
+    sets it just before each start() -- like set_offset, not mid-session."""
+    pl, g, clock, drv = build('identity', lo=150, hi=150)
+    g.stop()
+    g.set_spill_dir('/tmp/some/spill/dir')
+    check('set_spill_dir updates the graph itself',
+          g.spill_dir == '/tmp/some/spill/dir')
+    check('set_spill_dir propagates to every channel',
+          all(c.spill_dir == '/tmp/some/spill/dir' for c in g.channels))
+
+    g.start()
+    try:
+        g.set_spill_dir('/tmp/other')
+        check('changing spill_dir mid-session raises', False, 'no exception')
+    except RuntimeError:
+        check('changing spill_dir mid-session raises', True)
+
+
 def test_offset_matches_post_hoc_subtraction():
     """Correcting at ingestion must give the same coincidences as the old
     per-poll `ch.arr - offset`."""

@@ -420,6 +420,11 @@ class ChannelGraph:
         # miss the moments that matter, which are the gated ones where a poll
         # returns early.
         self.peak_nbytes = 0
+        # Same idea for disk (docs/lag_safe_correlator.md, Phase 4): answers
+        # "what did this lag actually cost on disk" from a saved run, the
+        # same way peak_nbytes already answers it for RAM. Updated in
+        # _spill_overflow, which runs every release() regardless of branch.
+        self.peak_spill_nbytes = 0
 
     # -- wiring ------------------------------------------------------------
 
@@ -445,6 +450,25 @@ class ChannelGraph:
         for c in self.ch2.values():
             c.offset = self.offset
 
+    def set_spill_dir(self, spill_dir: str | None) -> None:
+        """Point every channel at a (possibly new) spill directory --
+        docs/lag_safe_correlator.md, Phase 4. Lets a caller construct the
+        graph once at Enable time, before a session's directory name (e.g.
+        one stamped per Start, like the `diffs` write mode's own per-run
+        folder) is known, then set it just before each start().
+
+        Must precede accumulation, like set_offset: swapping directories
+        mid-session would let one run's spilled data land in two places.
+        Safe to call again before a later start() even with channels still
+        holding old spill_files -- reset() (called by start()) deletes them
+        by their own stored path, independent of whatever spill_dir is
+        current by then, so nothing is orphaned by the switch."""
+        if self.accumulating:
+            raise RuntimeError('spill_dir cannot change while accumulating')
+        self.spill_dir = spill_dir
+        for c in self.channels:
+            c.spill_dir = spill_dir
+
     def start(self, offset=None) -> None:
         if offset is not None:
             self.accumulating = False
@@ -456,6 +480,7 @@ class ChannelGraph:
         self.stream_idle = False
         self.exclusion_history.clear()
         self.peak_nbytes = 0
+        self.peak_spill_nbytes = 0
 
     def stop(self) -> None:
         self.accumulating = False
@@ -717,6 +742,9 @@ class ChannelGraph:
             excess_events = (c1.nbytes - self.spill_tail_bytes) // 8
             if excess_events > 0:
                 c1.spill(excess_events)
+        sb = self.spill_nbytes
+        if sb > self.peak_spill_nbytes:
+            self.peak_spill_nbytes = sb
 
     def _cut_limit_for(self, p1: int):
         """min over p1's non-dead partners of `partner.last_ts - tmax`, shared

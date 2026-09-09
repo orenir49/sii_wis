@@ -216,6 +216,7 @@ class MultiCorrelateWindow(tk.Toplevel):
         self._diff_files: dict = {}    # (p1, p2) -> open file handle, this session
         self._diff_paths: dict = {}    # (p1, p2) -> path, kept after close for consolidation
         self._diff_session_dir: str | None = None
+        self._spill_session_dir: str | None = None
         self._result_q: queue.Queue = queue.Queue()
         self._last_kernel_s = 0.0
         # Scale measurements the plan asks for at 4 -> 16 -> 80 pairs.
@@ -743,6 +744,21 @@ class MultiCorrelateWindow(tk.Toplevel):
                             ('Enabled — waiting for DWELL.' if self._active else 'Disabled.'))
 
     # ------------------------------------------------------------------
+    # Lag-safe correlator disk spill (docs/lag_safe_correlator.md, Phase 4).
+    # A per-session directory, same stamped-folder convention as diff
+    # capture below, but independent of it and of write_mode -- spilling is
+    # an internal RAM-management fallback for a lagging (not dead) partner,
+    # not a user-visible save feature. Nothing is created on disk here: the
+    # directory only actually appears if some channel ever spills
+    # (Channel.spill() creates it lazily), which a healthy run never does.
+    # ------------------------------------------------------------------
+
+    def _new_spill_session_dir(self) -> str:
+        stamp = time.strftime('%Y%m%d_%H%M%S')
+        suffix = self.suffix_var.get().strip() or 'g2multi'
+        return os.path.join('.', 'spad_data', 'spill', f'{suffix}_{stamp}')
+
+    # ------------------------------------------------------------------
     # Diff capture -- streams each derived pair's filtered time differences
     # to disk for the life of one accumulation session, consolidated into
     # the same .npz "Save .npz" already produces.
@@ -809,6 +825,8 @@ class MultiCorrelateWindow(tk.Toplevel):
         if not self._active or self._graph is None:
             return
         self._start_diff_capture()
+        self._spill_session_dir = self._new_spill_session_dir()
+        self._graph.set_spill_dir(self._spill_session_dir)
         self._offset = int(offset)
         self._graph.start(offset=int(offset))
         self._hist.clear()
@@ -1134,6 +1152,13 @@ class MultiCorrelateWindow(tk.Toplevel):
             'n_pairs': len(self._pairs) if self._pairs else 0,
             'peak_buffer_bytes': int(self._graph.peak_nbytes) if self._graph else 0,
             'peak_rss_bytes': _peak_rss_bytes(),
+            # docs/lag_safe_correlator.md, Phase 4: what a lagging partner
+            # actually cost on disk, the same way peak_buffer_bytes already
+            # answers it for RAM. spill_dir is the directory whether or not
+            # it was ever actually created (Channel.spill() makes it lazily),
+            # so a zero peak with a non-null dir just means nothing lagged.
+            'spill_dir': self._spill_session_dir,
+            'peak_spill_bytes': int(self._graph.peak_spill_nbytes) if self._graph else 0,
             'kernel_s_total': round(self._kernel_s_total, 4),
             'kernel_batches': int(self._kernel_batches),
             'kernel_s_per_batch': (round(self._kernel_s_total / self._kernel_batches, 5)
