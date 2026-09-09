@@ -151,9 +151,10 @@ correlation, live only on the master (where `ChannelGraph` runs), are never
 part of the saved `.npz`, and are deleted as soon as they're consumed or
 the channel is finally declared `dead`. Proposed location:
 `spad_data/spill/<session>/n{node}_px{pixel:03d}_{seq}.bin` — gitignored
-like the rest of `spad_data/`, one file per spilled segment (rotation, not
-one growing file, so "delete once consumed" is a file removal rather than a
-truncation-in-place).
+like the rest of `spad_data/`, one file per poll's worth of evicted data
+(`seq` incrementing per poll that spills for that channel, not one growing
+file), so "delete once consumed" is a plain file removal rather than a
+truncation-in-place (see the file-rotation decision under "Open questions").
 
 ## Non-goals
 
@@ -170,7 +171,20 @@ truncation-in-place).
    session data is the obvious candidate) rather than a guess.
 2. The final give-up threshold once a channel is spilling (see "Bounding
    disk usage" above).
-3. File rotation size / chunk boundaries for spill files.
+3. ~~File rotation size / chunk boundaries for spill files.~~ **Decided
+   (simplest starting point, revisit if benchmarking shows overhead): one
+   file per poll's worth of newly-evicted data per channel.** This matches
+   the plan's own "stays on the poll cadence, no per-timestamp bookkeeping"
+   principle, and makes "delete once consumed" a plain whole-file removal
+   rather than needing partial-file deletion. Tradeoff accepted for now: a
+   channel that lags for a long time accumulates one small file per poll
+   (dozens to hundreds over a multi-minute lag) rather than fewer, larger
+   ones — more filesystem overhead (opens/closes/directory entries) than a
+   size-capped multi-poll rotation would have, but a multi-poll file can't
+   be deleted until the lagging partner clears its *newest* poll, not just
+   its oldest, which delays reclaim. Start simple; move to size-capped
+   rotation only if Phase 4's live validation shows the per-poll file count
+   is actually a problem.
 4. How `ChannelGraph.status()` and the GUI should represent "spilling to
    disk, N MB, waiting on node X" as a distinct, non-alarming state,
    separate from today's `LOSING COINCIDENCES` red line — the whole point
