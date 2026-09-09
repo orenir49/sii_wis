@@ -225,6 +225,15 @@ the logbook's 7-9-26 entry for the correction.
   as far as "node2's own file-write pacing/I/O", per Stage 4 — the two
   bullets above (synthetic disk-write test, Defender exclusion parity) are
   the next real steps, not a correlator-side fix.
+  **Status, 9-9-26: marked undecided.** The remaining gap is inside
+  lSPAD's own closed-source write-pacing logic, which we have no tooling
+  to instrument further — diagnosing it past this point needs the vendor.
+  Workaround for now: keep each node's active pixel count below the point
+  where it diverges, not a fix for the mechanism itself. Longer-term
+  direction (a separate future plan, not designed yet): stage each node's
+  own timestamps in a temporary file and only release/delete them once the
+  other detector has caught up to the same point in time, instead of
+  forwarding each file as soon as it's parsed.
 - **Master-chip pixels show no bunching signal at any delay (9-9-26),
   marked undecidable for now — deferred to the end of this list.** Every
   tested slave-chip pixel (160/162/164/166/168) shows the expected ~14 ns
@@ -246,3 +255,10 @@ the logbook's 7-9-26 entry for the correction.
   hardware/optical, not this branch's software; if they *do* show a real
   peak under SB mode, the bug is isolated to the T-mode pipeline. For now,
   the main plan proceeds with slave-chip pixels only.
+  **Result, 9-9-26: ran the check.** Single master pixel (151 vs 151),
+  SB mode on `main`, ~1 Mcps for 2 hours: no bunching signal — same as
+  under T-mode. This rules out a T-mode-pipeline-specific bug as the sole
+  explanation but doesn't identify an alternative cause either; no obvious
+  suspect remains. **Marked undecided** — deferring further investigation
+  until the pulsed laser is back from repair and allows more thorough,
+  higher-SNR testing. Until then, work with slave-chip pixels only.
