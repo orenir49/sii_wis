@@ -114,28 +114,73 @@ no new timer and no per-timestamp check — a lagging channel costs one
 comparison per poll (has the index range been reached?) until it actually
 has enough data to act on.
 
-### Bounding disk usage — open question, not resolved by this doc
+### Bounding disk usage — resolved: a free-space safety net (10-9-26)
 
-"Delete once used" handles the common case, but a node that never recovers
-(exactly what node2's still-undecided write-pacing divergence looks like
-today) needs a hard stop somewhere, or spilled data accumulates forever.
-Candidates, to be settled once this is prototyped rather than guessed at
-here:
-
-1. A much longer wall-clock grace period specifically for the spilling
-   state (minutes, not `stall_grace_s`'s 30 s) after which a still-lagging
-   partner is finally treated as `dead` and the backlog is released lost —
-   turning "instant loss at 5 s of lag" into "correct correlation, delayed,
-   up to some generous ceiling."
-2. A hard byte cap on total spill per channel/run, past which the oldest
-   spilled data is discarded (reported the same way `lost_pairs` is today).
-3. Both, with (2) as the safety net under (1).
+**Decided, not a wall-clock grace period or a per-channel byte cap** (the
+three candidates this section used to list): `ReceiverGUI._check_disk_space`
+(`master.py`) checks `shutil.disk_usage` on the master's own drive every
+health-check tick (2 s) while a session is active, and soft-stops the whole
+acquisition once free space drops to `SPILL_FREE_SPACE_FLOOR_BYTES` (100 GB).
+Chosen over the two candidates because it scales with whatever headroom
+*this* machine actually has rather than a guessed constant, and it protects
+the disk as a whole, not just this feature's own directory — spill isn't the
+only thing that can fill a drive. Latched per run (reset in `_start_all`) so
+it fires the soft stop once, not on every tick while the drain that follows
+is itself still using disk space. Unit-verified against a mocked
+`shutil.disk_usage` (plenty of space / low space, session active / idle,
+exactly-at-floor and just-above-floor boundaries, and the once-per-run latch)
+since `master.py` has no non-GUI test harness to add this to.
 
 This plan does not fix node2's underlying I/O pacing (marked undecided,
 vendor-only, in `logbook.md`'s 9-9-26 entry) — it only stops that
 still-unexplained slowness from silently deleting otherwise-correlatable
 data while it works itself out or while the operator reduces pixel count to
 compensate.
+
+### Live validation (10-9-26)
+
+Re-ran mask_ten (10 slave pixels, locs 150-168 even, identity mode) live for
+~4-5 minutes at ~11 Mcps global, the same scenario that lost all 10 pairs'
+coincidences under the pre-fix code on 9-9-26. Result, from the saved
+`spad_data/lag_safe_test.npz`:
+
+- **No coincidences lost.** `exclusion_history` (meta `excluded`) contains
+  only the expected end-of-run cleanup — 10 entries, all `(node 1, pixel
+  {150..168}, "silent for 302 s")`, i.e. node1 going wall-clock-`dead` after
+  acquisition was stopped and fully drained. Zero entries citing detector-time
+  lag on node2, where the old code lost everything.
+- **Coincidences actually recovered.** All 10 pairs accumulated 121M-167M
+  counts; every pixel shows the expected ~14 ns bunching peak (0.9-1.7%
+  excess, SNR 2.0-3.2 — lower than long-integration runs, as expected for
+  ~4 minutes, but present on all 10, none flatlined).
+- **Disk footprint:** `peak_spill_bytes` = 13.70 GB peak, growing at
+  roughly **2.5-3 GB/min (~150-180 GB/hr)** while node2 stayed maximally
+  lagged. Spill fully drained back to 0 bytes after stop (the "delete once
+  consumed" reload path works end-to-end, no leaked files).
+- **RAM stayed bounded as designed:** `peak_buffer_bytes` (in-RAM channel
+  data) was only 1.72 GB total across all 10 channels, i.e. the existing
+  `DEFAULT_SPILL_TAIL_BYTES` placeholder (16 MB/channel, ~2M events) is
+  already doing its job — most of the backlog volume correctly went to disk,
+  not RAM. **No change made to it.**
+
+Caveats on these numbers, both raised 10-9-26:
+
+- **Rate/hardware-specific.** The ~150-180 GB/hr spill rate and "node2 never
+  recovers" behavior reflect *today's* ~10-11 Mcps/node global rate on
+  *today's* node2 hardware (the still-undecided write-pacing divergence in
+  `docs/tmode_rate_and_io_characterization.md`). A different pixel count,
+  count rate, or a node2 hardware/software fix would change this rate —
+  these are not universal constants, they're this setup's numbers today.
+- **Increasing the RAM tail cap would trade disk for RAM, not eliminate the
+  problem.** The master has ~34 GB total RAM (~22 GB free at idle) against a
+  3.8 GB peak process RSS during this run — plenty of headroom to raise
+  `DEFAULT_SPILL_TAIL_BYTES` well past 16 MB/channel. But since the total
+  backlog volume during a lag is fixed by lag-duration x rate, a larger RAM
+  cap only shifts a fixed number of bytes from disk to RAM (and reduces
+  spill-file churn, per the per-poll-file tradeoff in "Open questions" #3
+  below) — it doesn't change the ~150-180 GB/hr growth rate or remove the
+  need for the free-space floor above. Not changed for now; worth revisiting
+  only if per-poll file-count overhead itself becomes the bottleneck.
 
 ### Relationship to existing disk features
 
@@ -166,11 +211,17 @@ truncation-in-place (see the file-rotation decision under "Open questions").
 
 ## Open questions to settle before implementation
 
-1. Tail-window sizing: RAM bytes, wall-clock span, or both — needs
+1. ~~Tail-window sizing: RAM bytes, wall-clock span, or both — needs
    benchmarking against a real lagging-node capture (mask_ten's saved
-   session data is the obvious candidate) rather than a guess.
-2. The final give-up threshold once a channel is spilling (see "Bounding
-   disk usage" above).
+   session data is the obvious candidate) rather than a guess.~~ **Settled
+   10-9-26 by live validation:** the existing `DEFAULT_SPILL_TAIL_BYTES`
+   placeholder (16 MB/channel) held up fine — 1.72 GB peak in-RAM buffer
+   total across 10 channels against ~22 GB free RAM on the master. No change
+   made; see "Live validation" above.
+2. ~~The final give-up threshold once a channel is spilling (see "Bounding
+   disk usage" above).~~ **Settled 10-9-26:** a free-space floor
+   (`SPILL_FREE_SPACE_FLOOR_BYTES`, 100 GB), not a wall-clock or byte-count
+   give-up. See "Bounding disk usage" above.
 3. ~~File rotation size / chunk boundaries for spill files.~~ **Decided
    (simplest starting point, revisit if benchmarking shows overhead): one
    file per poll's worth of newly-evicted data per channel.** This matches
@@ -192,7 +243,11 @@ truncation-in-place (see the file-rotation decision under "Open questions").
    (...) — <reason>; X MB spilled to disk` line, checked ahead of the
    generic `waiting_on` report. The GUI itself (`correlate_multi.py`) isn't
    touched yet -- it doesn't call `status()` any differently than before,
-   this is just the string available to it once it does.
+   this is just the string available to it once it does. **Reconfirmed
+   10-9-26 live:** the mask_ten validation run spilled 13+ GB with no
+   "lagging" text ever appearing in the correlator's status line, exactly
+   because `status()` is still uncalled — this is a real, currently-open
+   gap, not just a theoretical one. Wiring it in is a small, separate follow-up.
 5. Test plan: extend `tests/test_channel_graph.py` with a synthetic case
    that reproduces `test_detector_time_lag_triggers_exclusion`'s scenario
    but keeps the lagging partner delivering indefinitely, and asserts the
@@ -245,7 +300,7 @@ truncation-in-place (see the file-rotation decision under "Open questions").
   currently stops `spill_nbytes` from growing without bound if a lagging
   partner never recovers and never dies.
 
-- **Phase 4, wiring done, live validation not yet run.**
+- **Phase 4, wiring done, live-validated 10-9-26 (see "Live validation" above).**
   `ChannelGraph.set_spill_dir()` lets a caller point every channel at a
   (new) directory after construction but before `start()` -- needed because
   `correlate_multi.py` builds the graph at Enable time, before a session's
@@ -261,9 +316,12 @@ truncation-in-place (see the file-rotation decision under "Open questions").
   saved `.npz` meta, so "what did this lag cost on disk" is answerable from
   a saved run the same way the RAM and RSS figures already are.
 
-  **Still needs real hardware, not done in this session:** rerun the
-  mask_ten scenario and confirm the previously-dropped pairs now show
-  coincidences, at an acceptable disk footprint (`peak_spill_bytes` in the
-  saved file); use that run to settle the still-open tail-window sizing
-  (question 1) and disk-usage
-  ceiling (question 2) with real numbers instead of the placeholder default.
+  **Done 10-9-26:** reran mask_ten live, confirmed all 10 previously-dropped
+  pairs now accumulate coincidences correctly with zero lagging-related
+  exclusions, and used the run's real numbers to settle questions 1 and 2
+  (tail-window sizing kept at the placeholder; disk ceiling implemented as a
+  free-space floor, `master.py`'s `_check_disk_space`). See "Live validation"
+  above for the full readout. Remaining known gap: `correlate_multi.py` still
+  never calls `ChannelGraph.status()` (question 4's GUI half), so the
+  "lagging (nothing lost)" line never actually appears on screen today even
+  though the underlying state and disk-spill accounting are correct.
