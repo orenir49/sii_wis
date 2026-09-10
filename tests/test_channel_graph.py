@@ -638,7 +638,13 @@ def test_channel_that_stops_mid_run():
 
 def test_detector_time_lag_triggers_exclusion():
     """The second trigger: a channel still delivering, but hopelessly behind in
-    detector time. Wall-clock silence would never catch this one."""
+    detector time. Wall-clock silence would never catch this one.
+
+    Since docs/lag_safe_correlator.md's Phase 3, this trigger no longer marks
+    the channel DEAD (`excluded`) -- only wall-clock silence does that. A
+    still-delivering-but-lagging channel is `lagging` instead, which
+    `_cut_for`/`_keep_for`/`_would_release` treat as a normal live partner
+    (see test_lagging_partner_recovers_without_loss for why that matters)."""
     clock = FakeClock()
     pl, g, clock, drv = build('grid', list1=[10], list2=[20, 21], clock=clock,
                               stall_grace_s=1e9, stall_tolerance_ps=2 * PS_PER_S)
@@ -647,10 +653,15 @@ def test_detector_time_lag_triggers_exclusion():
               (2, 20): np.array([base + 10 * PS_PER_S], dtype=np.int64),
               (2, 21): np.array([base], dtype=np.int64)}, dt=0.5)
     rel = drv.step(None, dt=0.5)
-    check('a channel 10 s behind in detector time is excluded despite delivering',
-          any(n == 2 and p == 21 for n, p, _ in rel.excluded)
+    check('a channel 10 s behind in detector time is LAGGING, not excluded (dead)',
+          any(n == 2 and p == 21 for n, p, _ in rel.lagging)
+          and not any(n == 2 and p == 21 for n, p, _ in rel.excluded)
+          and g.ch2[21].lagging and not g.ch2[21].excluded
           and 'behind in detector time' in g.ch2[21].exclude_reason,
-          f'{rel.excluded} / {g.ch2[21].exclude_reason!r}')
+          f'{rel.lagging} / {rel.excluded} / {g.ch2[21].exclude_reason!r}')
+    check('status reports it as lagging (nothing lost), not LOSING COINCIDENCES',
+          'lagging (nothing lost)' in g.status() and 'LOSING' not in g.status(),
+          g.status())
 
 
 # ---------------------------------------------------------------------------
@@ -745,6 +756,242 @@ def test_asymmetric_lag_does_not_starve_the_delivering_pairs():
 
 
 # ---------------------------------------------------------------------------
+# Lag-safe correlator (docs/lag_safe_correlator.md)
+# ---------------------------------------------------------------------------
+
+def _node_lag_case(stall_tolerance_ps, n_chunks=20, lag_chunks=8):
+    """Node 2 trails node 1 by a fixed number of chunks throughout the run --
+    unlike test_whole_node_lag_catches_up_bit_identical's hold-then-burst, it
+    never goes silent (something arrives almost every poll, well within any
+    wall-clock grace); its detector-time watermark just stays `lag_chunks`
+    chunks behind node 1's the whole way through. This is the shape of node
+    2's own real write-pacing divergence
+    (docs/tmode_rate_and_io_characterization.md, Stage 4 / mask_ten): steadily
+    still producing data, just too slowly to keep pace -- which is exactly
+    what a wall-clock-silence check cannot catch, and what
+    `stall_tolerance_ps` exists to catch instead.
+    """
+    rng = np.random.default_rng(44)
+    streams = {}
+    for p in (150, 151):
+        streams[(1, p)] = poisson_stream(rng, 1e6, 0.002)
+        streams[(2, p)] = poisson_stream(rng, 1e6, 0.002)
+
+    _, g0, _, d0 = build('identity', lo=150, hi=151)
+    for feed in _interleaved_feed(streams, n_chunks):
+        d0.step(feed)
+    d0.flush()
+
+    _, g1, c1, d1 = build('identity', lo=150, hi=151,
+                          stall_grace_s=1e9, stall_tolerance_ps=stall_tolerance_ps)
+    c1_chunks = {p: chunk(streams[(1, p)], n_chunks) for p in (150, 151)}
+    c2_chunks = {p: chunk(streams[(2, p)], n_chunks) for p in (150, 151)}
+    for i in range(n_chunks + lag_chunks):
+        feed = {}
+        if i < n_chunks:
+            for p in (150, 151):
+                feed[(1, p)] = c1_chunks[p][i]
+        j = i - lag_chunks
+        if 0 <= j < n_chunks:
+            for p in (150, 151):
+                feed[(2, p)] = c2_chunks[p][j]
+        d1.step(feed, dt=0.5)
+    d1.flush()
+    return g0, d0, g1, d1
+
+
+def test_lagging_partner_recovers_without_loss():
+    """Acceptance test for docs/lag_safe_correlator.md, satisfied as of
+    Phase 3. A partner that lags past stall_tolerance_ps but keeps delivering
+    must cost no coincidences once it catches up -- the same bit-identical
+    standard test_whole_node_lag_catches_up_bit_identical already holds a
+    dead-partner-free run to, but with the lag-exclusion trigger actually
+    engaged this time instead of set unreachably high.
+
+    Before Phase 3 this failed: the lag trigger marked the channel `excluded`
+    exactly like a dead one, so `_cut_for` force-released node 1's held-up
+    backlog against whatever sliver of node 2 had arrived so far, then
+    cleared it -- so node 2's later, matching data had nothing left to pair
+    with (the mask_ten failure in docs/tmode_rate_and_io_characterization.md).
+    Phase 3 stops treating `lagging` as `excluded`, so this now passes purely
+    from the existing in-RAM gating (test_whole_node_lag_catches_up_bit_identical's
+    same mechanism) -- no spill_dir is configured here, so this specific test
+    never touches disk. test_lagging_partner_spills_and_reloads below is the
+    companion that actually exercises the disk path."""
+    g0, d0, g1, d1 = _node_lag_case(stall_tolerance_ps=2e8)
+    same = all(sorted(d1.taus[p]) == sorted(d0.taus[p]) for p in g0.pairs)
+    check('a partner lagging past tolerance but still delivering loses nothing',
+          same and sum(len(v) for v in d0.taus.values()) > 500,
+          f'{[(p, len(d1.taus[p]), len(d0.taus[p])) for p in g0.pairs]}')
+
+
+def test_lagging_partner_spills_and_reloads():
+    """The disk half of Phase 3: with spill_dir configured and a small
+    spill_tail_bytes, node 1's backlog while node 2 lags must actually spill
+    to disk (not just grow RAM without bound), and reload+delete once node 2
+    catches up -- ending bit-identical to the undelayed baseline and with no
+    files left behind."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        rng = np.random.default_rng(45)
+        streams = {(1, 150): poisson_stream(rng, 1e6, 0.002),
+                   (2, 150): poisson_stream(rng, 1e6, 0.002)}
+        _, g0, _, d0 = build('identity', lo=150, hi=150)
+        for feed in _interleaved_feed(streams, 20):
+            d0.step(feed)
+        d0.flush()
+
+        pl = pair_map.derive('identity', lo=150, hi=150)
+        clock = FakeClock()
+        g1 = ChannelGraph(pl, TMAX, clock=clock, stall_grace_s=1e9,
+                          stall_tolerance_ps=2e8, spill_dir=d, spill_tail_bytes=2000)
+        g1.start()
+        drv = Driver(g1, clock)
+        n_chunks, lag_chunks = 20, 8
+        c1_chunks = chunk(streams[(1, 150)], n_chunks)
+        c2_chunks = chunk(streams[(2, 150)], n_chunks)
+        saw_spill_file = False
+        for i in range(n_chunks + lag_chunks):
+            feed = {}
+            if i < n_chunks:
+                feed[(1, 150)] = c1_chunks[i]
+            j = i - lag_chunks
+            if 0 <= j < n_chunks:
+                feed[(2, 150)] = c2_chunks[j]
+            drv.step(feed, dt=0.5)
+            if g1.ch1[150].spill_files:
+                saw_spill_file = True
+        drv.flush()
+
+        check('a small spill_tail_bytes actually forces a spill to disk',
+              saw_spill_file)
+        check('spilled data ends up bit-identical to the undelayed baseline',
+              sorted(drv.taus[(150, 150)]) == sorted(d0.taus[(150, 150)])
+              and sum(len(v) for v in d0.taus.values()) > 500,
+              f'{len(drv.taus[(150, 150)])} vs {len(d0.taus[(150, 150)])}')
+        check('every spill file was reloaded and deleted -- none left behind',
+              g1.ch1[150].spill_files == [] and os.listdir(d) == [],
+              f'{g1.ch1[150].spill_files} / {os.listdir(d)}')
+
+
+def test_lagging_partner_spills_and_reloads_symmetric():
+    """The mirror of test_lagging_partner_spills_and_reloads: node 1 lags,
+    node 2 backlogs. Node 2's *entire* arr is re-snapshotted every release()
+    cycle (unlike node 1's incremental cut), so this exercises a genuinely
+    different code path (release()'s reload-before-use check ahead of the
+    t2_now snapshot), not just _spill_overflow's mirrored loop -- must still
+    end bit-identical to the undelayed baseline with no files left behind."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        rng = np.random.default_rng(46)
+        streams = {(1, 150): poisson_stream(rng, 1e6, 0.002),
+                   (2, 150): poisson_stream(rng, 1e6, 0.002)}
+        _, g0, _, d0 = build('identity', lo=150, hi=150)
+        for feed in _interleaved_feed(streams, 20):
+            d0.step(feed)
+        d0.flush()
+
+        pl = pair_map.derive('identity', lo=150, hi=150)
+        clock = FakeClock()
+        g1 = ChannelGraph(pl, TMAX, clock=clock, stall_grace_s=1e9,
+                          stall_tolerance_ps=2e8, spill_dir=d, spill_tail_bytes=2000)
+        g1.start()
+        drv = Driver(g1, clock)
+        n_chunks, lag_chunks = 20, 8
+        c1_chunks = chunk(streams[(1, 150)], n_chunks)
+        c2_chunks = chunk(streams[(2, 150)], n_chunks)
+        saw_spill_file = False
+        for i in range(n_chunks + lag_chunks):
+            feed = {}
+            if i < n_chunks:
+                feed[(2, 150)] = c2_chunks[i]
+            j = i - lag_chunks
+            if 0 <= j < n_chunks:
+                feed[(1, 150)] = c1_chunks[j]
+            drv.step(feed, dt=0.5)
+            if g1.ch2[150].spill_files:
+                saw_spill_file = True
+        drv.flush()
+
+        check('a small spill_tail_bytes forces node 2 to spill when node 1 lags',
+              saw_spill_file)
+        check('symmetric spill ends bit-identical to the undelayed baseline',
+              sorted(drv.taus[(150, 150)]) == sorted(d0.taus[(150, 150)])
+              and sum(len(v) for v in d0.taus.values()) > 500,
+              f'{len(drv.taus[(150, 150)])} vs {len(d0.taus[(150, 150)])}')
+        check('every node-2 spill file was reloaded and deleted -- none left behind',
+              g1.ch2[150].spill_files == [] and os.listdir(d) == [],
+              f'{g1.ch2[150].spill_files} / {os.listdir(d)}')
+
+
+def test_lagging_partner_spills_and_reloads_symmetric_shared_channel():
+    """Sharpest case for the reload-before-use check: node-2 px160 is shared
+    by two node-1 partners (grid), only one of which (150) lags -- the other
+    (151) stays healthy and keeps releasing normally throughout. `_spill_overflow`'s
+    `any partner lagging` trigger means 160 spills because of 150 alone; the
+    healthy 151 pair must still see 160's *complete* history on every one of
+    its own regular releases, or those coincidences go silently missing.
+    Reload churns (every 151 release pulls 160 fully back, _spill_overflow
+    re-spills it next cycle since 150 is still lagging) -- correctness is
+    what's being pinned here, not I/O efficiency."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        rng = np.random.default_rng(46)
+        streams = {(1, 150): poisson_stream(rng, 1e6, 0.002),   # will lag
+                   (1, 151): poisson_stream(rng, 1e6, 0.002),   # stays healthy
+                   (2, 160): poisson_stream(rng, 1e6, 0.002)}   # shared partner
+        pl0 = pair_map.derive('grid', list1=[150, 151], list2=[160])
+        clock0 = FakeClock()
+        g0 = ChannelGraph(pl0, TMAX, clock=clock0)
+        g0.start()
+        d0 = Driver(g0, clock0)
+        for feed in _interleaved_feed(streams, 20):
+            d0.step(feed)
+        d0.flush()
+
+        pl = pair_map.derive('grid', list1=[150, 151], list2=[160])
+        clock = FakeClock()
+        g1 = ChannelGraph(pl, TMAX, clock=clock, stall_grace_s=1e9,
+                          stall_tolerance_ps=2e8, spill_dir=d, spill_tail_bytes=2000)
+        g1.start()
+        drv = Driver(g1, clock)
+        n_chunks, lag_chunks = 20, 8
+        c150 = chunk(streams[(1, 150)], n_chunks)
+        c151 = chunk(streams[(1, 151)], n_chunks)
+        c160 = chunk(streams[(2, 160)], n_chunks)
+        saw_spill_file = False
+        for i in range(n_chunks + lag_chunks):
+            feed = {}
+            if i < n_chunks:
+                feed[(1, 151)] = c151[i]
+                feed[(2, 160)] = c160[i]
+            j = i - lag_chunks
+            if 0 <= j < n_chunks:
+                feed[(1, 150)] = c150[j]
+            drv.step(feed, dt=0.5)
+            if g1.ch2[160].spill_files:
+                saw_spill_file = True
+        drv.flush()
+
+        check('shared channel 160 actually spills while 150 lags',
+              saw_spill_file)
+        check('the lagging pair (150x160) is bit-identical to the undelayed baseline',
+              sorted(drv.taus[(150, 160)]) == sorted(d0.taus[(150, 160)])
+              and len(d0.taus[(150, 160)]) > 500,
+              f'{len(drv.taus[(150, 160)])} vs {len(d0.taus[(150, 160)])}')
+        check('the healthy, regularly-releasing pair (151x160) loses nothing to the spill',
+              sorted(drv.taus[(151, 160)]) == sorted(d0.taus[(151, 160)])
+              and len(d0.taus[(151, 160)]) > 500,
+              f'{len(drv.taus[(151, 160)])} vs {len(d0.taus[(151, 160)])}')
+        check('every node-2 spill file was reloaded and deleted -- none left behind',
+              g1.ch2[160].spill_files == [] and os.listdir(d) == [],
+              f'{g1.ch2[160].spill_files} / {os.listdir(d)}')
+
+
+# ---------------------------------------------------------------------------
 # Mechanics
 # ---------------------------------------------------------------------------
 
@@ -781,6 +1028,26 @@ def test_offset_change_while_accumulating_is_refused():
         check('changing offset mid-session raises', False, 'no exception')
     except RuntimeError:
         check('changing offset mid-session raises', True)
+
+
+def test_set_spill_dir_propagates_and_is_refused_while_accumulating():
+    """docs/lag_safe_correlator.md, Phase 4: a caller (correlate_multi.py)
+    constructs the graph before a session's directory name is known, then
+    sets it just before each start() -- like set_offset, not mid-session."""
+    pl, g, clock, drv = build('identity', lo=150, hi=150)
+    g.stop()
+    g.set_spill_dir('/tmp/some/spill/dir')
+    check('set_spill_dir updates the graph itself',
+          g.spill_dir == '/tmp/some/spill/dir')
+    check('set_spill_dir propagates to every channel',
+          all(c.spill_dir == '/tmp/some/spill/dir' for c in g.channels))
+
+    g.start()
+    try:
+        g.set_spill_dir('/tmp/other')
+        check('changing spill_dir mid-session raises', False, 'no exception')
+    except RuntimeError:
+        check('changing spill_dir mid-session raises', True)
 
 
 def test_offset_matches_post_hoc_subtraction():

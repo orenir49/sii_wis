@@ -17,6 +17,7 @@ import csv
 import json
 import os
 import queue
+import shutil
 import socket
 import sys
 import threading
@@ -42,6 +43,13 @@ LAG_ALERT_S   = 2.0               # parser this far behind is worth reporting
 CAL_ARM_TIMEOUT_MS = 20_000       # give up waiting for a node's first chunk
 CAL_POLL_MS   = 250               # how often to check collected dwell span
 CAL_MAX_WAIT_S = 30.0             # backstop if a period never accumulates
+# Free-space safety net for the lag-safe correlator's disk spill
+# (docs/lag_safe_correlator.md, "Bounding disk usage"). A node stuck lagging
+# forever (node2's still-undecided write-pacing divergence, at worst observed
+# ~150-180 GB/hr under mask_ten's ~11 Mcps global) would otherwise spill until
+# the drive is full. Checked against free space, not a spill-size cap, so it
+# scales with whatever headroom this particular master actually has.
+SPILL_FREE_SPACE_FLOOR_BYTES = 100_000_000_000  # 100 GB
 
 
 def merge_hooks(*hook_maps) -> dict:
@@ -918,6 +926,7 @@ class ReceiverGUI:
         # would otherwise read as a transition and log "unlocked" on every start.
         self._write_locked_last = False
         self._run_id = 0
+        self._low_disk_stop_triggered = False   # latched per run; see _check_disk_space
         self._cal_waiting: set[int] = set()   # nodes whose first data chunk is still pending
         self._cal_run = -1                    # run_id that opened the current wait
         self._cal_armed_run = -1              # run_id whose cal window has been opened
@@ -1202,6 +1211,7 @@ class ReceiverGUI:
             return
 
         self._run_id += 1
+        self._low_disk_stop_triggered = False
         self._set_cal_status('')
         mode = self.write_mode_var.get()
         note = ''
@@ -1714,7 +1724,34 @@ class ReceiverGUI:
         self.node1.health_check()
         self.node2.health_check()
         self._refresh_write_mode_lock()
+        self._check_disk_space()
         self._schedule_health_check()
+
+    def _check_disk_space(self) -> None:
+        """Soft-stop a live acquisition before the lag-safe correlator's disk
+        spill (docs/lag_safe_correlator.md) can fill the drive.
+
+        Latched per run (`_low_disk_stop_triggered`, reset in `_start_all`) so
+        this fires the soft stop once, not on every 2 s health-check tick while
+        the drain that follows is itself still using disk space.
+        """
+        if self._low_disk_stop_triggered:
+            return
+        if not any(n.is_finishing() for n in (self.node1, self.node2)):
+            return
+        try:
+            free = shutil.disk_usage(os.path.abspath('.')).free
+        except OSError:
+            return
+        if free > SPILL_FREE_SPACE_FLOOR_BYTES:
+            return
+        self._low_disk_stop_triggered = True
+        self._enqueue_log(
+            f'⚠ Free disk space down to {free / 1e9:.1f} GB (floor '
+            f'{SPILL_FREE_SPACE_FLOOR_BYTES / 1e9:.0f} GB) — soft-stopping '
+            f'acquisition to protect the disk. Likely cause: a node lagging '
+            f'far enough behind to spill (see spad_data/spill/).\n')
+        self._end_run('soft')
 
     # ------------------------------------------------------------------
     # Window close

@@ -54,6 +54,7 @@ python tools\replay.py spad_data\captures\cap_node1.raw --outdir replay_out
 .venv\Scripts\python.exe run_log.py
 .venv\Scripts\python.exe tests\test_hook_fanout.py
 .venv\Scripts\python.exe tests\test_channel_graph.py
+.venv\Scripts\python.exe tests\test_channel_spill.py
 .venv\Scripts\python.exe tests\test_multi_window.py
 .venv\Scripts\python.exe tests\test_write_lock.py
 .venv\Scripts\python.exe tools\raw_dump.py --selftest
