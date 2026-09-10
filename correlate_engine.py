@@ -676,8 +676,26 @@ class ChannelGraph:
         # post-trim array instead drops almost every coincidence while still
         # producing a plausible-looking histogram. Slicing yields a view onto
         # the same buffer, so the snapshot costs nothing and stays valid.
+        #
+        # Symmetric spill (docs/lag_safe_correlator.md, "Bounding disk usage" /
+        # the node-1-lags follow-up): unlike c1 -- which only ever hands the
+        # kernel a freshly-cut, currently-in-RAM slice -- c2's FULL current
+        # arr is snapshotted here on every cycle, for every p2, regardless of
+        # which pair actually releases. A channel spilled by _spill_overflow
+        # (below) must therefore be back in RAM *before* this snapshot on any
+        # cycle where a partner is about to actually use it -- reloading only
+        # once it becomes safe to drop (mirroring c1's limit-based trigger)
+        # would be too late, since the snapshot is unconditional, not gated
+        # on the drop point. `batches` (just computed above) already says
+        # exactly which p1's are releasing nonzero data this cycle, so that
+        # is the trigger: reload everything for a p2 with any such partner,
+        # nothing otherwise. A no-op for the overwhelmingly common case of no
+        # spill_files.
         t2_now = {}
         for p2, c2 in self.ch2.items():
+            if c2.spill_files and any(
+                    batches[p1].size for p1 in self.partners2.get(p2, ()) if p1 in batches):
+                c2.reload_up_to(float('inf'))
             t2_now[p2] = c2.arr
             c2.arr = c2.arr[self._keep_for(p2, c2):]
 
@@ -716,18 +734,28 @@ class ChannelGraph:
                 c1.reload_up_to(limit)
 
     def _spill_overflow(self) -> None:
-        """Cap RAM for a node-1 channel genuinely blocked on a `lagging` (not
-        dead, not simply not-yet-arrived) partner, moving its oldest excess
-        past spill_tail_bytes to disk instead of letting it grow without
-        bound -- the disk-spill half of docs/lag_safe_correlator.md's Phase 3.
+        """Cap RAM for a channel genuinely blocked on a `lagging` (not dead,
+        not simply not-yet-arrived) partner, moving its oldest excess past
+        spill_tail_bytes to disk instead of letting it grow without bound --
+        the disk-spill half of docs/lag_safe_correlator.md's Phase 3, applied
+        symmetrically to both directions (node-2-lags-node-1-backlogs, the
+        originally observed mask_ten failure, and node-1-lags-node-2-backlogs,
+        the follow-up gap closed alongside GUI status wiring).
 
         Deliberately narrow: only fires for a channel whose backlog is both
         oversized AND blocked by a partner we know is still coming back
         (`lagging`), never for a healthy channel or one merely waiting out a
         partner's startup grace period, so a normal run never touches disk.
-        The disk-usage ceiling for a partner that lags forever without ever
-        recovering or dying is still open question 2 in that doc -- this
-        bounds RAM, not disk.
+        The `any partner lagging` trigger is safe for spilling either side --
+        `_cut_for`/`_keep_for` are both a `min` over partners, so one
+        permanently-lagging partner alone determines the limit regardless of
+        the others -- and correctness for c2's very different consumption
+        pattern (its whole `arr` is re-snapshotted every cycle, not released
+        incrementally like c1's) comes from `release()`'s reload-before-use
+        check just above, not from being choosy here about which partner
+        triggered the spill. The disk-usage ceiling for a partner that lags
+        forever without ever recovering or dying is handled at the run level
+        (`master.py`'s free-space floor), not per-channel here.
         """
         if self.spill_dir is None:
             return
@@ -742,6 +770,17 @@ class ChannelGraph:
             excess_events = (c1.nbytes - self.spill_tail_bytes) // 8
             if excess_events > 0:
                 c1.spill(excess_events)
+        for p2, c2 in self.ch2.items():
+            if c2.nbytes <= self.spill_tail_bytes:
+                continue
+            blocked_by_lagging = any(
+                self.ch1[p1].lagging for p1 in self.partners2.get(p2, ()) if p1 in self.ch1)
+            if not blocked_by_lagging:
+                continue
+            c2.merge()
+            excess_events = (c2.nbytes - self.spill_tail_bytes) // 8
+            if excess_events > 0:
+                c2.spill(excess_events)
         sb = self.spill_nbytes
         if sb > self.peak_spill_nbytes:
             self.peak_spill_nbytes = sb

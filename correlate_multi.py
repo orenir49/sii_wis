@@ -856,6 +856,15 @@ class MultiCorrelateWindow(tk.Toplevel):
         if self._correlating:
             return
         rel = g.release()
+        # Ahead of the "no batches this poll" return below: a lagging (or
+        # excluded, or idle) state is exactly when rel.batches is empty, so
+        # gating this on there being something to correlate would show the
+        # line least often when it matters most. Left alone while the
+        # zero-count CRITICAL alarm (_poll_results) owns the line -- that is
+        # a more specific, actionable warning and must not flicker back to
+        # "ok"/"lagging" every POLL_MS while it's still live.
+        if not self._zero_count_warning:
+            self._set_status(g.status())
         if not rel.batches:
             return
 

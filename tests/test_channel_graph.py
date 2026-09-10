@@ -875,6 +875,122 @@ def test_lagging_partner_spills_and_reloads():
               f'{g1.ch1[150].spill_files} / {os.listdir(d)}')
 
 
+def test_lagging_partner_spills_and_reloads_symmetric():
+    """The mirror of test_lagging_partner_spills_and_reloads: node 1 lags,
+    node 2 backlogs. Node 2's *entire* arr is re-snapshotted every release()
+    cycle (unlike node 1's incremental cut), so this exercises a genuinely
+    different code path (release()'s reload-before-use check ahead of the
+    t2_now snapshot), not just _spill_overflow's mirrored loop -- must still
+    end bit-identical to the undelayed baseline with no files left behind."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        rng = np.random.default_rng(46)
+        streams = {(1, 150): poisson_stream(rng, 1e6, 0.002),
+                   (2, 150): poisson_stream(rng, 1e6, 0.002)}
+        _, g0, _, d0 = build('identity', lo=150, hi=150)
+        for feed in _interleaved_feed(streams, 20):
+            d0.step(feed)
+        d0.flush()
+
+        pl = pair_map.derive('identity', lo=150, hi=150)
+        clock = FakeClock()
+        g1 = ChannelGraph(pl, TMAX, clock=clock, stall_grace_s=1e9,
+                          stall_tolerance_ps=2e8, spill_dir=d, spill_tail_bytes=2000)
+        g1.start()
+        drv = Driver(g1, clock)
+        n_chunks, lag_chunks = 20, 8
+        c1_chunks = chunk(streams[(1, 150)], n_chunks)
+        c2_chunks = chunk(streams[(2, 150)], n_chunks)
+        saw_spill_file = False
+        for i in range(n_chunks + lag_chunks):
+            feed = {}
+            if i < n_chunks:
+                feed[(2, 150)] = c2_chunks[i]
+            j = i - lag_chunks
+            if 0 <= j < n_chunks:
+                feed[(1, 150)] = c1_chunks[j]
+            drv.step(feed, dt=0.5)
+            if g1.ch2[150].spill_files:
+                saw_spill_file = True
+        drv.flush()
+
+        check('a small spill_tail_bytes forces node 2 to spill when node 1 lags',
+              saw_spill_file)
+        check('symmetric spill ends bit-identical to the undelayed baseline',
+              sorted(drv.taus[(150, 150)]) == sorted(d0.taus[(150, 150)])
+              and sum(len(v) for v in d0.taus.values()) > 500,
+              f'{len(drv.taus[(150, 150)])} vs {len(d0.taus[(150, 150)])}')
+        check('every node-2 spill file was reloaded and deleted -- none left behind',
+              g1.ch2[150].spill_files == [] and os.listdir(d) == [],
+              f'{g1.ch2[150].spill_files} / {os.listdir(d)}')
+
+
+def test_lagging_partner_spills_and_reloads_symmetric_shared_channel():
+    """Sharpest case for the reload-before-use check: node-2 px160 is shared
+    by two node-1 partners (grid), only one of which (150) lags -- the other
+    (151) stays healthy and keeps releasing normally throughout. `_spill_overflow`'s
+    `any partner lagging` trigger means 160 spills because of 150 alone; the
+    healthy 151 pair must still see 160's *complete* history on every one of
+    its own regular releases, or those coincidences go silently missing.
+    Reload churns (every 151 release pulls 160 fully back, _spill_overflow
+    re-spills it next cycle since 150 is still lagging) -- correctness is
+    what's being pinned here, not I/O efficiency."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        rng = np.random.default_rng(46)
+        streams = {(1, 150): poisson_stream(rng, 1e6, 0.002),   # will lag
+                   (1, 151): poisson_stream(rng, 1e6, 0.002),   # stays healthy
+                   (2, 160): poisson_stream(rng, 1e6, 0.002)}   # shared partner
+        pl0 = pair_map.derive('grid', list1=[150, 151], list2=[160])
+        clock0 = FakeClock()
+        g0 = ChannelGraph(pl0, TMAX, clock=clock0)
+        g0.start()
+        d0 = Driver(g0, clock0)
+        for feed in _interleaved_feed(streams, 20):
+            d0.step(feed)
+        d0.flush()
+
+        pl = pair_map.derive('grid', list1=[150, 151], list2=[160])
+        clock = FakeClock()
+        g1 = ChannelGraph(pl, TMAX, clock=clock, stall_grace_s=1e9,
+                          stall_tolerance_ps=2e8, spill_dir=d, spill_tail_bytes=2000)
+        g1.start()
+        drv = Driver(g1, clock)
+        n_chunks, lag_chunks = 20, 8
+        c150 = chunk(streams[(1, 150)], n_chunks)
+        c151 = chunk(streams[(1, 151)], n_chunks)
+        c160 = chunk(streams[(2, 160)], n_chunks)
+        saw_spill_file = False
+        for i in range(n_chunks + lag_chunks):
+            feed = {}
+            if i < n_chunks:
+                feed[(1, 151)] = c151[i]
+                feed[(2, 160)] = c160[i]
+            j = i - lag_chunks
+            if 0 <= j < n_chunks:
+                feed[(1, 150)] = c150[j]
+            drv.step(feed, dt=0.5)
+            if g1.ch2[160].spill_files:
+                saw_spill_file = True
+        drv.flush()
+
+        check('shared channel 160 actually spills while 150 lags',
+              saw_spill_file)
+        check('the lagging pair (150x160) is bit-identical to the undelayed baseline',
+              sorted(drv.taus[(150, 160)]) == sorted(d0.taus[(150, 160)])
+              and len(d0.taus[(150, 160)]) > 500,
+              f'{len(drv.taus[(150, 160)])} vs {len(d0.taus[(150, 160)])}')
+        check('the healthy, regularly-releasing pair (151x160) loses nothing to the spill',
+              sorted(drv.taus[(151, 160)]) == sorted(d0.taus[(151, 160)])
+              and len(d0.taus[(151, 160)]) > 500,
+              f'{len(drv.taus[(151, 160)])} vs {len(d0.taus[(151, 160)])}')
+        check('every node-2 spill file was reloaded and deleted -- none left behind',
+              g1.ch2[160].spill_files == [] and os.listdir(d) == [],
+              f'{g1.ch2[160].spill_files} / {os.listdir(d)}')
+
+
 # ---------------------------------------------------------------------------
 # Mechanics
 # ---------------------------------------------------------------------------

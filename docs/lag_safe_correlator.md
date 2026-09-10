@@ -241,13 +241,14 @@ truncation-in-place (see the file-rotation decision under "Open questions").
    separate from today's `LOSING COINCIDENCES` red line.~~ **Done (Phase
    3):** `status()` now has a `lagging (nothing lost): N channel(s) behind
    (...) — <reason>; X MB spilled to disk` line, checked ahead of the
-   generic `waiting_on` report. The GUI itself (`correlate_multi.py`) isn't
-   touched yet -- it doesn't call `status()` any differently than before,
-   this is just the string available to it once it does. **Reconfirmed
-   10-9-26 live:** the mask_ten validation run spilled 13+ GB with no
-   "lagging" text ever appearing in the correlator's status line, exactly
-   because `status()` is still uncalled — this is a real, currently-open
-   gap, not just a theoretical one. Wiring it in is a small, separate follow-up.
+   generic `waiting_on` report. **GUI half done 10-9-26:** `correlate_multi.py`'s
+   `_tick` now calls `g.status()` and shows it via `_set_status` every poll a
+   release runs, placed ahead of the "no batches this poll" early-return so
+   `lagging`/`idle`/`waiting` states show even when nothing was released this
+   cycle (exactly when they matter most). Left alone while `_poll_results`'s
+   zero-count CRITICAL alarm is live — that is a more specific, actionable
+   warning and must not flicker back to "ok" every `POLL_MS` while it's
+   still active. Verified against `tests/test_multi_window.py` (78 checks).
 5. Test plan: extend `tests/test_channel_graph.py` with a synthetic case
    that reproduces `test_detector_time_lag_triggers_exclusion`'s scenario
    but keeps the lagging partner delivering indefinitely, and asserts the
@@ -277,21 +278,40 @@ truncation-in-place (see the file-rotation decision under "Open questions").
   `lagging (nothing lost)` line, distinct from `LOSING COINCIDENCES`
   (resolves open question 4 with a first-pass wording).
 
-  The disk-spill half is wired in for the documented real-world direction
-  only: a node-1 channel (`ch1`) blocked on a `lagging` node-2 partner spills
+  The disk-spill half is wired in for the documented real-world direction:
+  a node-1 channel (`ch1`) blocked on a `lagging` node-2 partner spills
   its oldest excess past a new `spill_tail_bytes` cap (`_spill_overflow`,
   called at the end of `release()`) and reloads it before the next cut that
   can use it (`_reload_ready_spills`, called at the start), verified
   end-to-end by `test_lagging_partner_spills_and_reloads` (real files
   written, read back, and deleted, final result bit-identical to an
-  undelayed baseline). **Known gap, not yet handled:** the symmetric case --
-  node 1 lagging, node-2 channels (`ch2`) backlogging while `_keep_for` holds
-  old data for a still-`lagging`-not-`dead` node-1 partner -- gets the same
-  correctness fix (it was never excluded from `_keep_for`'s limits either)
-  but no disk-spill RAM-bounding yet; `ch2`'s RAM can still grow unboundedly
-  in that direction. Left as a follow-up since it isn't the observed
-  real-world failure (mask_ten is node-2-lags-node-1-backlogs), not because
-  it's architecturally hard.
+  undelayed baseline).
+
+  **Symmetric case done 10-9-26:** node 1 lagging, node-2 channels (`ch2`)
+  backlogging while `_keep_for` holds old data for a still-`lagging`-not-`dead`
+  node-1 partner, now gets the same RAM-bounding as `ch1` -- `_spill_overflow`
+  applies the identical `any partner lagging` trigger to `ch2`. This needed
+  more than copy-pasting the `ch1` loop: `ch1`'s spilled data is only ever
+  consumed incrementally, by its own `_cut_for` slicing off a prefix once
+  `_reload_ready_spills` has proactively brought it back -- but `ch2`'s
+  *entire* `arr` is re-snapshotted wholesale on every `release()` cycle
+  (`t2_now[p2] = c2.arr`), for every `p2`, regardless of which pair actually
+  releases that cycle. Reloading `ch2` on the same proactive,
+  limit-based schedule as `ch1` would be too late for that snapshot. The fix
+  instead reloads a spilled `ch2` channel's *entire* backlog right before its
+  snapshot is taken, but only on a cycle where `batches` (just computed a few
+  lines above, for exactly this purpose) shows one of its partners is
+  actually releasing nonzero data -- the one piece of information that says
+  "this snapshot is about to be used." A no-op for the overwhelmingly common
+  case of no spill files. Verified two ways, both against an undelayed,
+  bit-identical baseline: `test_lagging_partner_spills_and_reloads_symmetric`
+  (the direct mirror of the `ch1` test) and, sharper,
+  `test_lagging_partner_spills_and_reloads_symmetric_shared_channel` (a
+  node-2 channel shared by two node-1 partners, only one of which lags --
+  the healthy partner keeps releasing normally throughout and must not lose
+  anything to the other partner's spill/reload churn). Also stress-tested
+  ad hoc across 20 seeds x 4 lag magnitudes (diagonal) and 15 seeds (shared)
+  with zero failures before either test was written into the suite.
 
   `spill_tail_bytes` ships with a placeholder default
   (`DEFAULT_SPILL_TAIL_BYTES = 16_000_000`, ~2M events/channel) -- open
@@ -321,7 +341,11 @@ truncation-in-place (see the file-rotation decision under "Open questions").
   exclusions, and used the run's real numbers to settle questions 1 and 2
   (tail-window sizing kept at the placeholder; disk ceiling implemented as a
   free-space floor, `master.py`'s `_check_disk_space`). See "Live validation"
-  above for the full readout. Remaining known gap: `correlate_multi.py` still
-  never calls `ChannelGraph.status()` (question 4's GUI half), so the
-  "lagging (nothing lost)" line never actually appears on screen today even
-  though the underlying state and disk-spill accounting are correct.
+  above for the full readout. Both remaining known gaps from this phase are
+  now closed (same day): `correlate_multi.py` calls `ChannelGraph.status()`
+  (question 4's GUI half, above) and the symmetric node-1-lags direction has
+  the same disk-spill RAM-bounding as the documented real-world direction
+  (above). This plan has no open implementation items left; only the
+  external, undecided root causes (node2's I/O pacing, master-chip
+  no-bunching) remain, and both are out of this plan's scope by design (see
+  "Non-goals").
