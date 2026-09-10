@@ -262,13 +262,29 @@ class Channel:
         self.arr = self.arr[cut:]
         return int(piece.size)
 
-    def reload_up_to(self, ts_limit: int) -> int:
-        """Merge back and delete every spill file entirely at or before
-        `ts_limit`, oldest first.
+    def reload_up_to(self, ts_limit: int, max_bytes: int | None = None) -> int:
+        """Merge back and delete spill files entirely at or before `ts_limit`,
+        oldest first, stopping early once `max_bytes` worth have been taken
+        (default None: take every qualifying file in one call).
 
         Chronological order (see spill_files' own invariant) means this only
         ever pops a prefix: once one file's max_ts clears the limit, every
         file spilled before it does too, so a single forward scan suffices.
+
+        `max_bytes` exists for the one caller that would otherwise reload an
+        unbounded amount in one shot: `_reload_ready_spills`'s all-dead branch
+        passes `ts_limit=inf`, which (uncapped) matches *every* spill file
+        regardless of how many GB accumulated while the partner was merely
+        `lagging` -- concatenating all of it into one array is exactly the
+        `MemoryError: Allocation failed` seen live 10-9-26 once node2's crash
+        turned a large, correctly-bounded-on-disk backlog into one huge
+        reload. Capped, the caller drains it over as many `release()` cycles
+        as it takes instead. Always takes at least one file even if it alone
+        exceeds `max_bytes`, so a single oversized file cannot stall progress
+        forever. The normal (non-dead, `ts_limit` = the partner's advancing
+        cut point) call site is already naturally bounded -- one poll's worth
+        of newly-safe-to-correlate data -- so it never needed this and keeps
+        calling with `max_bytes=None`.
 
         NOT necessarily a prepend to `arr`. A single reload_up_to call that
         clears every spill file at once could safely prepend, since they are
@@ -288,8 +304,13 @@ class Channel:
         reloaded, 0 if nothing qualified yet.
         """
         ready = []
+        taken_bytes = 0
         while self.spill_files and self.spill_files[0].max_ts <= ts_limit:
-            ready.append(self.spill_files.pop(0))
+            if ready and max_bytes is not None and taken_bytes >= max_bytes:
+                break
+            sf = self.spill_files.pop(0)
+            ready.append(sf)
+            taken_bytes += sf.n * 8
         if not ready:
             return 0
         combined = np.concatenate([np.fromfile(sf.path, dtype=np.int64) for sf in ready])
@@ -298,6 +319,21 @@ class Channel:
         for sf in ready:
             os.remove(sf.path)
         return sum(sf.n for sf in ready)
+
+    def discard_spill(self) -> None:
+        """Delete every spill file without reloading it -- for data already
+        known to be unrecoverable (every partner needing it is DEAD, mirroring
+        `_keep_for`'s own "not limits: drop everything" branch for `arr`,
+        which that branch never reaches since it doesn't know about disk).
+        Reloading first would risk the identical unbounded-allocation failure
+        `reload_up_to`'s `max_bytes` fixes, for bytes about to be thrown away
+        regardless -- so this never touches `arr` at all."""
+        for sf in self.spill_files:
+            try:
+                os.remove(sf.path)
+            except OSError:
+                pass
+        self.spill_files = []
 
     @property
     def spill_nbytes(self) -> int:
@@ -691,11 +727,24 @@ class ChannelGraph:
         # is the trigger: reload everything for a p2 with any such partner,
         # nothing otherwise. A no-op for the overwhelmingly common case of no
         # spill_files.
+        # `all_partners_dead` is checked BEFORE the reload-for-use trigger,
+        # not after: a c1 partner that is DEAD (not merely lagging) still
+        # produces nonzero `batches[p1]` every cycle while its own chunked
+        # drain runs (see _cut_for), which would otherwise satisfy the
+        # reload-for-use condition below and pull this channel's entire
+        # spilled backlog into RAM in one shot -- for data _keep_for is about
+        # to say is unneeded regardless. Same fix, other side: discard
+        # instead of reload when nothing will ever use it again.
         t2_now = {}
         for p2, c2 in self.ch2.items():
-            if c2.spill_files and any(
-                    batches[p1].size for p1 in self.partners2.get(p2, ()) if p1 in batches):
-                c2.reload_up_to(float('inf'))
+            if c2.spill_files:
+                partners = self.partners2.get(p2, ())
+                all_dead = bool(partners) and all(
+                    p1 not in self.ch1 or self.ch1[p1].excluded for p1 in partners)
+                if all_dead:
+                    c2.discard_spill()
+                elif any(batches[p1].size for p1 in partners if p1 in batches):
+                    c2.reload_up_to(float('inf'))
             t2_now[p2] = c2.arr
             c2.arr = c2.arr[self._keep_for(p2, c2):]
 
@@ -729,7 +778,14 @@ class ChannelGraph:
                 continue
             limit, all_dead = self._cut_limit_for(p1)
             if all_dead:
-                c1.reload_up_to(float('inf'))
+                # Capped (docs/lag_safe_correlator.md, "RAM failure, 10-9-26"):
+                # an uncapped reload here concatenates every GB this channel
+                # ever spilled into one array the instant its partner dies --
+                # exactly the failure that crashed the master's correlator
+                # live. _cut_for's own all-dead branch caps the matching
+                # release to the same chunk, so this drains over as many
+                # release() cycles as it takes instead of one.
+                c1.reload_up_to(float('inf'), max_bytes=self.spill_tail_bytes)
             elif limit is not None:
                 c1.reload_up_to(limit)
 
@@ -826,7 +882,21 @@ class ChannelGraph:
             # says so rather than letting it look like physics. (A `lagging`
             # partner does NOT reach here -- _cut_limit_for treats it as a
             # normal live partner, so this stays gated instead, per Phase 3.)
-            return int(c1.arr.size), True
+            #
+            # Capped, not the whole array at once (docs/lag_safe_correlator.md,
+            # "RAM failure, 10-9-26"): a channel that spilled tens of GB while
+            # its partner was merely `lagging` would otherwise hand the kernel
+            # one single, unbounded batch the instant that partner finally
+            # dies -- observed live as the master correlator's
+            # `MemoryError: Allocation failed` freeze. `_would_release` keeps
+            # returning True every poll while `not limits` holds (every
+            # partner excluded), so capping here just spreads the same total,
+            # already-reloaded-in-matching-chunks-by-_reload_ready_spills
+            # release across as many cycles as it takes, reported lost on
+            # each one rather than once -- `rel.lost_pairs` has no other
+            # consumer that would care about the difference.
+            chunk_events = max(1, self.spill_tail_bytes // 8)
+            return min(int(c1.arr.size), chunk_events), True
         if limit is None:
             return 0, False
         return int(np.searchsorted(c1.arr, limit, side='right')), False

@@ -991,6 +991,73 @@ def test_lagging_partner_spills_and_reloads_symmetric_shared_channel():
               f'{g1.ch2[160].spill_files} / {os.listdir(d)}')
 
 
+def test_dead_partner_drains_spilled_backlog_in_chunks():
+    """10-9-26 live incident: node2's crash turned a large, correctly-spilled
+    node1 backlog into node2 going fully DEAD (not merely lagging), and the
+    "every partner is dead, stop waiting" cleanup path tried to
+    reload+release it all in one unbounded shot -- `MemoryError: Allocation
+    failed` in the master's live correlator. Reproduced at test scale: node1
+    delivers its full stream in real time; node2 delivers only a prefix, then
+    goes silent for good (as node2's lSPAD.exe actually did). Node1's backlog
+    must spill while node2 is merely `lagging`, then drain in chunks bounded
+    by spill_tail_bytes -- not one poll -- once node2 crosses into `dead`,
+    ending bit-identical to a golden brute-force over exactly what node2
+    really delivered, with nothing left on disk."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as d:
+        rng = np.random.default_rng(47)
+        n1_total = poisson_stream(rng, 2e6, 0.01)
+        n2_total = poisson_stream(rng, 2e6, 0.01)
+        n_chunks = 20
+        n2_deliver_chunks = 6   # node2 only ever delivers the first 30%
+        c1_chunks = chunk(n1_total, n_chunks)
+        c2_chunks = chunk(n2_total, n_chunks)
+        n2_delivered = np.concatenate(c2_chunks[:n2_deliver_chunks])
+        want = brute_taus(n1_total, n2_delivered)
+
+        pl = pair_map.derive('identity', lo=150, hi=150)
+        clock = FakeClock()
+        g = ChannelGraph(pl, TMAX, clock=clock, stall_grace_s=5.0,
+                         stall_tolerance_ps=2e8, spill_dir=d, spill_tail_bytes=4000)
+        g.start()
+        drv = Driver(g, clock)
+        c1 = g.ch1[150]
+
+        for i in range(n_chunks):
+            feed = {(1, 150): c1_chunks[i]}
+            if i < n2_deliver_chunks:
+                feed[(2, 150)] = c2_chunks[i]
+            drv.step(feed, dt=0.5)
+
+        spilled_before_death = len(c1.spill_files)
+
+        # node2 is gone for good; node1 keeps delivering (it's healthy, like
+        # the real node1 during node2's crash) so the whole-array stream_idle
+        # gate never fires and masks the dead exclusion. A far-future
+        # sentinel, like Driver.flush()'s own trick, advances node1's
+        # watermark without adding real coincidences.
+        poll_count = 0
+        while c1.spill_files or c1.arr.size or c1.pending:
+            top = int(c1.last_ts or 0) + FAR
+            drv.step({(1, 150): np.array([top], dtype=np.int64)}, dt=1.0)
+            poll_count += 1
+            if poll_count > 100:
+                break
+
+        check('node1 actually spilled while node2 was still merely lagging',
+              spilled_before_death > 0, str(spilled_before_death))
+        check('the dead backlog drained over MULTIPLE release() cycles, not one',
+              poll_count > 5, f'{poll_count} polls')
+        got = sorted(t for t in drv.taus[(150, 150)] if abs(t) < FAR // 2)
+        check('drained result is bit-identical to the golden brute force',
+              got == want and len(want) > 500,
+              f'{len(got)} vs {len(want)} coincidences')
+        check('every spill file was drained and deleted -- none left behind',
+              c1.spill_files == [] and os.listdir(d) == [],
+              f'{c1.spill_files} / {os.listdir(d)}')
+
+
 # ---------------------------------------------------------------------------
 # Mechanics
 # ---------------------------------------------------------------------------

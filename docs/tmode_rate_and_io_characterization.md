@@ -234,6 +234,66 @@ the logbook's 7-9-26 entry for the correction.
   own timestamps in a temporary file and only release/delete them once the
   other detector has caught up to the same point in time, instead of
   forwarding each file as soon as it's parsed.
+
+  **Escalation, 10-9-26: this is much worse than "diverges" — it's
+  unbounded, and it crashed both `node_backend.py` and the master's live
+  correlator.** A `mask_twenty.txt` run (20 slave pixels) crashed both
+  nodes with `MemoryError: Allocation failed (probably too large)` inside
+  `tmode_kernel.reconstruct_epochs`/`counting_sort_bucket`, after node1 had
+  sent 40.6 GB and node2 14.6 GB this session (`spad_data/log/2026-09-10_100422.log`).
+  Initial hypothesis — long-running numpy alloc/free fragmentation in the
+  Python parser — was **wrong** and corrected the same day: a re-run with
+  `mask_ten.txt` (half the pixels) watched live in Task Manager showed
+  node2's climb was almost entirely **`lSPAD.exe` itself**, not
+  `pythonw.exe`. Quantified with an ad hoc SSH poll of both nodes every 15 s
+  (`spad_data/python_mem_watch_20260910.csv`, plotted in
+  `figs/10-9-26/node2_ram_blowup_10-9-26.png`,
+  `tools/plot_node2_ram_blowup.py`):
+
+  - node2's `lSPAD.exe` working set grew **from near 0 to ~27 GB in under
+    3 minutes** (roughly linear with wall-clock time, not obviously tied to
+    pixel count or data volume — `mask_ten` at half of `mask_twenty`'s
+    pixels hit the same wall just as fast), forcing Windows to page
+    heavily once free RAM hit near-zero, then crashed and was killed by the
+    OS. This happened **twice** in one ~17-minute window before node2's
+    `lSPAD.exe` died for good and did not restart.
+  - node1's `lSPAD.exe`, running the identical T-mode acquisition
+    throughout, stayed flat at 30-50 MB the whole time; node1's own free
+    RAM never moved off ~27 GB. Confirms this is node2-specific, not a
+    generic T-mode/lSPAD behavior — consistent with (and now a severe
+    escalation of) the existing node1-vs-node2 asymmetry above, but this is
+    the first time it's been observed running the machine out of physical
+    RAM rather than just "somewhat higher footprint" (7.6 GB peak on a 30 s
+    test, Stage 4/9-9-26).
+  - **A previously-unrecognized correctness gap in `correlate_engine.py`
+    surfaced as a direct consequence**: once node2's crash made its channel
+    transition from `lagging` to fully `dead` (`stall_grace_s` = 30 s of
+    true silence), the master's live correlator froze with
+    `Poll error: Unable to allocate 5 GiB for an array with shape ... int64`.
+    Root cause: the "every partner is dead, stop waiting and report the
+    loss" cleanup path (`_reload_ready_spills`'s `all_dead` branch and
+    `_cut_for`'s matching release) reloaded/released a spilled channel's
+    **entire** accumulated backlog in one unbounded `np.concatenate` /
+    kernel batch, rather than the normal incrementally-gated release —
+    correct data-loss reporting, but with no size cap of its own. **Fixed
+    same day**: both paths now drain in chunks bounded by
+    `spill_tail_bytes` across as many `release()` cycles as it takes
+    (`Channel.reload_up_to`'s new `max_bytes`, `_cut_for`'s capped
+    `all_dead` cut), verified bit-identical to an undelayed baseline and
+    multi-poll (not one-shot) via a new
+    `test_lagging_partner_spills_and_reloads`-style acceptance test. The
+    symmetric direction (a `ch2` channel's own spill files, orphaned once
+    *its* partners all die) is discarded outright via a new
+    `Channel.discard_spill()` rather than reloaded, since that data is
+    already known to be unrecoverable — this half is written but not yet
+    fully wired (a `_would_release()` short-circuit can skip the cleanup
+    when the dead side has nothing left of its own to release; tracked as a
+    follow-up, not the crash that actually occurred today).
+  - **Still undecided**: why `lSPAD.exe`'s own memory grows this way at
+    all. No new tooling reaches inside it past today's live observation;
+    the vendor question from 9-9-26 stands, now with much higher urgency
+    given it can render a node's PC unresponsive within minutes, not just
+    "diverge."
 - **Master-chip pixels show no bunching signal at any delay (9-9-26),
   marked undecidable for now — deferred to the end of this list.** Every
   tested slave-chip pixel (160/162/164/166/168) shows the expected ~14 ns
