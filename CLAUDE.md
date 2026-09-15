@@ -40,6 +40,14 @@ python tools\pair_map.py --selftest
 # does NOT apply it -- that's still Launch or the mask-refresh button in master.py)
 python tools\push_mask.py .claude\masks\mask_two.txt [--node 1|2]
 
+# Push a local pixel_offsets_ps.txt to both nodes' lSPAD directories (upload +
+# readback-verify; validates 320 integer lines before pushing). No apply step --
+# node_backend.py reads the file fresh at the start of every acquisition.
+python tools\push_offsets.py pixel_offsets_ps.txt [--node 1|2]
+
+# Generate pixel_offsets_ps.txt from a single-detector pulsed-laser run
+python .claude\skills\temporal-align\align_time.py --base spad_data\<session>
+
 # Raw lSPAD capture (Stage 2 Phase 0) -- off by default
 # Set on the MASTER before launching master.py; forwarded to each node as
 # <that node repo>\<value>_node{1,2}. Relative is preferred: the two nodes have
@@ -132,6 +140,8 @@ Pixel mapping: `PIXMAP` in `node_backend.py` maps lSPAD pixel indices to output 
 Each SPAD's own TDC has a small, internal, uncalibrated per-pixel timing skew — distinct from the cross-node master/slave dwell offset the correlator already applies (that's between the two detectors; this is *within* one). `node_backend.load_pixel_offsets_ps()` reads `pixel_offsets_ps.txt` from lSPAD's own install directory (found locally via `find_lspad_dir_local()` — the same search `ssh_launcher.find_lspad_dir()` does over SSH for the master's own use, just without SSH since this runs on the node already): one integer (ps) per line, 320 lines, line *N* = the offset for physical location *N* — same units as the mask file's own pixel entries (`M,` in `LSPAD_CLI.md`), not lSPAD's internal pixel ids. Loaded once per acquisition (`run()`'s preamble), not per file, so an edit mid-session can't silently change what an in-progress run is applying.
 
 Applied once per T-mode `.txt` file, per individual pixel, in `_reassemble_tmode_file()` — added to that pixel's own bucketed timestamp slice right before it's queued for the master, via `_offset_pixel_slice()`. Sync markers (dwell/line/frame) are never offset, only real pixels. A missing directory, missing file, or a file that doesn't parse as exactly 320 integers falls back to all-zero (a no-op) rather than failing the acquisition — measuring real offsets (pulsed laser) is future work; for now every node runs with all-zero offsets unless `pixel_offsets_ps.txt` has been placed and filled in by hand. Once calibrated, every cross-detector bunching peak should land on the same τ, pixel to pixel.
+
+`.claude/skills/temporal-align/align_time.py` measures the offsets from a single-detector pulsed-laser run (comb-peak centroid vs. pixel 160, the same convention `align_arc.py` centers its own fit on) and writes `pixel_offsets_ps.txt`. `tools/push_offsets.py` uploads it to a node's lSPAD directory — same upload + readback-verify shape as `push_mask.py`, plus a 320-integer-line check before anything is sent, since a malformed file wouldn't fail loudly on the node, just silently fall back to all-zero. Unlike a mask there is no separate apply step: the node reads the file fresh at the start of every acquisition.
 
 ### Abnormal marker logging (sender)
 

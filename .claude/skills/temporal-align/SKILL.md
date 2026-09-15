@@ -75,8 +75,10 @@ outcome: measured / masked / bad illumination).
 5. Tell the user this file needs to be copied onto the node's own lSPAD
    directory (`pixel_offsets_ps.txt`, next to `lSPAD.exe`) to actually take
    effect — this script only measures and writes the local file, it does not
-   push it anywhere (no `push_mask.py`-style upload tool exists for this file
-   yet — offer to build one if they want it).
+   push it anywhere. `tools\push_offsets.py` does that part (mirrors
+   `tools\push_mask.py`: upload + readback-verify over SFTP, no apply step
+   needed since the node reads the file fresh every acquisition):
+   `python tools\push_offsets.py pixel_offsets_ps.txt [--node 1|2]`.
 
 ## Tuning
 
