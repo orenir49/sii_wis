@@ -170,6 +170,104 @@ not CPU. Core count may still matter for the live pipeline's *parsing* cost
 specifically, but it is not what explains node2's overall slowness -- see
 the logbook's 7-9-26 entry for the correction.
 
+## Stage 5 — Vendor correspondence: T-mode's ASCII cost, and RAM exhaustion confirmed as expected (15-9-26)
+
+We put two open questions from this investigation to the vendor
+(SPADlambda/lSPAD): `T`-mode's own mid-run slowdown
+(`docs/lspad_streaming_throttle.md`'s GUI comparison, ~110-130 -> ~55-65 MB/s)
+and the "Not yet done" list's node2 RAM-exhaustion crash below.
+
+**Vendor reply:**
+
+> Thanks for the detailed information.
+> Regarding the first point (30 sec integration), the main limitation is
+> that the T command converts the timestamps to ASCII, which becomes quite
+> slow at high count rates. You should get better performance using binary
+> streaming mode.
+>
+> For continuous acquisition, unfortunately, the behavior you describe is
+> expected when the system cannot keep up with the incoming data: the data
+> accumulates in RAM until the memory is exhausted, at which point the
+> application may crash. This is especially noticeable in T=0 mode at high
+> count rates.
+
+**What this confirms:**
+
+- Resolves the "still undecided: why does `lSPAD.exe`'s own memory grow
+  this way at all" question in the "Not yet done" list below: **confirmed
+  as expected, intended behavior, not a bug** — lSPAD buffers unconsumed
+  data in RAM with no bound, and any sustained rate above what it can
+  drain (write, for `T` mode; send, for `SB`/`S`) means RAM grows until the
+  OS kills the process. "T=0 mode" (continuous, no fixed duration) at high
+  count rates is named explicitly as the regime where this is most
+  visible — which is exactly how this repo's own live acquisitions run
+  (`master.py` drives Start/Stop, not a bounded `T,<ms>` request), and
+  exactly the scenario that crashed node2 on 10-9-26.
+- Explains `T`-mode's own mid-run slowdown as an ASCII-conversion cost —
+  a *different* mechanism from the RAM-exhaustion crash, even though both
+  were asked about together.
+
+**What it doesn't confirm, and the tension worth flagging:**
+
+- It does **not** explain the node1-vs-node2 asymmetry. The vendor's
+  answer is generic (any node, given enough rate for long enough), but
+  node2 has consistently diverged first and worst at identical mask/rate
+  since Stage 1 above and the 6-9-26 logbook entry, right through to being
+  the *only* one of the two that actually crashed for good on 10-9-26.
+  That asymmetry is still unexplained and still node2-specific.
+- The vendor's advice — "you should get better performance using binary
+  streaming" — is the **opposite** of what Stages 1-4 above and
+  `docs/lspad_streaming_throttle.md` already measured for *finite*
+  acquisitions: `SB` (binary) collapses far worse than `T` at the same
+  mask_sparse rate (~17-20 Mcps/node) — 9-15x overrun vs. `T`'s ~1.8x.
+  Either the vendor's claim holds on a different axis (e.g. raw CPU/decode
+  cost per event at sustained high rate) without contradicting the
+  specific backlog-collapse shape already measured, or `T`'s ASCII cost
+  and `SB`'s collapse are both real but not comparable at the durations
+  tested so far. Untested until now: how `SB` mode behaves under a
+  **long, continuous, high-rate** acquisition — as opposed to the bounded
+  60s runs measured in `docs/lspad_streaming_throttle.md`.
+
+**Our response to the vendor:**
+
+> We already saw SB is worse at finite acquisition. However, it's worth
+> testing for infinite, monitoring RAM usage and measuring time until
+> crash.
+>
+> Best case, we gain some more throughput.
+> Worst case, we are confined to low count rates.
+
+**Planned test (not yet run):** drive `SB` mode continuously — no fixed
+duration, matching how this repo's own acquisitions actually run — at
+count rates overlapping the ones that crashed `T` mode (mask_ten/
+mask_twenty scale, ~11-20+ Mcps), monitoring:
+
+- `lSPAD.exe`'s own working-set memory on the node, the same per-15s SSH
+  poll used for the 10-9-26 crash (`tools/plot_node2_ram_blowup.py`'s
+  method, reusable as-is) — last time it was the vendor's own process
+  ballooning, not this repo's Python parser, so that is the number that
+  matters again here.
+- Time-to-crash (if any) at each rate, on both nodes — node2 crashed
+  within ~3 minutes under `T` mode; whether `SB` crashes faster, slower,
+  or not at all at the same rate is the actual open question.
+- Whether node1-vs-node2's existing asymmetry (node2 diverges first,
+  every time, in every mode tested so far) reappears under `SB` too —
+  which would point toward it being about node2's own hardware/OS/driver
+  stack rather than anything specific to `T` mode's file-writing path.
+
+**Reading the outcome, per our own framing above:**
+
+- **Best case** — `SB` survives materially longer (or indefinitely) at
+  rates that crash `T` mode: real throughput headroom gained by routing
+  continuous high-rate acquisition through `SB` despite it being worse for
+  short bounded runs. Two different regimes, two different right answers.
+- **Worst case** — `SB` crashes just as fast (or faster) at the same rate:
+  this isn't a `T`-mode-specific defect to route around by switching
+  modes. It's a hard, mode-independent ceiling on sustained count rate for
+  this hardware/driver stack, and the operating rule becomes "stay under
+  the rate that exhausts RAM," full stop, regardless of which acquisition
+  mode is in use.
+
 ## Not yet done
 
 - ~~A true synthetic disk-write test (write N ~52 MB files with no lSPAD
@@ -289,11 +387,16 @@ the logbook's 7-9-26 entry for the correction.
     fully wired (a `_would_release()` short-circuit can skip the cleanup
     when the dead side has nothing left of its own to release; tracked as a
     follow-up, not the crash that actually occurred today).
-  - **Still undecided**: why `lSPAD.exe`'s own memory grows this way at
-    all. No new tooling reaches inside it past today's live observation;
-    the vendor question from 9-9-26 stands, now with much higher urgency
-    given it can render a node's PC unresponsive within minutes, not just
-    "diverge."
+  - ~~Still undecided: why `lSPAD.exe`'s own memory grows this way at
+    all.~~ — **answered by the vendor, 15-9-26 (Stage 5 below): confirmed
+    expected behavior**, not a bug — RAM accumulates without bound whenever
+    the incoming rate exceeds what lSPAD can drain, "especially noticeable
+    in T=0 [continuous] mode at high count rates," exactly this repo's own
+    acquisition style. Node1-vs-node2's asymmetry (why node2 specifically
+    diverges first every time) is **not** answered by this and remains
+    open. New question raised by the same reply: whether `SB` mode shares
+    this failure under continuous acquisition — untested, planned in
+    Stage 5.
 - **Master-chip pixels show no bunching signal at any delay (9-9-26),
   marked undecidable for now — deferred to the end of this list.** Every
   tested slave-chip pixel (160/162/164/166/168) shows the expected ~14 ns
