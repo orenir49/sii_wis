@@ -133,6 +133,102 @@ master_loc = np.array([PIXMAP[170 + i] for i in range(150)])
 slave_loc  = np.array([PIXMAP[i]       for i in range(170)])
 
 # ---------------------------------------------------------------------------
+# Per-pixel TDC offset calibration
+#
+# Each SPAD's own TDC has a small, internal, uncalibrated per-pixel timing
+# skew -- distinct from the cross-node master/slave dwell offset the
+# correlator already applies, this is *within* one detector, one entry per
+# physical location (0-319, same units as the mask file's own pixel entries
+# -- PIXMAP *values*, not PIXMAP indices). Lives in lSPAD's own install
+# directory, like the mask; measured with a pulsed laser (future work), so
+# for now a node with no offsets file, or one that's all zeros, behaves
+# exactly as it always has -- this is a no-op until it's actually
+# calibrated. Once it is, every cross-detector bunching peak should land on
+# the same tau, pixel to pixel.
+# ---------------------------------------------------------------------------
+LSPAD_SEARCH_ROOT     = r'C:\Program Files (x86)\SPADlambda'
+LSPAD_SUBDIR          = 'lSPAD_standalone_win64'
+LSPAD_EXE_NAME        = 'lSPAD.exe'
+PIXEL_OFFSET_FILENAME = 'pixel_offsets_ps.txt'
+N_PIXEL_LOCATIONS     = 320
+
+
+def find_lspad_dir_local(root: str | None = None) -> str | None:
+    """Return the directory containing lSPAD.exe, or None if not found.
+
+    Local equivalent of ssh_launcher.find_lspad_dir: same search root/
+    subdir/exe name (only inside SPADlambda\\lSPAD_standalone_win64 --
+    outdated lSPAD installs live in sibling subdirectories under SPADlambda
+    with other names, see that function's own docstring), but a plain
+    filesystem walk rather than SSH/PowerShell -- this runs ON the node
+    already, so there is no reason to go through SSH for its own machine,
+    and node_backend.py has no paramiko dependency to begin with. `root`
+    defaults to LSPAD_SEARCH_ROOT/LSPAD_SUBDIR; overridable for tests.
+    """
+    if root is None:
+        root = os.path.join(LSPAD_SEARCH_ROOT, LSPAD_SUBDIR)
+    if not os.path.isdir(root):
+        return None
+    for dirpath, _dirnames, filenames in os.walk(root):
+        if LSPAD_EXE_NAME in filenames:
+            return dirpath
+    return None
+
+
+def load_pixel_offsets_ps(log_fn=print, lspad_dir: str | None = None) -> np.ndarray:
+    """Per-pixel TDC offset in ps, indexed by physical location (int64,
+    length N_PIXEL_LOCATIONS). Read from PIXEL_OFFSET_FILENAME inside
+    lSPAD's own directory: one integer per line, line N = offset for
+    location N.
+
+    Falls back to all-zero (a no-op) if lSPAD's directory can't be found,
+    the file doesn't exist yet, or it doesn't parse as exactly
+    N_PIXEL_LOCATIONS integers -- a node with no offsets file must behave
+    exactly as it did before this existed, not fail an acquisition over a
+    file nobody has created yet. Logged either way, so a run's log records
+    which case it was rather than leaving it to be inferred.
+
+    `lspad_dir`: override for tests / a caller that already resolved it;
+    None (the default) resolves it here via find_lspad_dir_local().
+    """
+    zeros = np.zeros(N_PIXEL_LOCATIONS, dtype=np.int64)
+    if lspad_dir is None:
+        lspad_dir = find_lspad_dir_local()
+    if lspad_dir is None:
+        log_fn('pixel offsets: lSPAD directory not found -- using all-zero offsets\n')
+        return zeros
+    path = os.path.join(lspad_dir, PIXEL_OFFSET_FILENAME)
+    if not os.path.exists(path):
+        log_fn(f'pixel offsets: {path} not found -- using all-zero offsets\n')
+        return zeros
+    try:
+        with open(path) as f:
+            values = [int(line.strip()) for line in f if line.strip()]
+        if len(values) != N_PIXEL_LOCATIONS:
+            raise ValueError(
+                f'expected {N_PIXEL_LOCATIONS} values, got {len(values)}')
+        offsets = np.array(values, dtype=np.int64)
+    except (OSError, ValueError) as exc:
+        log_fn(f'pixel offsets: could not read {path} ({exc}) -- '
+               f'using all-zero offsets\n')
+        return zeros
+    n_nonzero = int(np.count_nonzero(offsets))
+    log_fn(f'pixel offsets: loaded from {path} '
+           f'({n_nonzero}/{N_PIXEL_LOCATIONS} pixels non-zero)\n')
+    return offsets
+
+
+def _offset_pixel_slice(ts_slice: np.ndarray, key, offsets_ps: np.ndarray) -> np.ndarray:
+    """Add this destination's TDC offset once, only for a real pixel (`key`
+    an int -- the physical location, DEST_KEYS' own convention below) --
+    sync markers (`key` a (chip, name) tuple) are left untouched, since an
+    offset corrects a pixel's own TDC, not a sync signal."""
+    if isinstance(key, int):
+        return ts_slice + offsets_ps[key]
+    return ts_slice
+
+
+# ---------------------------------------------------------------------------
 # Fused (chip, pixel_nr) slot table -- Stage 2a bucketing fix.
 #
 # Replaces the old per-chip "for uid in np.unique(phys_pid): bufs[...].append(
@@ -702,6 +798,11 @@ def run(sock: socket.socket,
     outdir_bytes = output_dir.encode('utf-8')
     sock.sendall(struct.pack('>II', KEY_SETUP, len(outdir_bytes)) + outdir_bytes)
 
+    # Loaded once per acquisition, not per file -- a mid-run edit to the file
+    # on disk must not silently change which correction an in-progress
+    # session is applying pixel by pixel.
+    pixel_offsets_ps = load_pixel_offsets_ps(log_fn)
+
     # --- per-run queue and buffers ----------------------------------------
     sq: queue.Queue = queue.Queue(maxsize=QUEUE_MAXSIZE)
 
@@ -959,7 +1060,9 @@ def run(sock: socket.socket,
                 t0 = time.perf_counter()
                 for d in np.nonzero(counts)[0]:
                     key = DEST_KEYS[d]
-                    bufs[key].append(ts_sorted[bounds[d]:bounds[d + 1]])
+                    ts_slice = _offset_pixel_slice(
+                        ts_sorted[bounds[d]:bounds[d + 1]], key, pixel_offsets_ps)
+                    bufs[key].append(ts_slice)
                     if isinstance(key, tuple) and key[1] == 'dwell':
                         dwell_seen = True
                 stats['bucket_append_s'] += time.perf_counter() - t0

@@ -55,6 +55,7 @@ python tools\replay.py spad_data\captures\cap_node1.raw --outdir replay_out
 .venv\Scripts\python.exe tests\test_hook_fanout.py
 .venv\Scripts\python.exe tests\test_channel_graph.py
 .venv\Scripts\python.exe tests\test_channel_spill.py
+.venv\Scripts\python.exe tests\test_pixel_offsets.py
 .venv\Scripts\python.exe tests\test_multi_window.py
 .venv\Scripts\python.exe tests\test_write_lock.py
 .venv\Scripts\python.exe tools\raw_dump.py --selftest
@@ -125,6 +126,12 @@ Frames: 8-byte header `(key_id: uint32 big-endian, n_bytes: uint32 big-endian)` 
 - `0xFFFFFFFE` (KEY_END): empty payload — closes the session; `run_session_loop()` loops back for the next
 
 Pixel mapping: `PIXMAP` in `node_backend.py` maps lSPAD pixel indices to output keys. Slave pixels occupy indices 0–169, master pixels 170–319.
+
+### Per-pixel TDC offset calibration (sender)
+
+Each SPAD's own TDC has a small, internal, uncalibrated per-pixel timing skew — distinct from the cross-node master/slave dwell offset the correlator already applies (that's between the two detectors; this is *within* one). `node_backend.load_pixel_offsets_ps()` reads `pixel_offsets_ps.txt` from lSPAD's own install directory (found locally via `find_lspad_dir_local()` — the same search `ssh_launcher.find_lspad_dir()` does over SSH for the master's own use, just without SSH since this runs on the node already): one integer (ps) per line, 320 lines, line *N* = the offset for physical location *N* — same units as the mask file's own pixel entries (`M,` in `LSPAD_CLI.md`), not lSPAD's internal pixel ids. Loaded once per acquisition (`run()`'s preamble), not per file, so an edit mid-session can't silently change what an in-progress run is applying.
+
+Applied once per T-mode `.txt` file, per individual pixel, in `_reassemble_tmode_file()` — added to that pixel's own bucketed timestamp slice right before it's queued for the master, via `_offset_pixel_slice()`. Sync markers (dwell/line/frame) are never offset, only real pixels. A missing directory, missing file, or a file that doesn't parse as exactly 320 integers falls back to all-zero (a no-op) rather than failing the acquisition — measuring real offsets (pulsed laser) is future work; for now every node runs with all-zero offsets unless `pixel_offsets_ps.txt` has been placed and filled in by hand. Once calibrated, every cross-detector bunching peak should land on the same τ, pixel to pixel.
 
 ### Abnormal marker logging (sender)
 
