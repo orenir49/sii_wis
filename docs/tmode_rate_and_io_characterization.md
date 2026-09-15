@@ -244,14 +244,22 @@ Deliberately *not* through `master.py`/`node.py` — `node_backend.py` has
 no `SB` support any more (replaced entirely by T-mode, 6-9-26), and even
 if it did, we specifically want lSPAD's own behavior isolated from this
 repo's pipeline, the same reasoning `docs/lspad_streaming_throttle.md`'s
-original A/B test already used. Driver side: revive/extend that doc's
-`python_tcp_stream_binary.py` (the same throwaway node-local script —
-connect directly to `127.0.0.1:9999`, the raw `SB` command, drain and
-discard with no PIXMAP/epoch/queueing work of its own), but run it with
-**no fixed duration** — continuously, until it crashes or we stop it —
-instead of that doc's bounded 10s/60s windows, at count rates overlapping
-the ones that crashed `T` mode (mask_ten/mask_twenty scale, ~11-20+ Mcps,
-mask still applied via `master.py`'s Launch beforehand as usual).
+original A/B test already used. Driver side, now written:
+`tools/bench_sb_raw_drain.py` — the tracked successor to that doc's
+throwaway `python_tcp_stream_binary.py` (connect directly to
+`127.0.0.1:9999`, send `SB,<ms>`, drain and discard with no PIXMAP/epoch/
+queueing work of its own — not even that script's master/slave file
+split, since this test only needs a crash time, not record counts), but
+run with **no fixed duration** — continuously, until it crashes or we
+stop it — instead of that doc's bounded 10s/60s windows.
+`--duration-ms 0` follows the vendor's own "T=0" = continuous wording, but
+is unconfirmed for `SB` specifically (LSPAD_CLI.md documents no such
+sentinel for it); the script's own `--help` says to fall back to a large
+explicit value, e.g. `999999999`, if `0` doesn't behave as continuous. Run
+at count rates overlapping the ones that crashed `T` mode (mask_ten/
+mask_twenty scale, ~11-20+ Mcps, mask still applied via `master.py`'s
+Launch beforehand as usual, node only — do not start an acquisition
+through `master.py` itself).
 
 Monitor side: identical to the 10-9-26 `T`-mode crash measurement, so the
 two runs are directly comparable rather than merely similar —
