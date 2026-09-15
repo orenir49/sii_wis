@@ -237,16 +237,30 @@ and the "Not yet done" list's node2 RAM-exhaustion crash below.
 > Best case, we gain some more throughput.
 > Worst case, we are confined to low count rates.
 
-**Planned test (not yet run):** drive `SB` mode continuously — no fixed
-duration, matching how this repo's own acquisitions actually run — at
-count rates overlapping the ones that crashed `T` mode (mask_ten/
-mask_twenty scale, ~11-20+ Mcps), monitoring:
+**Planned test (not yet run): raw behavior, deliberately, and the same
+measurement as the T-mode crash so the two are comparable.**
 
-- `lSPAD.exe`'s own working-set memory on the node, the same per-15s SSH
-  poll used for the 10-9-26 crash (`tools/plot_node2_ram_blowup.py`'s
-  method, reusable as-is) — last time it was the vendor's own process
-  ballooning, not this repo's Python parser, so that is the number that
-  matters again here.
+Deliberately *not* through `master.py`/`node.py` — `node_backend.py` has
+no `SB` support any more (replaced entirely by T-mode, 6-9-26), and even
+if it did, we specifically want lSPAD's own behavior isolated from this
+repo's pipeline, the same reasoning `docs/lspad_streaming_throttle.md`'s
+original A/B test already used. Driver side: revive/extend that doc's
+`python_tcp_stream_binary.py` (the same throwaway node-local script —
+connect directly to `127.0.0.1:9999`, the raw `SB` command, drain and
+discard with no PIXMAP/epoch/queueing work of its own), but run it with
+**no fixed duration** — continuously, until it crashes or we stop it —
+instead of that doc's bounded 10s/60s windows, at count rates overlapping
+the ones that crashed `T` mode (mask_ten/mask_twenty scale, ~11-20+ Mcps,
+mask still applied via `master.py`'s Launch beforehand as usual).
+
+Monitor side: identical to the 10-9-26 `T`-mode crash measurement, so the
+two runs are directly comparable rather than merely similar —
+`lSPAD.exe`'s own working-set memory on the node, the same per-15s SSH
+poll (`spad_data/python_mem_watch_20260910.csv`'s method,
+`tools/plot_node2_ram_blowup.py` reusable as-is for the plot) — last time
+it was the vendor's own process ballooning, not this repo's Python
+parser, so that is the number that matters again here. Concretely:
+
 - Time-to-crash (if any) at each rate, on both nodes — node2 crashed
   within ~3 minutes under `T` mode; whether `SB` crashes faster, slower,
   or not at all at the same rate is the actual open question.
