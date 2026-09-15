@@ -261,13 +261,21 @@ mask_twenty scale, ~11-20+ Mcps, mask still applied via `master.py`'s
 Launch beforehand as usual, node only — do not start an acquisition
 through `master.py` itself).
 
-Monitor side: identical to the 10-9-26 `T`-mode crash measurement, so the
-two runs are directly comparable rather than merely similar —
-`lSPAD.exe`'s own working-set memory on the node, the same per-15s SSH
-poll (`spad_data/python_mem_watch_20260910.csv`'s method,
-`tools/plot_node2_ram_blowup.py` reusable as-is for the plot) — last time
-it was the vendor's own process ballooning, not this repo's Python
-parser, so that is the number that matters again here. Concretely:
+Monitor side, now written: `tools/monitor_lspad_ram.py` — the tracked
+successor to the ad hoc 15s SSH poll that produced
+`spad_data/python_mem_watch_20260910.csv`, same schema
+(`node,timestamp,lspad_ws_mb,free_ram_mb`) so `tools/plot_node2_ram_blowup.py`
+reads its output as-is. Run from the master (`python tools/monitor_lspad_ram.py
+--nodes 1,2` alongside `bench_sb_raw_drain.py` on each node), so the two
+runs are directly comparable rather than merely similar — last time it was
+the vendor's own `lSPAD.exe` process ballooning, not this repo's Python
+parser, so that is the number that matters again here. Each poll is its
+own independent, timed-out SSH round trip rather than one long session
+held open for the whole window (unlike `tools/monitor_node_resources.py`'s
+`Get-Counter` pattern) — deliberately, since a poll timing out because the
+node is thrashing under paging *is* useful data, and the CSV must survive
+the crash it's watching for, not just the run that doesn't crash.
+Concretely:
 
 - Time-to-crash (if any) at each rate, on both nodes — node2 crashed
   within ~3 minutes under `T` mode; whether `SB` crashes faster, slower,
