@@ -68,8 +68,7 @@ def load_pixel(base: str, pixel: int) -> np.ndarray:
 
 
 def measure_rate_hz(t: np.ndarray) -> float:
-    """Incident rate from a stream's own span -- same convention
-    node_backend._process_tmode_file uses for its live rate_hz estimate."""
+    """Incident rate from a stream's own span."""
     if t.size < 2:
         return 0.0
     span_s = float(t[-1] - t[0]) / 1e12

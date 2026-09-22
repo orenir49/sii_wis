@@ -12,9 +12,7 @@ import tkinter as tk
 from tkinter import ttk
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from node_backend import (run_command_server, DEFAULT_CMD_PORT,
-                          clear_stale_tmode_run_dirs)
-import tmode_kernel
+from node_backend import run_command_server, DEFAULT_CMD_PORT
 
 
 class SpadSenderGUI:
@@ -25,19 +23,9 @@ class SpadSenderGUI:
 
         self._event_queue: queue.Queue = queue.Queue()
 
-        # A folder left here by an earlier crashed run would otherwise wedge
-        # every T-mode start until this process is relaunched (see
-        # clear_stale_tmode_run_dirs's own docstring) -- so do it now, at
-        # that relaunch, rather than waiting for the next acquisition.
-        clear_stale_tmode_run_dirs()
-
         self._build_ui()
         self._poll_events()
         self._start_server()
-        # Compile tmode_kernel's numba kernels now, off the GUI thread, so
-        # the first real acquisition never eats a first-call JIT-compile
-        # stall (same reasoning as correlate_multi.py's own prewarm() call).
-        threading.Thread(target=tmode_kernel.prewarm, daemon=True).start()
 
     def _build_ui(self) -> None:
         frame = ttk.Frame(self.root, padding=20)

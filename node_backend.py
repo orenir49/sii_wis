@@ -13,20 +13,14 @@ import argparse
 import json
 import os
 import select
-import shutil
 import socket
 import struct
 import sys
 import numpy as np
-import polars as pl
 import threading
 import queue
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor
-
-import tmode_kernel
-from tmode_kernel import PS_PER_COUNT, COUNTS_PER_RESET, RESET_ID
 
 # ---------------------------------------------------------------------------
 # Configuration (standalone defaults)
@@ -50,44 +44,15 @@ LSPAD_HANDSHAKE_S = 10.0    # banner / T,v,1 — never block forever on a wedged
 PRESTART_DRAIN_S  = 120.0   # budget for reading a stale backlog to silence;
                             # ~120 MB/s on loopback, so this covers ~14 GB
 TDC_CALIB_S       = 180.0   # T,c,1 runs for minutes
+STOP_CONFIRM_S    = 5.0     # hard-abort drain budget; a soft stop has none
+DRAIN_REPORT_S    = 5.0     # progress cadence while draining after STOP
 
-# T-mode acquisition (docs/lspad_streaming_throttle.md,
-# docs/tmode_architecture_feasibility.md): lSPAD's `T,<ms>` file-based mode
-# replaces `SB,<ms>` streaming on this branch -- see run()'s T-mode ingestion
-# loop. Run-folder numbering increments once per T, command for the lifetime
-# of the lSPAD.exe process (verified empirically, 2026-09-06) and resets on
-# lSPAD restart, so the folder is discovered by diffing the directory listing
-# before/after sending T,, never guessed from a counter.
-#
-# lSPAD's own default save location is under its install directory
-# (C:\Program Files (x86)\SPADlambda\...); a node user may not have write
-# access there. `D,<dir>` (LSPAD_CLI.md) redirects it, so open_lspad_tmode_
-# stream() points it at this repo's own gitignored spad_data/ instead, where
-# the node always has write access. Verified live against real lSPAD
-# (2026-09-06): it appends its fixed "data/tdc/RunNNN/" suffix to whatever
-# `D,<dir>` was sent via a plain string concatenation with NO separator
-# inserted -- a `dir` with no trailing separator produced the nonsense path
-# "...spad_data\tdcdata/tdc/RunNNN/". TMODE_SAVE_DIR must end in one.
-TMODE_SAVE_DIR   = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                'spad_data') + os.sep
-TMODE_RUN_ROOT   = os.path.join(TMODE_SAVE_DIR, 'data', 'tdc')
-TMODE_RUN_WAIT_S = 30.0    # new Run folder must appear within this long
-TMODE_POLL_S     = 0.05    # file-lane poll interval while a file might still be arriving
-
-# Cross-file parallelism (docs/lspad_streaming_throttle.md): once the fused
-# tmode_kernel made per-file compute fast, a backlog of 100+ already-written
-# files sitting idle while one thread processes them one at a time became the
-# next lever -- see run()'s T-mode loop and _process_tmode_file(). None ->
-# ThreadPoolExecutor's own default (min(32, cpu_count+4)), same as PairPool.
-TMODE_POOL_WORKERS  = None
-TMODE_MAX_INFLIGHT  = 24   # cap on files dispatched-but-not-yet-reassembled
-                           # (both chips combined) -- bounds memory (~150-200
-                           # MB/file of live arrays) against a pool that falls
-                           # behind a burst of newly-ready files.
-
-# PS_PER_COUNT/COUNTS_PER_RESET/RESET_ID now live in tmode_kernel.py (imported
-# above) -- the fused epoch-reconstruction kernel needs them too, and one
-# definition avoids the two ever drifting apart.
+# ---------------------------------------------------------------------------
+# Physics
+# ---------------------------------------------------------------------------
+PS_PER_COUNT     = int((1 / 10e6) * 1e12)
+COUNTS_PER_RESET = 2**16
+TOP_COARSE       = COUNTS_PER_RESET - 1   # last tick of an epoch; see the reset fix in run()
 
 # ---------------------------------------------------------------------------
 # Pixel mapping
@@ -111,7 +76,7 @@ PIXMAP = np.array([
 ])
 
 SPECIAL = {225: 'dwell', 226: 'line', 228: 'frame'}
-# RESET_ID (234) imported from tmode_kernel at module top.
+RESET_ID          = 234      # coarse-counter reset marker
 OVERFLOW_ID       = 247      # detector FIFO overflow: photons already lost
 FILE_START_ID     = 239      # lSPAD file/stream-start marker -- expected once per session
 KNOWN_MARKER_IDS  = np.array(sorted(SPECIAL) + [RESET_ID, OVERFLOW_ID])
@@ -351,251 +316,6 @@ def drain_lspad(sock: socket.socket, quiet_for: float = 0.5,
     return head, total
 
 
-# ---------------------------------------------------------------------------
-# T-mode file ingestion (docs/tmode_architecture_feasibility.md)
-# ---------------------------------------------------------------------------
-
-def _tmode_file_path(run_dir: str, chip: str, idx: int) -> str:
-    return os.path.join(run_dir, f'data_{chip}{idx:03d}.txt')
-
-
-def read_tmode_file(path: str, skip_first_line: bool) -> tuple:
-    """Parse one data_{master,slave}NNN.txt into (pixel, coarse, fine) int
-    arrays, file order preserved.
-
-    Every row is a uniform 3-field `pixel,coarse,fine` CSV -- including
-    RESET_ID rows (`234,0,<seq>`) -- except the very first row of the very
-    first file of a run (`239,<coarse>`, the file-start marker, 2 fields),
-    which the caller must skip explicitly (`skip_first_line`) since polars
-    needs a uniform column count. Verified against real captures
-    (2026-09-06): no other marker id (dwell/line/frame/overflow) has been
-    observed in this format yet, so they are not specifically excluded here
-    -- run()'s abnormal-marker reporting downstream still catches them by
-    physical-pixel-range the same way it does for the SB stream.
-    """
-    df = pl.read_csv(path, has_header=False, skip_rows=1 if skip_first_line else 0,
-                      new_columns=['pixel', 'coarse', 'fine'],
-                      schema_overrides={'pixel': pl.Int32, 'coarse': pl.Int32,
-                                        'fine': pl.Int64})
-    return (df['pixel'].to_numpy(), df['coarse'].to_numpy(), df['fine'].to_numpy())
-
-
-def reconstruct_tmode_epochs(pixel: np.ndarray, coarse: np.ndarray, fine: np.ndarray,
-                              epoch_offset: int) -> tuple:
-    """Reconstruct absolute ps timestamps from one T-mode file's columns
-    (one chip, file order). Returns (time_ps, pixel) for photon rows only
-    (RESET_ID rows dropped) plus the epoch_offset to carry into the next
-    file of this chip.
-
-    T-mode's reset marker (`234,0,<seq>`) is authoritative and needs no
-    marker-ordering special case (the retired SB stream's own
-    correct_boundary_epochs() existed only to fix an ordering defect this
-    format doesn't appear to have): verified against a real capture that
-    every genuine epoch wrap is marked by exactly one RESET_ID row (54/54
-    matched), and that `<seq>` is a continuous count across files, not reset
-    per file (file000's last marker `234,0,53`, file001's first
-    `234,0,54`). So epoch tracking here is a plain inclusive cumsum of
-    RESET_ID rows, offset by what was carried in from earlier files.
-
-    `<seq>` is itself a 16-bit hardware register (confirmed 7-9-26: a
-    high-rate run crossed it mid-file, seq0 in the 65k range with enough
-    resets in that one file to wrap), so it wraps back to 0 at
-    COUNTS_PER_RESET (65536) regardless of how many resets came before --
-    unlike epoch_offset/the return value here, which must keep counting
-    unboundedly since it multiplies directly into time_ps. The cross-check
-    below therefore compares mod COUNTS_PER_RESET; the epoch math itself
-    (tmode_kernel.reconstruct_epochs) never wraps.
-
-    The carried epoch_offset is cross-checked against the markers' own
-    `<seq>` values (stored in the `fine` column for those rows) rather than
-    trusted alone: a silent mismatch would misplace a whole file's
-    timestamps by some multiple of 6.5536 ms with no other visible symptom.
-
-    The actual epoch/timestamp computation is tmode_kernel.reconstruct_epochs
-    (a fused numba kernel, proved bitwise-identical to the plain-numpy
-    reconstruct_epochs_ref by tmode_kernel's own _selftest()) -- this
-    function's job is just the cheap validation above, kept here in plain
-    Python for a readable ValueError rather than duplicated inside the
-    compiled kernel.
-    """
-    is_reset = pixel == RESET_ID
-    if is_reset.any():
-        seq = fine[is_reset]
-        expected_seq = (epoch_offset + np.arange(len(seq))) % COUNTS_PER_RESET
-        if not np.array_equal(seq, expected_seq):
-            raise ValueError(
-                f'T-mode epoch continuity mismatch: expected reset seq '
-                f'starting at {epoch_offset % COUNTS_PER_RESET}, got '
-                f'{seq[:5].tolist()} (first 5 of {len(seq)})')
-    return tmode_kernel.reconstruct_epochs(pixel, coarse, fine, epoch_offset)
-
-
-def _process_tmode_file(path: str, skip_first_line: bool, is_mast: bool) -> dict:
-    """Heavy, per-file T-mode work: parse, epoch-reconstruct and bucket ONE
-    file, entirely independently of every other file -- no shared state, no
-    lock. This is the unit of work run()'s thread pool dispatches, so N
-    files can be processed on N cores at once (docs/lspad_streaming_
-    throttle.md: a backlog of 100+ already-written files is the normal
-    steady state once a single thread stopped being the bottleneck).
-
-    Epoch reconstruction runs at a LOCAL baseline (epoch_offset=0) rather
-    than this file's true accumulated offset, which isn't knowable here --
-    it depends on every earlier file of this chip, in order, and forcing
-    that dependency here would serialize the very work this function exists
-    to parallelize. This is safe because epoch enters the timestamp formula
-    additively (time_ps = (offset + local_epoch) * COUNTS_PER_RESET *
-    PS_PER_COUNT + coarse*PS_PER_COUNT + fine): the TRUE timestamps are
-    exactly this file's local ones plus one constant,
-    `offset * COUNTS_PER_RESET * PS_PER_COUNT`, applied once the true
-    offset is known -- by run()'s _reassemble_tmode_file, strictly in file
-    order, the only place that dependency actually has to be resolved.
-
-    The reset-seq cross-check (docs: catches a carried offset silently
-    misplacing a whole file's timestamps by some multiple of 6.5536 ms) is
-    split the same way: this function only checks that its OWN reset
-    markers count up contiguously from wherever they start (independent of
-    every other file, safe to check in parallel) and reports where they
-    start (`seq0`); whether that matches the true accumulated offset from
-    earlier files is _reassemble_tmode_file's job, once that offset exists.
-
-    Abnormal-row detection runs here too (independent per file), but only
-    the rare abnormal rows themselves are returned -- report_abnormal()'s
-    throttled, order-sensitive logging still runs in _reassemble_tmode_file,
-    on the main thread, unchanged from before this file was parallelized.
-
-    `<seq>` (the reset marker's own `fine` value) is a 16-bit hardware
-    register: it wraps to 0 at COUNTS_PER_RESET (65536) resets, regardless
-    of file boundaries. A file whose reset count crosses that wrap (confirmed
-    7-9-26 on a high-rate run: seq0 in the 65k range with enough resets in
-    that one file to cross it) must not be flagged as discontinuous, so the
-    contiguity check below compares mod COUNTS_PER_RESET. `seq0` is still
-    reported as the file's raw (wrapped) starting value -- that is what
-    _reassemble_tmode_file's cross-file check below compares against.
-    """
-    t0 = time.perf_counter()
-    pixel, coarse, fine = read_tmode_file(path, skip_first_line)
-    parse_s = time.perf_counter() - t0
-
-    t0 = time.perf_counter()
-    is_reset = pixel == RESET_ID
-    n_resets = int(is_reset.sum())
-    seq0 = None
-    if n_resets:
-        seq = fine[is_reset]
-        expected = (seq[0] + np.arange(n_resets)) % COUNTS_PER_RESET
-        if not np.array_equal(seq, expected):
-            raise ValueError(
-                f'T-mode epoch continuity mismatch within {path}: this '
-                f"file's own reset seq is not contiguous from its first "
-                f'value ({seq[:5].tolist()}, first 5 of {len(seq)})')
-        seq0 = int(seq[0])
-    time_ps_local, pixel_nr, local_reset_count = tmode_kernel.reconstruct_epochs(
-        pixel, coarse, fine, 0)
-    epoch_s = time.perf_counter() - t0
-
-    t0 = time.perf_counter()
-    phys_ok  = pixel_nr < (150 if is_mast else 170)
-    abnormal = ~(phys_ok | np.isin(pixel_nr, NORMAL_MARKER_IDS))
-    abn_positions     = np.nonzero(abnormal)[0]
-    abn_pixel_nr      = pixel_nr[abn_positions]
-    abn_time_ps_local = time_ps_local[abn_positions]
-    n_unknown = int((abnormal & ~np.isin(pixel_nr, KNOWN_MARKER_IDS)).sum())
-    abnormal_s = time.perf_counter() - t0
-
-    t0 = time.perf_counter()
-    slot = pixel_nr.astype(np.uint16) | (np.uint16(1 if is_mast else 0) << 8)
-    dest = SLOT_DEST[slot]
-    bucket_slot_s = time.perf_counter() - t0
-
-    t0 = time.perf_counter()
-    ts_sorted_local, counts = tmode_kernel.counting_sort_bucket(dest, time_ps_local, N_DEST)
-    bucket_sort_s = time.perf_counter() - t0
-
-    t0 = time.perf_counter()
-    n_events = int(counts[:N_PHYS_DEST].sum())
-    bucket_gather_s = time.perf_counter() - t0
-
-    return {
-        'n_rows': len(pixel),
-        'seq0': seq0, 'local_reset_count': local_reset_count,
-        'first_ts_local': int(time_ps_local[0]) if time_ps_local.size else None,
-        'last_ts_local': int(time_ps_local[-1]) if time_ps_local.size else None,
-        'abn_positions': abn_positions,
-        'abn_pixel_nr': abn_pixel_nr, 'abn_time_ps_local': abn_time_ps_local,
-        'n_unknown': n_unknown,
-        'ts_sorted_local': ts_sorted_local, 'counts': counts, 'n_events': n_events,
-        'parse_s': parse_s, 'epoch_s': epoch_s, 'abnormal_s': abnormal_s,
-        'bucket_slot_s': bucket_slot_s, 'bucket_sort_s': bucket_sort_s,
-        'bucket_gather_s': bucket_gather_s,
-    }
-
-
-def clear_stale_tmode_run_dirs(root: str = TMODE_RUN_ROOT, log_fn=print) -> list:
-    """Remove every entry under `root`. Called once at node.py launch (see
-    node.py's SpadSenderGUI.__init__), not lazily deferred to the next
-    acquisition start.
-
-    lSPAD's own Run-counter resets to 0 on every lSPAD.exe restart (verified
-    empirically -- see find_tmode_run_dir), and lSPAD is fine writing into a
-    name that already exists -- it knows to overwrite. Our own new-folder
-    detection is what cannot cope: find_tmode_run_dir only recognises a Run
-    folder that is genuinely new in a before/after listing diff, so a
-    leftover folder from an earlier session (run()'s own rmtree cleanup is
-    skipped on any exception, deliberately, to leave a crashed run's data in
-    place to debug -- see run()) is already in the next session's `before`
-    snapshot and can never be seen as new again. One crash then silently
-    wedges every subsequent T-mode start with "No new Run folder appeared",
-    even though lSPAD itself would have happily reused/overwritten it.
-
-    node.py is what actually gets relaunched after a crash (master.py's
-    recovery flow kills and restarts it before retrying), so clearing here
-    reliably runs before every retry. The crashed run's data still survives
-    until that relaunch -- exactly one more session's worth of debugging
-    time -- rather than being deleted the instant it crashed.
-
-    Returns the paths actually removed.
-    """
-    removed = []
-    if not os.path.isdir(root):
-        return removed
-    for stale in os.listdir(root):
-        stale_path = os.path.join(root, stale)
-        try:
-            shutil.rmtree(stale_path)
-            removed.append(stale_path)
-            log_fn(f'Removed stale Run folder from an earlier session: '
-                   f'{stale_path}\n')
-        except OSError as exc:
-            log_fn(f'WARNING: could not remove stale Run folder '
-                   f'{stale_path} -- {exc!r}\n')
-    return removed
-
-
-def find_tmode_run_dir(before: set, log_fn=print,
-                       wait_s: float = TMODE_RUN_WAIT_S) -> str:
-    """Poll TMODE_RUN_ROOT for a Run folder not in `before` (a snapshot taken
-    just before sending T,). Diffing the listing rather than tracking/
-    guessing the run number is deliberate: the counter increments per T,
-    command for the life of the lSPAD.exe process and resets on restart
-    (verified empirically), so guessing it would silently break the first
-    time something else touches this lSPAD."""
-    deadline = time.time() + wait_s
-    while time.time() < deadline:
-        try:
-            current = set(os.listdir(TMODE_RUN_ROOT))
-        except OSError:
-            current = set()
-        new = current - before
-        if new:
-            return os.path.join(TMODE_RUN_ROOT, sorted(new)[0])
-        time.sleep(TMODE_POLL_S)
-    raise RuntimeError(
-        f'No new Run folder appeared under {TMODE_RUN_ROOT} within '
-        f'{wait_s:.0f} s of sending T, -- lSPAD may not have accepted the '
-        f'D,<dir> save-path command (see open_lspad_tmode_stream), or is '
-        f'not running on this machine.')
-
-
 def is_text_reply(data: bytes) -> bool:
     """True if `data` looks like an lSPAD text reply rather than binary stream."""
     if not data:
@@ -618,28 +338,93 @@ def check_connection(sock: socket.socket) -> bool:
         return False
 
 
-def open_lspad_tmode_stream(duration: float, log_fn=print) -> tuple:
-    """Connect to lSPAD, clear any leftover acquisition, point its save path
-    at this repo's spad_data/ (TMODE_SAVE_DIR), check the TDC calibration,
-    and start a T-mode acquisition. Returns (spad_sock, run_dir) -- run_dir
-    is the newly-created Run folder this session's files land in, discovered
-    by diffing TMODE_RUN_ROOT's listing from just before the T, command was
-    sent (see find_tmode_run_dir()).
+def correct_boundary_epochs(coarse, reset_arr, pixel_nr, is_mast) -> int:
+    """Undo the over-counted epoch on top-of-range records, in place.
 
-    Same STOP-drain-then-calibrate handshake as the retired SB path (see
-    docs/lspad_streaming_throttle.md, docs/raw_timestamp_wire_encoding_
-    bakeoff.md for why that path no longer exists on this branch) -- only
-    the final command differs.
+    lSPAD emits the reset marker (id 234) just *before* the final
+    coarse=0xFFFF tick of the epoch it closes, so a photon in that tick gets
+    the incremented epoch and lands one full reset period (6.5536 ms) in the
+    future — which also breaks the sortedness np.searchsorted relies on
+    downstream.
+
+    A correctly assigned top-of-range record is the LAST record of its epoch,
+    so it is stale iff the next record on the same chip still carries the same
+    epoch. Two things must be skipped when looking for that successor:
+
+      * the reset marker itself, which sits on the boundary carrying the
+        pre-increment epoch, and
+      * any same-tick partner — a second photon in the *same* 0xFFFF tick is
+        by construction in the same epoch, so a pairwise test sees it as
+        proof of staleness and demotes a perfectly good record by a full
+        epoch. That is a real regression, not a hypothetical: on the
+        2026-08-20 151x151 run it fired ~20.6k times across 1.1e10 records,
+        and every one of those was an inversion rather than a repair. It
+        scales as P(>=2 photons in a 100 ns tick), so it gets worse the
+        brighter you run.
+
+    So the unit of decision is a *run* of consecutive same-chip records that
+    are all at 0xFFFF and share an epoch — one tick's worth of photons. The
+    whole run is stale iff the first record after it carries that same epoch,
+    and the verdict applies to every member.
+
+    Residual: a run at the very end of a chip's records in this chunk has no
+    successor here and is left alone. That matters only if it sits exactly at
+    0xFFFF — 1/65536 per chip per chunk. Carrying records across chunks to
+    close that costs more than the defect.
+
+    Returns the number of records corrected.
+    """
+    n_fixed = 0
+    not_reset = pixel_nr != RESET_ID
+    for chip in (is_mast, ~is_mast):
+        idx = np.nonzero(chip & not_reset)[0]
+        m = idx.size
+        if m < 2:
+            continue
+        r_chip = reset_arr[idx]
+        is_top = coarse[idx] == TOP_COARSE
+        if not is_top.any():
+            continue
+
+        # partner[k]: record k+1 continues k's tick, so k is not the run end.
+        partner = np.zeros(m, dtype=bool)
+        partner[:-1] = is_top[:-1] & is_top[1:] & (r_chip[1:] == r_chip[:-1])
+        # run_end[k] = index of the last record in k's run (nearest
+        # non-partner position at or after k), by reverse-accumulating a min.
+        run_end = np.minimum.accumulate(
+            np.where(~partner, np.arange(m), m)[::-1])[::-1]
+
+        has_succ = run_end < m - 1
+        succ     = np.where(has_succ, np.minimum(run_end + 1, m - 1), 0)
+        stale    = is_top & has_succ & (r_chip[succ] == r_chip)
+
+        n_stale = int(stale.sum())
+        if n_stale:
+            reset_arr[idx[stale]] -= 1
+            n_fixed += n_stale
+    return n_fixed
+
+
+def open_lspad_stream(duration: float, log_fn=print):
+    """Connect to lSPAD, clear any leftover acquisition, check the TDC
+    calibration, and start the stream (SB). Returns the streaming socket.
+
+    Extracted so a replay harness could substitute a socket that re-serves a
+    captured stream. Deliberately ONLY the handshake: the parse loop it feeds
+    is the thing a parser rewrite has to be proved against, so that loop
+    stays byte-for-byte where it was. Refactoring the code under test to make
+    it testable would defeat the point.
     """
     spad_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     spad_sock.settimeout(LSPAD_HANDSHAKE_S)
     spad_sock.connect((SPAD_HOST, SPAD_PORT))
     # Clear any acquisition still running from a previous session before
     # touching the command protocol. lSPAD streams to every connected
-    # client, so a leftover SB/S would be read as our command replies and
-    # would desynchronise the handshake. Sending STOP straight away lets one
-    # drain cover the banner, any leftover stream and the STOP reply — three
-    # waits cost >1 s of the sparse-cal window.
+    # client, so a leftover SB would be read as our command replies and
+    # would desynchronise the 7-byte record framing for the whole run.
+    # Sending STOP straight away lets one drain cover the banner, any
+    # leftover stream and the STOP reply — three waits cost >1 s of the
+    # sparse-cal window.
     spad_sock.sendall(b'STOP\n')
     t_pre = time.time()
     _, pre_n = drain_lspad(spad_sock, quiet_for=0.4, cap=PRESTART_DRAIN_S)
@@ -647,21 +432,6 @@ def open_lspad_tmode_stream(duration: float, log_fn=print) -> tuple:
         dt = time.time() - t_pre
         log_fn(f'pre-START STOP: discarded {pre_n / 1e6:,.0f} MB of '
                f'leftover stream in {dt:.1f} s before lSPAD went quiet\n')
-
-    # lSPAD requires the directory to already exist (an unrecognised path
-    # replies 'Incorrect path' -- verified live) and echoes the given path
-    # back verbatim on success.
-    os.makedirs(TMODE_SAVE_DIR, exist_ok=True)
-    spad_sock.sendall(f'D,{TMODE_SAVE_DIR}\n'.encode('utf8'))
-    d_reply, _ = drain_lspad(spad_sock, quiet_for=0.2, cap=LSPAD_HANDSHAKE_S)
-    d_reply_text = d_reply.decode('utf8', errors='replace').strip()
-    if d_reply_text != TMODE_SAVE_DIR:
-        raise RuntimeError(
-            f'lSPAD rejected the save-path command D,{TMODE_SAVE_DIR} '
-            f'(replied {d_reply_text!r}) -- refusing to start, since this '
-            f"session's Run folder would land somewhere neither this code "
-            f'nor the master is looking.')
-    log_fn(f'{d_reply_text} is set as data directory\n')
 
     spad_sock.sendall(b'T,v,1\n')
     tdc_reply, tdc_n = drain_lspad(spad_sock, quiet_for=0.2,
@@ -677,35 +447,9 @@ def open_lspad_tmode_stream(duration: float, log_fn=print) -> tuple:
         log_fn(drain_lspad(spad_sock, quiet_for=2.0, cap=TDC_CALIB_S)[0]
                .decode('utf8', errors='replace'))
 
-    before = (set(os.listdir(TMODE_RUN_ROOT))
-             if os.path.isdir(TMODE_RUN_ROOT) else set())
-
-    spad_sock.settimeout(None)   # main loop drives its own select()
-    spad_sock.sendall(f'T,{int(duration * 1000)}\n'.encode('utf8'))
-
-    run_dir = find_tmode_run_dir(before, log_fn)
-    log_fn(f'T-mode acquisition started, output: {run_dir}\n')
-    return spad_sock, run_dir
-
-
-def _tmode_latest_index(run_dir: str, chip: str) -> int:
-    """Highest NNN among data_{chip}NNN.txt files currently in run_dir, or -1
-    if none exist yet -- used only for the live "parsing file m X/Y" progress
-    report, not for deciding what to read next (find_tmode_run_dir and run()'s
-    own dispatch loop already do that by existence-checking, not by scanning
-    for a maximum)."""
-    best = -1
-    prefix, suffix = f'data_{chip}', '.txt'
-    try:
-        names = os.listdir(run_dir)
-    except OSError:
-        return best
-    for name in names:
-        if name.startswith(prefix) and name.endswith(suffix):
-            digits = name[len(prefix):-len(suffix)]
-            if digits.isdigit():
-                best = max(best, int(digits))
-    return best
+    spad_sock.settimeout(None)   # stream loop drives its own select()
+    spad_sock.sendall(f'SB,{int(duration * 1000)}\n'.encode('utf8'))
+    return spad_sock
 
 
 def run(sock: socket.socket,
@@ -738,58 +482,16 @@ def run(sock: socket.socket,
     the blocking sq.put() stalled the parser — so the ceiling is ours, and the
     photons were lost downstream of the detector rather than by it.
 
-    progress_fn: optional callable(m_idx, m_total, s_idx, s_total, m_rate_hz,
-                 s_rate_hz), invoked every LAG_CHECK_S during T-mode ingestion
-                 (test_mode ignores it). m_idx/s_idx is the next file each
-                 lane is about to read; m_total/s_total is the highest-
-                 numbered file currently on disk for that chip
-                 (_tmode_latest_index) -- so the caller can show "how far
-                 behind" as a file count instead of a growing stream of
-                 timestamped WARNING lines, one line that updates rather
-                 than one appended every tick. m_rate_hz/s_rate_hz is each
-                 chip's incident count rate from its own most recently
-                 parsed file (photon count over that file's own timestamp
-                 span) -- unlike a rate derived from data reaching the
-                 master, this is not slowed down by this code's own
-                 ingestion lag.
+    progress_fn: accepted for interface parity with callers that pass one
+                 (see _run_acquisition_cmd), never invoked here -- SB has no
+                 "file" concept to report progress against.
     """
     stats = {'records': 0, 'overflow': 0, 'unknown': 0, 'abnormal': {},
              'lag_s': 0.0, 'lag_max_s': 0.0,
              'queue_max': 0, 'queue_blocks': 0,
              'recv_calls': 0, 'recv_mean_b': 0, 'discarded_b': 0,
              'epoch_fixes': 0, 'stop_mode': 'duration',
-             'first_ts': None, 'last_ts': None,
-             # T-mode ingestion breakdown (docs/lspad_streaming_throttle.md,
-             # docs/tmode_architecture_feasibility.md): where the per-node
-             # effective throughput ceiling actually sits. 'file_wait_s' and
-             # 'stability_sleep_s' are real main-thread wall-clock time
-             # (waiting for lSPAD to produce/finish a file -- its own pace,
-             # not something this code can speed up -- and the deliberate
-             # anti-race stability-check sleep). Since _process_tmode_file()
-             # dispatches each file's parse/epoch/bucket work to a thread
-             # pool (cross-file parallelism, docs/lspad_streaming_throttle.md),
-             # 'parse_s'/'epoch_s'/'abnormal_s'/'bucket_*_s' are each the SUM
-             # of however many files' worth of CPU-time ran concurrently --
-             # a measure of total work done, not serial wall-clock, and no
-             # longer directly comparable to elapsed_s the way they were
-             # before parallelism (they can sum to more than elapsed_s once
-             # multiple cores are genuinely busy at once; that is the win,
-             # not a bug in the accounting). Bucketing is split further:
-             # the SLOT_DEST lookup, the counting-sort kernel, gathering the
-             # bounds/n_events, and the per-destination Python loop that
-             # appends each slice into bufs (the one piece that is still
-             # genuinely sequential, since bufs order must match file order).
-             'file_wait_s': 0.0, 'stability_sleep_s': 0.0,
-             'parse_s': 0.0, 'epoch_s': 0.0, 'abnormal_s': 0.0,
-             'bucket_slot_s': 0.0, 'bucket_sort_s': 0.0,
-             'bucket_gather_s': 0.0, 'bucket_append_s': 0.0,
-             # Per-chip incident count-rate from the most recently parsed
-             # file of that chip (see the rate_hz comment in
-             # _reassemble_tmode_file below)
-             # -- stale (not zero) once a lane goes quiet, since "most
-             # recently parsed" is the whole point: the last real number
-             # beats no number.
-             'master_rate_hz': 0.0, 'slave_rate_hz': 0.0}
+             'first_ts': None, 'last_ts': None}
 
     def is_soft() -> bool:
         return soft_event is not None and soft_event.is_set()
@@ -861,29 +563,17 @@ def run(sock: socket.socket,
     # photons — the very failure it would be reporting.
     anom: dict = {}          # 'chip:id' -> [total, pending, last_log_t]
 
-    def report_abnormal(mask, pixel_nr, is_mast, time_ps, rec0, positions=None) -> None:
+    def report_abnormal(mask, pixel_nr, is_mast, time_ps, rec0) -> None:
         """Log abnormal ids in this chunk, at most one line per (chip, id) per
         ANOM_LOG_S. `rec0` is the session record index of the chunk's first
         record, so a marker's position in the stream is judgeable — a file-start
-        at record 0 is expected, one at record 4,000,000 is not.
-
-        positions: optional array mapping this call's local row indices (what
-        `sel` below naturally is) back to their true index within the
-        file/session record stream. Needed when `mask`/`pixel_nr`/`time_ps`
-        have already been filtered down to just the abnormal subset (the
-        cross-file-parallel path only ever hands this function that subset,
-        not a whole file -- see _process_tmode_file/_reassemble_tmode_file),
-        since then `sel` indexes into the SUBSET and is no longer the same
-        number as the true record position. None (a whole-file-array caller)
-        means `sel` already IS the true position.
-        """
+        at record 0 is expected, one at record 4,000,000 is not."""
         now  = time.time()
         t0   = stats['first_ts'] if stats['first_ts'] is not None else 0
         idx  = np.nonzero(mask)[0]
         code = pixel_nr[idx].astype(np.int64) * 2 + is_mast[idx]
         for c in np.unique(code):
-            sel      = idx[code == c]
-            true_sel = sel if positions is None else positions[sel]
+            sel  = idx[code == c]
             pid  = int(c) >> 1
             chip = 'master' if int(c) & 1 else 'slave'
             key  = f'{chip}:{pid}'
@@ -895,7 +585,7 @@ def run(sock: socket.socket,
                 anom[key] = [int(sel.size), 0, now]
                 if len(anom) <= ANOM_MAX_FIRST:
                     log_fn(f'ABNORMAL: {chip} id {pid} ({name}) x{sel.size:,} — '
-                           f'first at record {rec0 + int(true_sel[0]):,}, '
+                           f'first at record {rec0 + int(sel[0]):,}, '
                            f't=+{t_s:.6f} s\n')
                 elif len(anom) == ANOM_MAX_FIRST + 1:
                     log_fn(f'ABNORMAL: over {ANOM_MAX_FIRST} distinct abnormal '
@@ -908,7 +598,7 @@ def run(sock: socket.socket,
             if now - ent[2] >= ANOM_LOG_S:
                 log_fn(f'ABNORMAL: {chip} id {pid} ({name}) x{ent[1]:,} more '
                        f'(total {ent[0]:,}), latest at record '
-                       f'{rec0 + int(true_sel[-1]):,}, t=+{t_e:.6f} s\n')
+                       f'{rec0 + int(sel[-1]):,}, t=+{t_e:.6f} s\n')
                 ent[1] = 0
                 ent[2] = now
 
@@ -947,294 +637,240 @@ def run(sock: socket.socket,
                 stop_event.wait(timeout=min(1.0, max(0.0, remaining)))
 
         else:
-            # lSPAD's own TCP command protocol — see LSPAD_CLI.md for the full
-            # command set. T-mode (docs/lspad_streaming_throttle.md,
-            # docs/tmode_architecture_feasibility.md) replaces SB streaming on
-            # this branch: lSPAD writes rotating data_{master,slave}NNN.txt
-            # files instead of pushing bytes down this socket, and this loop's
-            # job is to notice, read and bucket each one as it completes.
-            spad_sock, run_dir = open_lspad_tmode_stream(duration, log_fn)
+            # lSPAD's own TCP command protocol — see LSPAD_CLI.md for the full command set.
+            spad_sock = open_lspad_stream(duration, log_fn)
 
-            CHIPS = (('master', True), ('slave', False))
-            # Per chip: next file index to check readiness for / dispatch,
-            # next file index whose result must be reassembled next (bufs
-            # order must match file order -- see _reassemble_tmode_file),
-            # the running epoch offset (only advances once a file has
-            # actually been reassembled), and {idx: (Future, size)} for
-            # dispatched-but-not-yet-reassembled files.
-            next_to_check      = {c: 0 for c, _ in CHIPS}
-            next_to_reassemble = {c: 0 for c, _ in CHIPS}
-            accumulated_offset = {c: 0 for c, _ in CHIPS}
-            pending            = {c: {} for c, _ in CHIPS}
-            chip_done          = {c: False for c, _ in CHIPS}
-            n_files          = 0
-            total_bytes      = 0
-            reply_buf        = b''
-            reply_received   = False
-            t_stream         = time.time()
-            last_lag_check   = t_stream
-            stopping         = False
+            reset_m     = 0
+            reset_s     = 0
+            carry       = b''
+            total_bytes = 0
+            t_stream    = time.time()
+            last_lag_check = t_stream
 
-            def _reassemble_tmode_file(chip: str, is_mast: bool, idx: int,
-                                       result: dict) -> bool:
-                """Apply file `idx`'s now-known true epoch offset to its
-                worker result, run abnormal-marker reporting, append into
-                bufs, and update stats -- everything that must happen
-                exactly once and strictly in file order, regardless of
-                which pool thread computed the heavy work in
-                _process_tmode_file. Deletes the raw .txt once everything
-                above has succeeded (node disk can otherwise overflow well
-                before a long acquisition ends -- these files are
-                fully-parsed-into-memory by this point, so there is nothing
-                left on disk to lose; deletion happens here rather than in
-                the worker so a failure anywhere above -- including the
-                cross-file epoch check just below -- leaves the file in
-                place for debugging instead of racing its removal against
-                the check that might still reject it). Returns dwell_seen.
-                """
-                accumulated = accumulated_offset[chip]
-                seq0 = result['seq0']
-                # accumulated is the true unbounded reset count (correct as
-                # the epoch multiplier below) but the hardware's own <seq>
-                # wraps at COUNTS_PER_RESET (65536) -- compare mod, not raw
-                # (see _process_tmode_file).
-                if seq0 is not None and seq0 != accumulated % COUNTS_PER_RESET:
-                    raise ValueError(
-                        f'T-mode epoch continuity mismatch: expected reset '
-                        f'seq starting at {accumulated % COUNTS_PER_RESET}, '
-                        f'got {seq0} (chip={chip}, file index {idx})')
+            stopping      = False
+            stop_deadline = None      # None while a soft stop is draining
+            drain_start   = 0.0
+            drain_at_stop = 0
+            last_report   = 0.0
 
-                stats['parse_s']         += result['parse_s']
-                stats['epoch_s']         += result['epoch_s']
-                stats['abnormal_s']      += result['abnormal_s']
-                stats['bucket_slot_s']   += result['bucket_slot_s']
-                stats['bucket_sort_s']   += result['bucket_sort_s']
-                stats['bucket_gather_s'] += result['bucket_gather_s']
-                stats['records']        += result['n_rows']
+            try:
+                while True:
+                    # On abort, send STOP but keep parsing: whatever lSPAD has
+                    # already buffered is real photon data, and discarding it
+                    # (as a drain-to-silence does) throws away everything the
+                    # parser had not yet caught up on. Exit when lSPAD goes
+                    # quiet, which is also the proof that STOP took effect.
+                    if stop_event.is_set() and not stopping:
+                        soft = is_soft()
+                        stats['stop_mode'] = 'soft' if soft else 'abort'
+                        log_fn(('Soft stop — sending STOP to lSPAD, then draining '
+                                'everything it has buffered. At a high count rate '
+                                'this can take much longer than the acquisition; '
+                                'press Abort to give up on the remainder.\n')
+                               if soft else 'Aborted — sending STOP to lSPAD.\n')
+                        try:
+                            spad_sock.sendall(b'STOP\n')
+                        except OSError as exc:
+                            log_fn(f'STOP failed: {exc!r}\n')
+                        stopping      = True
+                        # None = drain to completion, discard nothing.
+                        stop_deadline = None if soft else time.time() + STOP_CONFIRM_S
+                        drain_start   = time.time()
+                        drain_at_stop = total_bytes
+                        last_report   = drain_start
 
-                shift = accumulated * COUNTS_PER_RESET * PS_PER_COUNT
+                    # A soft stop is never a trap: a later Abort clears the soft
+                    # flag, and the deadline applies from that moment.
+                    if stopping and stop_deadline is None and not is_soft():
+                        log_fn('Soft stop escalated to abort — giving up on the '
+                               'remaining backlog.\n')
+                        stats['stop_mode'] = 'soft_then_abort'   # ASCII: this lands in JSON
+                        stop_deadline = time.time()
 
-                if result['first_ts_local'] is not None:
-                    if stats['first_ts'] is None:
-                        stats['first_ts'] = result['first_ts_local'] + shift
-                    stats['last_ts'] = result['last_ts_local'] + shift
+                    if stopping and time.time() - last_report >= DRAIN_REPORT_S:
+                        last_report = time.time()
+                        log_fn(f'Draining: {(total_bytes - drain_at_stop) / 1e6:,.0f} MB '
+                               f'parsed since STOP, {last_report - drain_start:.0f} s '
+                               f'elapsed, parser {stats["lag_s"]:.1f} s behind\n')
 
-                # Anything that is neither a physical pixel for this chip nor
-                # a normal marker is discarded by the bucketing below. Report
-                # it live, same as the retired SB path did -- only the rare
-                # abnormal rows themselves crossed the thread boundary (see
-                # _process_tmode_file), so report_abnormal needs the position
-                # remap (positions=) to log the true record index.
-                abn_pixel_nr = result['abn_pixel_nr']
-                if abn_pixel_nr.size:
-                    stats['unknown'] += result['n_unknown']
-                    n_overflow = int(np.sum(abn_pixel_nr == OVERFLOW_ID))
+                    r, _, _ = select.select([spad_sock], [], [], 0.5)
+                    if not r:
+                        if stopping:
+                            break        # quiet: acquisition has really ended
+                        continue
+                    if stopping and stop_deadline is not None and time.time() > stop_deadline:
+                        # Drain the rest to silence rather than walking away.
+                        # No lSPAD command purges its buffer and it survives a
+                        # disconnect, so anything left here would be handed to
+                        # the *next* START, which would then refuse to begin
+                        # until it had cleared it. Discarding costs seconds;
+                        # deferring it cost minutes and an aborted run.
+                        t_lost = time.time()
+                        _, lost_n = drain_lspad(spad_sock, quiet_for=0.5,
+                                                cap=PRESTART_DRAIN_S)
+                        stats['discarded_b'] += lost_n
+                        log_fn(f'WARNING: lSPAD still streaming after STOP — '
+                               f'{lost_n / 1e6:,.0f} MB discarded unparsed in '
+                               f'{time.time() - t_lost:.1f} s. This is real photon '
+                               f'loss: the parser was behind, so lSPAD had buffered '
+                               f'more than we could parse. Use Soft stop to keep it.\n')
+                        break
+                    data = spad_sock.recv(57344)
+                    if not data:
+                        log_fn('lSPAD closed the stream socket (EOF)\n')
+                        break
+
+                    total_bytes += len(data)
+                    # The parse loop has a large fixed cost per chunk, so
+                    # throughput depends strongly on how much recv() hands
+                    # over at a time.
+                    stats['recv_calls'] += 1
+
+                    done  = data[-4:] == b'DONE'
+                    error = data[-5:] == b'ERROR'
+                    if error:
+                        log_fn(f'lSPAD ERROR trailer after {total_bytes} B / '
+                               f'{time.time() - t_stream:.1f} s\n')
+                        log_fn(data[-160:].decode('utf8', errors='replace'))
+                        break
+                    if done:
+                        # A genuine trailer leaves the preceding stream
+                        # record-aligned; a chance 'DONE' inside binary counter
+                        # data does not. aligned=False means false positive.
+                        payload_len = len(carry) + len(data) - 4
+                        log_fn(f'lSPAD DONE trailer after {total_bytes} B / '
+                               f'{time.time() - t_stream:.1f} s, chunk={len(data)} B, '
+                               f'carry={len(carry)} B, aligned='
+                               f'{payload_len % 7 == 0}, tail={data[-24:]!r}\n')
+                        data = data[:-4]
+
+                    data       = carry + data
+                    n_complete = (len(data) // 7) * 7
+                    carry      = data[n_complete:]
+                    if n_complete == 0:
+                        if done:
+                            break
+                        continue
+
+                    raw      = np.frombuffer(data[:n_complete], dtype=np.uint8).reshape(-1, 7)
+                    is_mast  = raw[:, 0].astype(bool)
+                    pixel_nr = raw[:, 1].astype(np.int32)
+                    coarse   = (raw[:, 2].astype(np.int64) << 8)  | raw[:, 3].astype(np.int64)
+                    fine     = ((raw[:, 4].astype(np.int64) << 16)
+                              | (raw[:, 5].astype(np.int64) << 8)
+                              |  raw[:, 6].astype(np.int64))
+
+                    # FIFO overflow is the one loss that cannot be recovered
+                    # afterwards, so total it for the session rather than
+                    # letting per-chunk warnings scroll past.
+                    n_overflow = int(np.sum(pixel_nr == OVERFLOW_ID))
                     if n_overflow:
                         stats['overflow'] += n_overflow
-                    abn_time_ps = result['abn_time_ps_local'] + shift
-                    is_mast_arr = np.full(abn_pixel_nr.shape, is_mast, dtype=bool)
-                    report_abnormal(
-                        np.ones(abn_pixel_nr.shape, dtype=bool), abn_pixel_nr,
-                        is_mast_arr, abn_time_ps,
-                        stats['records'] - result['n_rows'],
-                        positions=result['abn_positions'])
+                    stats['records'] += len(raw)
 
-                ts_sorted = result['ts_sorted_local'] + shift
-                counts    = result['counts']
-                bounds    = np.concatenate(([0], np.cumsum(counts)))
-                n_events  = result['n_events']
+                    cs_m = np.cumsum((is_mast  & (pixel_nr == RESET_ID)).astype(np.int64))
+                    cs_s = np.cumsum((~is_mast & (pixel_nr == RESET_ID)).astype(np.int64))
 
-                # Live incident count-rate estimate (see _process_tmode_file
-                # for why this is computed from the file's OWN span rather
-                # than data-reaches-master rate) -- the shift is a constant,
-                # so max-min is unaffected by it either way.
-                photon_ts = ts_sorted[:bounds[N_PHYS_DEST]]
-                if photon_ts.size >= 2:
-                    span_s = float(photon_ts.max() - photon_ts.min()) / 1e12
-                    rate_hz = n_events / span_s if span_s > 0 else 0.0
-                else:
-                    rate_hz = 0.0
-                stats['master_rate_hz' if is_mast else 'slave_rate_hz'] = rate_hz
+                    cum_reset_m    = np.empty(len(raw), dtype=np.int64)
+                    cum_reset_s    = np.empty(len(raw), dtype=np.int64)
+                    cum_reset_m[0] = reset_m
+                    cum_reset_s[0] = reset_s
+                    cum_reset_m[1:] = reset_m + cs_m[:-1]
+                    cum_reset_s[1:] = reset_s + cs_s[:-1]
+                    reset_m += int(cs_m[-1])
+                    reset_s += int(cs_s[-1])
 
-                dwell_seen = False
-                t0 = time.perf_counter()
-                for d in np.nonzero(counts)[0]:
-                    key = DEST_KEYS[d]
-                    ts_slice = _offset_pixel_slice(
-                        ts_sorted[bounds[d]:bounds[d + 1]], key, pixel_offsets_ps)
-                    bufs[key].append(ts_slice)
-                    if isinstance(key, tuple) and key[1] == 'dwell':
-                        dwell_seen = True
-                stats['bucket_append_s'] += time.perf_counter() - t0
+                    reset_arr = np.where(is_mast, cum_reset_m, cum_reset_s)
 
-                accumulated_offset[chip] += result['local_reset_count']
+                    # Undo the epoch over-count on top-of-range records; see
+                    # correct_boundary_epochs() for why the decision is made per
+                    # 0xFFFF tick rather than per adjacent pair.
+                    stats['epoch_fixes'] += correct_boundary_epochs(
+                        coarse, reset_arr, pixel_nr, is_mast)
 
-                try:
-                    os.remove(_tmode_file_path(run_dir, chip, idx))
-                except OSError as exc:
-                    log_fn(f'WARNING: could not delete {chip} file {idx} after '
-                           f'processing it -- {exc!r}. Disk usage will grow '
-                           f'faster than expected for the rest of this run.\n')
+                    time_ps   = (reset_arr * COUNTS_PER_RESET + coarse) * PS_PER_COUNT + fine
 
-                return dwell_seen
+                    # Lag = wall-clock elapsed minus reconstructed detector time.
+                    # It grows when the parser cannot keep up, which is what
+                    # pushes loss into the detector's FIFO.
+                    if stats['first_ts'] is None:
+                        stats['first_ts'] = int(time_ps[0])
+                    stats['last_ts'] = int(time_ps[-1])
+                    if time.time() - last_lag_check >= LAG_CHECK_S:
+                        last_lag_check = time.time()
+                        lag = ((last_lag_check - t_stream)
+                               - (stats['last_ts'] - stats['first_ts']) / 1e12)
+                        stats['lag_s'] = round(lag, 2)
+                        # lag_s is overwritten every LAG_CHECK_S, so a spike
+                        # that recovers before the run ends leaves no trace in
+                        # the final record. Keep the peak too.
+                        if lag > stats['lag_max_s']:
+                            stats['lag_max_s'] = round(lag, 2)
 
-            with ThreadPoolExecutor(max_workers=TMODE_POOL_WORKERS,
-                                    thread_name_prefix='tmode') as pool:
-                try:
-                    while True:
-                        # T-mode finalizes quickly once STOP lands (~1 s in
-                        # practice, verified 2026-09-06) — there is no multi-
-                        # minute in-flight backlog to drain or discard the way
-                        # SB's own buffer could hold, so soft stop and abort
-                        # converge to the same behaviour here: send STOP, then
-                        # keep reading whatever files complete until this loop's
-                        # own done/reply conditions are met below.
-                        if stop_event.is_set() and not stopping:
-                            stopping = True
-                            stats['stop_mode'] = 'soft' if is_soft() else 'abort'
-                            log_fn('Stopping T-mode acquisition — sending STOP to '
-                                   'lSPAD, then reading whatever files it finishes '
-                                   'writing.\n')
-                            try:
-                                spad_sock.sendall(b'STOP\n')
-                            except OSError as exc:
-                                log_fn(f'STOP failed: {exc!r}\n')
+                    # Anything that is neither a physical pixel for this chip nor
+                    # a normal marker is discarded by the bucketing below. Report
+                    # it live; 'unknown' keeps its narrower meaning (not even a
+                    # marker we have a name for) for the summary and JSON.
+                    abnormal = ~((is_mast & (pixel_nr < 150))
+                                | (~is_mast & (pixel_nr < 170))
+                                | np.isin(pixel_nr, NORMAL_MARKER_IDS))
+                    if abnormal.any():
+                        stats['unknown'] += int(
+                            (abnormal & ~np.isin(pixel_nr, KNOWN_MARKER_IDS)).sum())
+                        report_abnormal(abnormal, pixel_nr, is_mast, time_ps,
+                                        stats['records'] - len(raw))
 
-                        # Non-blocking check for the T, command's own reply — it
-                        # only arrives once the whole acquisition (every file,
-                        # fully finalized) is done, verified 2026-09-06.
-                        if not reply_received:
-                            r, _, _ = select.select([spad_sock], [], [], 0)
-                            if r:
-                                chunk = spad_sock.recv(4096)
-                                if not chunk:
-                                    reply_received = True
-                                else:
-                                    reply_buf += chunk
-                                    if b'ERROR' in reply_buf:
-                                        log_fn(f'lSPAD ERROR reply: {reply_buf!r}\n')
-                                        reply_received = True
-                                    elif b'Data saved' in reply_buf:
-                                        reply_received = True
+                    # Fused (chip, pixel_nr) -> destination lookup (module-
+                    # level SLOT_DEST/DEST_KEYS/N_PHYS_DEST): one vectorized
+                    # argsort+bincount replaces a per-active-pixel Python loop,
+                    # whose cost is one numpy pass per unique pixel regardless
+                    # of chunk length. Plain numpy -- no numba, no thread pool.
+                    slot  = pixel_nr.astype(np.uint16) | (is_mast.astype(np.uint16) << 8)
+                    dest  = SLOT_DEST[slot]
+                    valid = dest >= 0
+                    order = np.argsort(dest[valid], kind='stable')
+                    d_sorted  = dest[valid][order]
+                    ts_sorted = time_ps[valid][order]
+                    counts    = np.bincount(d_sorted, minlength=N_DEST)
+                    bounds    = np.concatenate(([0], np.cumsum(counts)))
+                    events_since_flush += int(counts[:N_PHYS_DEST].sum())
 
-                        progressed = False
-                        dwell_seen_any = False
-                        total_pending = sum(len(p) for p in pending.values())
+                    dwell_seen = False
+                    for d in np.nonzero(counts)[0]:
+                        key = DEST_KEYS[d]
+                        ts_slice = _offset_pixel_slice(
+                            ts_sorted[bounds[d]:bounds[d + 1]], key, pixel_offsets_ps)
+                        bufs[key].append(ts_slice)
+                        if isinstance(key, tuple) and key[1] == 'dwell':
+                            dwell_seen = True
 
-                        for chip, is_mast in CHIPS:
-                            if chip_done[chip]:
-                                continue
+                    # Markers go out immediately — calibration needs them promptly
+                    # and there are only a handful per second. Pixel buffers are
+                    # flushed on a size OR time bound, so a high rate produces few
+                    # large frames instead of hundreds of tiny ones, while a low
+                    # rate still reaches the correlator within FLUSH_INTERVAL_S.
+                    if dwell_seen:
+                        flush(MARKER_BUF_KEYS)
+                    now = time.time()
+                    if (events_since_flush >= FLUSH_EVERY
+                            or now - last_flush >= FLUSH_INTERVAL_S):
+                        flush()
+                        events_since_flush = 0
+                        last_flush = now
 
-                            # 1. Dispatch newly-ready files to the pool,
-                            # bounded so a pool that falls behind a burst of
-                            # ready files doesn't hold unbounded live arrays.
-                            while total_pending < TMODE_MAX_INFLIGHT:
-                                idx = next_to_check[chip]
-                                path = _tmode_file_path(run_dir, chip, idx)
-                                try:
-                                    size1 = os.path.getsize(path)
-                                except OSError:
-                                    break
-                                next_path = _tmode_file_path(run_dir, chip, idx + 1)
-                                if not os.path.exists(next_path) and not reply_received:
-                                    break
-                                t0 = time.perf_counter()
-                                time.sleep(TMODE_POLL_S)
-                                stats['stability_sleep_s'] += time.perf_counter() - t0
-                                try:
-                                    size2 = os.path.getsize(path)
-                                except OSError:
-                                    size2 = -1
-                                if size1 != size2:
-                                    break
-                                fut = pool.submit(_process_tmode_file, path,
-                                                  idx == 0, is_mast)
-                                pending[chip][idx] = (fut, size1)
-                                total_pending += 1
-                                next_to_check[chip] += 1
-                                progressed = True
+                    if done:
+                        break
 
-                            # 2. Reassemble completed futures, strictly in
-                            # file order (propagates a worker's exception,
-                            # e.g. the reset-seq check, exactly as a direct
-                            # call would have).
-                            while next_to_reassemble[chip] in pending[chip]:
-                                fut, size1 = pending[chip][next_to_reassemble[chip]]
-                                if not fut.done():
-                                    break
-                                result = fut.result()
-                                del pending[chip][next_to_reassemble[chip]]
-                                total_pending -= 1
-                                dwell = _reassemble_tmode_file(
-                                    chip, is_mast, next_to_reassemble[chip], result)
-                                total_bytes += size1
-                                n_files += 1
-                                events_since_flush += result['n_events']
-                                dwell_seen_any |= dwell
-                                next_to_reassemble[chip] += 1
-                                progressed = True
-
-                            # 3. Done once no more files will ever appear
-                            # (lSPAD's own reply confirms it) and everything
-                            # already dispatched has been reassembled.
-                            if (not os.path.exists(_tmode_file_path(run_dir, chip, next_to_check[chip]))
-                                    and reply_received and not pending[chip]):
-                                chip_done[chip] = True
-
-                        # Markers go out immediately — calibration needs them
-                        # promptly. Pixel buffers flush on a size OR time bound,
-                        # same as the retired SB path.
-                        if dwell_seen_any:
-                            flush(MARKER_BUF_KEYS)
-                        now = time.time()
-                        if (events_since_flush >= FLUSH_EVERY
-                                or now - last_flush >= FLUSH_INTERVAL_S):
-                            flush()
-                            events_since_flush = 0
-                            last_flush = now
-
-                        if time.time() - last_lag_check >= LAG_CHECK_S:
-                            last_lag_check = time.time()
-                            if stats['first_ts'] is not None:
-                                lag = ((last_lag_check - t_stream)
-                                       - (stats['last_ts'] - stats['first_ts']) / 1e12)
-                                stats['lag_s'] = round(lag, 2)
-                                if lag > stats['lag_max_s']:
-                                    stats['lag_max_s'] = round(lag, 2)
-                            if progress_fn is not None:
-                                progress_fn(next_to_reassemble['master'],
-                                           _tmode_latest_index(run_dir, 'master'),
-                                           next_to_reassemble['slave'],
-                                           _tmode_latest_index(run_dir, 'slave'),
-                                           stats['master_rate_hz'], stats['slave_rate_hz'])
-
-                        if chip_done['master'] and chip_done['slave'] and reply_received:
-                            break
-                        if not progressed:
-                            t0 = time.perf_counter()
-                            time.sleep(TMODE_POLL_S)
-                            stats['file_wait_s'] += time.perf_counter() - t0
-
-                    stats['recv_calls'] = n_files   # repurposed for T-mode: files read, not recv() calls
-
-                    # Every individual .txt was already deleted as it was
-                    # reassembled (_reassemble_tmode_file); this removes the
-                    # now-(normally-)empty Run folder itself, so a stale
-                    # RunNNN from an earlier session never sits around to
-                    # collide with lSPAD's own Run-counter resetting to the
-                    # same number after a restart -- find_tmode_run_dir's
-                    # before/after diff only detects a genuinely new folder
-                    # if "before" really means nothing has ever used that
-                    # name. Only reached on a clean finish -- an exception
-                    # above skips this and leaves the run's data in place to
-                    # debug.
-                    try:
-                        shutil.rmtree(run_dir)
-                    except OSError as exc:
-                        log_fn(f'WARNING: could not remove {run_dir} after '
-                               f'the run -- {exc!r}\n')
-                finally:
-                    spad_sock.close()
+                # Only surprising for an indefinite run: SB,0 should stream until
+                # we abort. A fixed-duration run ending by itself is the normal
+                # case, and warning about it every time trains people to ignore
+                # the warnings that matter.
+                if not stop_event.is_set() and duration <= 0:
+                    log_fn(f'WARNING: stream ended without an abort after '
+                           f'{total_bytes} B / {time.time() - t_stream:.1f} s '
+                           f'— lSPAD ended an indefinite (SB,0) acquisition\n')
+            finally:
+                spad_sock.close()
 
     finally:
         flush()
@@ -1279,33 +915,6 @@ def run(sock: socket.socket,
            f'(peak {stats["lag_max_s"]:.1f} s), queue peak '
            f'{stats["queue_max"]}/{QUEUE_MAXSIZE}, '
            f'{stats["recv_calls"]:,} recv of {stats["recv_mean_b"]:,} B mean')
-    if stats['recv_calls']:
-        # file_wait_s/stability_sleep_s are real main-thread wall-clock time
-        # (waiting for lSPAD's own file-write pace -- not fixable here -- and
-        # the deliberate anti-race stability-check sleep). Since
-        # _process_tmode_file() dispatches each file's parse/epoch/bucket
-        # work to a thread pool (cross-file parallelism), parse_s/epoch_s/
-        # bucket_*_s below are each the SUM of however many files' worth of
-        # CPU-time ran concurrently -- total work done, not serial wall-clock
-        # -- so they can add up to more than elapsed_s once multiple cores
-        # are genuinely busy at once (that is the win, not a bug in the
-        # accounting). bucket_append_s is the one piece still genuinely
-        # sequential (bufs order must match file order).
-        bucket_s = (stats['bucket_slot_s'] + stats['bucket_sort_s']
-                   + stats['bucket_gather_s'] + stats['bucket_append_s'])
-        accounted = (stats['file_wait_s'] + stats['stability_sleep_s']
-                    + stats['parse_s'] + stats['epoch_s'] + bucket_s)
-        log_fn(f'Ingestion breakdown: wait-for-file {stats["file_wait_s"]:.1f} s, '
-               f'stability-check sleep {stats["stability_sleep_s"]:.1f} s, '
-               f'parse {stats["parse_s"]:.1f} s (CPU-time, parallel), '
-               f'epoch-reconstruct {stats["epoch_s"]:.1f} s (CPU-time, parallel), '
-               f'bucket {bucket_s:.1f} s (CPU-time, parallel) '
-               f'(elapsed {elapsed:.1f} s total, accounted {accounted:.1f} s '
-               f'-- can exceed elapsed under real parallelism)\n')
-        log_fn(f'Bucket breakdown: SLOT_DEST lookup {stats["bucket_slot_s"]:.1f} s, '
-               f'counting-sort kernel {stats["bucket_sort_s"]:.1f} s, gather+bincount '
-               f'{stats["bucket_gather_s"]:.1f} s, per-destination append (sequential) '
-               f'{stats["bucket_append_s"]:.1f} s\n')
     return stats
 
 
