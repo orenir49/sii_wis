@@ -533,3 +533,20 @@ Data: `spad_data/ram_watch_sb_test_overflow.csv`, node logs
   suspect remains. **Marked undecided** — deferring further investigation
   until the pulsed laser is back from repair and allows more thorough,
   higher-SNR testing. Until then, work with slave-chip pixels only.
+
+  **Result, 22-9-26: resolved — it was SNR, not hardware/optical.** Same
+  pixel, 151 vs 151 (one of the original 9-9-26 non-detections), now at
+  today's much brighter source (~3.5 Mcps/pixel — roughly 3.5x the ~1 Mcps
+  both earlier null tests used): a clear peak at τ≈13.8-14 ns, SNR 7.3,
+  0.578% excess, 200 ps bins (`spad_data/151_151_master_check_highrate.txt`,
+  plotted in `figs/22-9-26/151_151_master_check_highrate_{histogram,
+  distribution,peak_zoom}.png` via `tools/plot_g2_result.py`) — same τ, same
+  shape as every slave-chip detection. Both earlier "no signal" results were
+  run at ~1 Mcps for hours; at 0.578% excess, the counting-statistics SNR
+  needed to see this peak clearly scales with count rate, and 1 Mcps was
+  evidently below the threshold even at 2 hours. **No hardware/optical
+  difference between the chips — master-chip pixels bunch exactly like
+  slave-chip ones once there are enough counts to see it.** Closes this
+  item; master-chip pixels are no longer excluded from the working set,
+  though a high enough count rate is still needed per pixel for the peak to
+  clear the noise floor at reasonable integration times.
