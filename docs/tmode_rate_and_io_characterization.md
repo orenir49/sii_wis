@@ -298,6 +298,81 @@ Concretely:
   the rate that exhausts RAM," full stop, regardless of which acquisition
   mode is in use.
 
+**Result, 22-9-26: ran the test — outcome is neither Best nor Worst case,
+it's a third one.**
+
+Bench source brightness has risen substantially since 10-9-26 (fresh
+intensity scans this session put it at roughly 4x higher per pixel near
+the detector peak) — `mask_twenty.txt`'s original 20 pixels now pull
+~76-81 Mcps/node, not the ~20 Mcps/node they were calibrated for. A new
+5-pixel mask (`mask_five.txt`: locs 160/162/164/166/168 — already the
+confirmed slave-chip bunching set from the master/slave-asymmetry check
+above) reproduces the *original* ~19-21 Mcps/node target under today's
+brightness, so both scales were tested: `mask_five` (~20 Mcps/node,
+matching 10-9-26) and `mask_twenty` (~76-81 Mcps/node, today's brightness
+at the historical pixel count).
+
+Also added this session: `--check-overflow` on `bench_sb_raw_drain.py` —
+a vectorized, resync-once scan of the raw stream for the detector FIFO
+overflow marker (id 247), so its timing could be checked directly against
+the RAM-monitoring poll's own oscillations. It resyncs to the record
+boundary rather than assuming a fixed number of preamble bytes to skip,
+since lSPAD's own text reply on connect has no documented length (8-check
+`--selftest`).
+
+**The clean run**: both nodes on `mask_twenty.txt` (~76-81 Mcps/node),
+`SB,0`, `--check-overflow`, RAM polled every 15s throughout.
+
+- Both nodes climbed together into the same oscillating 15-25 GB
+  working-set band within 2-3 minutes — repeated *partial internal RAM
+  releases* (e.g. node1: 25.2 GB -> 3.4 GB -> reclimbing, more than once),
+  not a monotonic runaway. Drain throughput collapsed from ~150 MB/s to
+  1-3 MB/s once backlogged, on both nodes.
+- **Zero FIFO overflow markers on either node, for the entire run —
+  including right up to the eventual crash.** This rules out "photons are
+  being dropped at the detector's FIFO" as the mechanism behind the RAM
+  growth: it's lSPAD's own unbounded internal buffering against a slow
+  drain (per the vendor's confirmation above), not lost/overflowing
+  events at the sensor side.
+- **Node2 crashed for real at ~15 minutes in**: `lSPAD.exe` died
+  (OS-level kill), RAM fully released to baseline, client connection
+  reset — same divergent-first node, same failure shape as 10-9-26's
+  T-mode crash, just ~5x slower to arrive (T-mode: ~3 min at the original
+  ~20 Mcps/node; `SB` here: ~15 min at ~76-81 Mcps/node — a materially
+  *higher* rate than the T-mode crash test used).
+- **Node1 did not crash on its own.** It kept oscillating in the same
+  15-25 GB band for another 5-6 minutes (still zero overflow) until
+  explicitly stopped. A plain `Stop-Process -Force` against the drain
+  *client* did not end lSPAD's own acquisition or reclaim its RAM —
+  confirmed still running at ~17 GB working set after its client's
+  connection had already dropped. Only `taskkill /F` against `lSPAD.exe`
+  itself actually freed the RAM. Separately, in an earlier pass this
+  session, sending `STOP` over a *freshly opened* connection while `SB`
+  streaming was already active did not get a clean text reply — the new
+  connection was fed raw/leftover stream bytes instead of a command
+  response. Once `SB` streaming has started, the command channel cannot
+  be relied on to accept text commands mid-stream; killing `lSPAD.exe`
+  directly is the only method that reliably ended a session and reclaimed
+  RAM this session.
+
+**Reading it against the Best/Worst framing above**: neither holds
+cleanly. `SB` is not immune (node2 still crashed; node1's trajectory
+looked headed the same way) — that rules out "Best case." But it also
+isn't "just as fast" as `T` — 5x longer to the same failure, at a
+materially higher offered rate, with `T`'s own ASCII-conversion cost
+never in the picture — so "Worst case" doesn't hold either. The honest
+summary: `SB` buys real headroom (more retry margin before the shared,
+mode-independent RAM ceiling above is hit) at the cost of the throughput
+collapse Stages 1-4 already measured for short runs, now confirmed to
+persist rather than recover under sustained load. `SB`'s only genuine
+advantage over `T` here is time-to-failure, not immunity from it, and the
+already-established node1-vs-node2 asymmetry reappears identically under
+`SB` — further evidence it's node2-specific (hardware/OS/driver), not a
+`T`-mode software defect.
+
+Data: `spad_data/ram_watch_sb_test_overflow.csv`, node logs
+`spad_data/sb_drain_node{1,2}.log` (each node's own checkout).
+
 ## Not yet done
 
 - ~~A true synthetic disk-write test (write N ~52 MB files with no lSPAD
@@ -425,8 +500,11 @@ Concretely:
     acquisition style. Node1-vs-node2's asymmetry (why node2 specifically
     diverges first every time) is **not** answered by this and remains
     open. New question raised by the same reply: whether `SB` mode shares
-    this failure under continuous acquisition — untested, planned in
-    Stage 5.
+    this failure under continuous acquisition — ~~untested, planned in
+    Stage 5~~ **tested 22-9-26 (Stage 5 above): yes, `SB` shares it —
+    node2 crashed the same way, ~5x slower to arrive than under `T`. The
+    node1-vs-node2 asymmetry reappeared identically, reinforcing that it's
+    node2-specific rather than a `T`-mode software defect.**
 - **Master-chip pixels show no bunching signal at any delay (9-9-26),
   marked undecidable for now — deferred to the end of this list.** Every
   tested slave-chip pixel (160/162/164/166/168) shows the expected ~14 ns
