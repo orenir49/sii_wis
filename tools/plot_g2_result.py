@@ -13,6 +13,19 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.stats import poisson
+from scipy.optimize import curve_fit
+
+
+# Cross-node TDC broadening, sigma from a free fit to the 1-9-26 high-SNR,
+# 20 ps-bin offline re-analysis (`164_164_resolve_peak_20ps_bins.txt`,
+# logbook 10-9-26). Pure instrument width -- identical for every pixel pair,
+# so later fits hold it fixed instead of re-fitting a width that degenerates
+# on weaker peaks riding a single bin.
+RESOLVE_PEAK_20PS_SIGMA_PS = 70.7
+
+
+def _gaussian(t, amp, t0, sigma, baseline):
+    return baseline + amp * np.exp(-0.5 * ((t - t0) / sigma) ** 2)
 
 
 def pick_unit(tau_range_ps: float) -> tuple:
@@ -90,7 +103,8 @@ def plot_histogram(centers, counts, px1, px2, suffix, bin_width_ps, outdir) -> s
 
 
 def plot_histogram_zoom(centers, counts, px1, px2, suffix, bin_width_ps, outdir,
-                        half_width_ns) -> str:
+                        half_width_ns, fit_gaussian=False,
+                        fit_sigma_ps=RESOLVE_PEAK_20PS_SIGMA_PS) -> str:
     """Same peak as plot_histogram, but the x-axis is cropped to +/-half_width_ns
     around it so individual bins are visible instead of being compressed across
     the full tau window."""
@@ -116,11 +130,41 @@ def plot_histogram_zoom(centers, counts, px1, px2, suffix, bin_width_ps, outdir,
     ax.plot(peak_tau_ps / 1_000.0, peak_count, marker='x', color='red',
             markersize=14, markeredgewidth=3, linestyle='none')
 
-    ax.annotate(
+    annotation = (
         f'peak at tau = {peak_tau_ps / 1_000.0:.3f} ns\n'
         f'excess = {excess_pct:.3f}% of avg coincidence count\n'
         f'bin width = {bin_width_ps:.0f} ps\n'
-        f'SNR = {snr:.1f}',
+        f'SNR = {snr:.1f}'
+    )
+
+    if fit_gaussian:
+        t_roi = centers[roi]
+        c_roi = counts[roi].astype(float)
+
+        def _model(t, amp, t0, baseline):
+            return _gaussian(t, amp, t0, fit_sigma_ps, baseline)
+
+        p0 = (peak_count - mean, peak_tau_ps, mean)
+        try:
+            popt, pcov = curve_fit(_model, t_roi, c_roi, p0=p0)
+            amp, t0, baseline = popt
+            amp_err = np.sqrt(pcov[0, 0])
+            amp_pct = amp / baseline * 100
+            amp_pct_err = amp_err / baseline * 100
+            fwhm_ps = 2.3548200450309493 * fit_sigma_ps
+            t_fine = np.linspace(t_roi.min(), t_roi.max(), 400)
+            ax.plot(t_fine / 1_000.0, _model(t_fine, *popt), 'r-',
+                    linewidth=1.5, label=f'Gaussian fit (sigma fixed {fit_sigma_ps:.0f} ps)')
+            annotation += (
+                f'\nmu = {t0 / 1_000.0:.3f} ns\n'
+                f'sigma = {fit_sigma_ps:.0f} ps (fixed, FWHM {fwhm_ps:.0f} ps)\n'
+                f'amplitude = {amp_pct:.3f}% +/- {amp_pct_err:.3f}%'
+            )
+        except RuntimeError:
+            annotation += '\nGaussian fit did not converge'
+
+    ax.annotate(
+        annotation,
         xy=(peak_tau_ps / 1_000.0, peak_count), xycoords='data',
         xytext=(0.55, 0.95), textcoords='axes fraction',
         fontsize=10, verticalalignment='top',
@@ -209,6 +253,14 @@ def main():
                     help='zoom-plot half-width around the peak, in ns (default 2.0)')
     ap.add_argument('--no-zoom', action='store_true',
                     help='skip the peak-zoom plot')
+    ap.add_argument('--no-distribution', action='store_true',
+                    help='skip the count-distribution plot')
+    ap.add_argument('--fit-gaussian', action='store_true',
+                    help='overlay a fitted Gaussian on the peak-zoom plot')
+    ap.add_argument('--fit-sigma-ps', type=float, default=RESOLVE_PEAK_20PS_SIGMA_PS,
+                    help='fixed Gaussian sigma in ps for --fit-gaussian '
+                         f'(default {RESOLVE_PEAK_20PS_SIGMA_PS}, the resolve_peak_20ps '
+                         'instrument-width result)')
     args = ap.parse_args()
 
     os.makedirs(args.outdir, exist_ok=True)
@@ -217,12 +269,15 @@ def main():
     bin_width_ps = float(np.median(np.diff(centers)))
 
     hist_path = plot_histogram(centers, counts, px1, px2, suffix, bin_width_ps, args.outdir)
-    dist_path = plot_distribution(counts, px1, px2, suffix, args.outdir)
     print(f'wrote {hist_path}')
-    print(f'wrote {dist_path}')
+    if not args.no_distribution:
+        dist_path = plot_distribution(counts, px1, px2, suffix, args.outdir)
+        print(f'wrote {dist_path}')
     if not args.no_zoom:
         zoom_path = plot_histogram_zoom(centers, counts, px1, px2, suffix,
-                                        bin_width_ps, args.outdir, args.zoom_ns)
+                                        bin_width_ps, args.outdir, args.zoom_ns,
+                                        fit_gaussian=args.fit_gaussian,
+                                        fit_sigma_ps=args.fit_sigma_ps)
         print(f'wrote {zoom_path}')
 
 
