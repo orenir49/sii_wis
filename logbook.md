@@ -373,3 +373,14 @@ Reverting to 2:1 fiber splitter, new spectral alignment.
 ## 23-09-26
 - Some more failed sweeping attempts.
 - Will run automatic pixel sweep one by one.
+
+## 24-09-26
+- Sweep over all active range pixels with high count rate. For the most part, g2(0)-1,
+  represented by the area under the peak, is constant versus wavelength, on par with
+  theoretical prediction. Some pixels show peculiar behavior: no bunching peak at all,
+  weak bunching with position varying between integrations. More work will follow to
+  determine the stability of the signal in position and amplitude.
+- Analysis: `tools/g2_analysis/` (free-width Gaussian fit to bunching-peak area dN/N,
+  SNR >= 5.7 significance, Poisson errors validated against off-peak nulls). Plots + fit
+  CSV/JSON saved to `figs/24-9-26/g2_area_analysis/`. dN/N flat vs pixel: 1.348 ± 0.024%
+  (SNR > 6, n=49, chi2/dof 1.04) and 1.324 ± 0.023% (SNR >= 5.7, n=57, chi2/dof 1.44).
