@@ -384,3 +384,15 @@ Reverting to 2:1 fiber splitter, new spectral alignment.
   SNR >= 5.7 significance, Poisson errors validated against off-peak nulls). Plots + fit
   CSV/JSON saved to `figs/24-9-26/g2_area_analysis/`. dN/N flat vs pixel: 1.348 ± 0.024%
   (SNR > 6, n=49, chi2/dof 1.04) and 1.324 ± 0.023% (SNR >= 5.7, n=57, chi2/dof 1.44).
+
+## 27-09-26
+- Reconsidered area dN/N vs peak amplitude as the bunching-rate metric: with jitter (fitted
+  sigma) shown non-constant (24-9-26), a free-sigma amplitude fit turned out to be exactly as
+  degenerate as area was jitter-sensitive -- the peak's FWHM (~166 ps) spans only ~1.7 of the
+  100 ps stored bins, so a free-sigma fit can't independently pin down sigma vs. amplitude from
+  so few bins. Resolution: fixed sigma = 70.7 ps instrument width (not free), sidestepping the
+  degeneracy at the cost of undercounting area on genuinely broadened runs.
+- 50 x 20 minute long integrations of pixels 164 and 151. A few effects are already clear midway through the campaign:
+  - 164's peak is always near 14 ns, with a small scatter.
+  - 151's peak is usually near 14 ns, at a constant offset from 164's; however, sometimes it is shifted by multiples of 100 ns- and even off the histogram range. This is probably a coarse counter error between master and slave chips, needs to be verified independently.
+  - 164's peak is consistently higher than 151's. I suspect this is due to a systematically different jitter. This can be tested both by integrating under the peak (if height*width is conserved, hints intrinsic bunching rate is constant), and by directly resolving the peaks with a long integration.
