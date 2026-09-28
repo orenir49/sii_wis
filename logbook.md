@@ -396,3 +396,27 @@ Reverting to 2:1 fiber splitter, new spectral alignment.
   - 164's peak is always near 14 ns, with a small scatter.
   - 151's peak is usually near 14 ns, at a constant offset from 164's; however, sometimes it is shifted by multiples of 100 ns- and even off the histogram range. This is probably a coarse counter error between master and slave chips, needs to be verified independently.
   - 164's peak is consistently higher than 151's. I suspect this is due to a systematically different jitter. This can be tested both by integrating under the peak (if height*width is conserved, hints intrinsic bunching rate is constant), and by directly resolving the peaks with a long integration.
+- 50 integrations done. 
+  - Pixel 151 has 9 instances of a bunching peak split between different tau's: -87, ~13, ~113, ~213 ns, et cetera, at jumps of 100 ns. 
+  - This is highly suggestive of a broken coarse counter, sometimes shifting the entire time stream. Plausible explanation for ALL weak signals in full detector sweep results; needs more investigation.
+  - Removing these histograms, both pixel 151 and pixel 164 are statistically consistent with a constant bunching rate.
+  - 164's bunching rate is ~0.74% while pixel 151 is ~0.64%. We must consider this when coadding pixels! I suspect it's due to different jitters, to be tested tomorrow.
+
+## 28-09-26
+
+- Peak width vs. pixel, following up on 27-9-26: matched-filter (sigma=70 ps Gaussian) search plus
+  free 4-parameter Gaussian fits on `*_compare_peak*.txt`.
+  - Pixel 164: single clean peak, tau0 = 12.918 +/- 0.005 ns, sigma = 77.1 +/- 5.2 ps
+    (FWHM 181.7 ps), amplitude 0.705 +/- 0.041% of baseline.
+  - Pixel 151: Suspected to have different jitter than pixel 164 (due to different bunching rates seen on yesterday's reliability sweep), unable to confirm here due to low quality data (long integration narrow time bins).
+  - Pixel 122: Original g2 sweep suggested pixel 122 had smaller bunching rate than the rest; this measurement tests whether this is a systematic consistent with a different intrinsic jitter.
+    - tau0 = 12.781 +/- 0.007 ns, sigma = 49.3 +/- 7.5 ps (FWHM 116.2 ps), amplitude 0.876 +/- 0.115% of baseline. **Measurement cut short by a power outage, reintegrating** 
+    - Reintegrated (`122_122_compare_peak2.txt`, ~5x the photons of the interrupted run): tau0 = 13.244 +/- 0.006 ns,
+      sigma = 77.4 +/- 6.1 ps (FWHM 182.2 +/- 14.4 ps), amplitude 0.672 +/- 0.045% of baseline, SNR 14.9. Sigma now
+      agrees with pixel 164 (77.1 +/- 5.2 ps) within error -- the earlier 49.3 ps width was a low-photon-count fit
+      artifact, not evidence of a different intrinsic jitter; the 24-9-26 "smaller bunching rate for pixel 122"
+      observation is not explained by a width difference. Peak center shifted by 463 ps (12.781 -> 13.244 ns)
+      between the interrupted and reintegrated runs -- more than the usual few-hundred-ps pixel-to-pixel skew and
+      unexplained; flagged for follow-up.
+    - Peak-zoom + free 4-parameter-fit plots for all three: `figs/28-9-26/164_164_compare_peak1_peak_zoom_freefit.png`,
+      `figs/28-9-26/122_122_compare_peak1_peak_zoom_freefit.png`, `figs/28-9-26/122_122_compare_peak2_peak_zoom_freefit.png`. 
