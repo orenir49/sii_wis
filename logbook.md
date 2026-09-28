@@ -419,4 +419,10 @@ Reverting to 2:1 fiber splitter, new spectral alignment.
       between the interrupted and reintegrated runs -- more than the usual few-hundred-ps pixel-to-pixel skew and
       unexplained; flagged for follow-up.
     - Peak-zoom + free 4-parameter-fit plots for all three: `figs/28-9-26/164_164_compare_peak1_peak_zoom_freefit.png`,
-      `figs/28-9-26/122_122_compare_peak1_peak_zoom_freefit.png`, `figs/28-9-26/122_122_compare_peak2_peak_zoom_freefit.png`. 
+      `figs/28-9-26/122_122_compare_peak1_peak_zoom_freefit.png`, `figs/28-9-26/122_122_compare_peak2_peak_zoom_freefit.png`.
+  - Pixel 151, redone with narrower (40 ps) bins (`151_151_compare_peak3.txt`) to resolve the earlier
+    low-quality-data gap: matched-filter search + free 4-parameter fit gives tau0 = 13.469 +/- 0.008 ns,
+    sigma = 76.4 +/- 8.1 ps (FWHM 180.0 +/- 19.0 ps), amplitude 0.653 +/- 0.059% of baseline, SNR 7.8.
+    Sigma now agrees with pixel 164 (77.1 +/- 5.2 ps) and pixel 122 (77.4 +/- 6.1 ps) within error -- no
+    evidence of a distinct intrinsic jitter for pixel 151 after all, and the amplitude matches the
+    27-9-26 reliability-sweep estimate (~0.64%). Plot: `figs/28-9-26/151_151_compare_peak3_peak_zoom_freefit.png`. 
