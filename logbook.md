@@ -425,4 +425,10 @@ Reverting to 2:1 fiber splitter, new spectral alignment.
     sigma = 76.4 +/- 8.1 ps (FWHM 180.0 +/- 19.0 ps), amplitude 0.653 +/- 0.059% of baseline, SNR 7.8.
     Sigma now agrees with pixel 164 (77.1 +/- 5.2 ps) and pixel 122 (77.4 +/- 6.1 ps) within error -- no
     evidence of a distinct intrinsic jitter for pixel 151 after all, and the amplitude matches the
-    27-9-26 reliability-sweep estimate (~0.64%). Plot: `figs/28-9-26/151_151_compare_peak3_peak_zoom_freefit.png`. 
+    27-9-26 reliability-sweep estimate (~0.64%). Plot: `figs/28-9-26/151_151_compare_peak3_peak_zoom_freefit.png`.
+  - Cross-check at native resolution: this run's `'diffs'`-mode raw tau values
+    (`spad_data/diffs/compare_peak3_20260928_160343/pair_151_151.bin`, 35.9B int64 ps, 287 GB) rebinned
+    with `correlate_kernel.rebin_diffs` to 20 ps bins over +/-100 ns (`spad_data/151_151_compare_peak3_rebinned.txt`,
+    7.18B counts kept) and refit the same way: sigma = 79.0 +/- 8.1 ps (FWHM 186.0 +/- 19.0 ps),
+    amplitude 0.645 +/- 0.056% of baseline, tau0 = 13.4785 +/- 0.0079 ns, SNR 5.4 -- consistent with the
+    40 ps-bin fit within error. Plot: `figs/28-9-26/151_151_compare_peak3_rebinned_peak_zoom_freefit.png`. 
