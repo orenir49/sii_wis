@@ -45,6 +45,7 @@ Self-test:
 """
 from __future__ import annotations
 
+import collections
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
@@ -115,16 +116,16 @@ def _pair_kernel(t1, t2, bin_width, tmax, nbins, n_shift):
 def _pair_kernel_diffs(t1, t2, bin_width, tmax, nbins, n_shift):
     """Same histogram as _pair_kernel, plus every in-range tau it binned.
 
-    Two passes rather than one preallocated worst-case buffer: a
-    `2*n_shift*len(t1)` buffer would be hundreds of MB per pair at this
-    module's stated scale (500k events x 80 pairs, n_shift up to
-    suggest_n_shift's cap of 40) -- out of line with how carefully this
-    module already tracks memory elsewhere (RAM caps, peak-RSS, the "hold"
-    policy in correlate_multi.py). The first pass is _pair_kernel's exact
-    loop (same binning arithmetic -- see DO NOT OPTIMIZE THE BINNING above)
-    to learn hist and hist.sum(); the second re-sweeps into an exactly-sized
-    output array. ~2x a plain histogram's cost, paid only when a caller
-    actually wants the diffs.
+    ONE pass into a worst-case-sized buffer (2*n_shift*len(t1) taus, returned
+    as a view of the filled prefix). Two earlier shapes were measured and
+    rejected: counting first and re-sweeping into an exact array cost ~4x a
+    plain histogram, and a doubling buffer reassigned inside the hot loop was
+    slower still (numba refcounts the rebound array on every access).
+
+    The worst case is only affordable because callers keep len(t1) small:
+    PairPool.run_with_diffs splits every pair into DIFF_CHUNK_EVENTS-sized t1
+    chunks, so the buffer is at most ~42 MB at n_shift's cap of 40. Do not
+    call this directly on a whole run's worth of events.
     """
     hist = np.zeros(nbins, dtype=np.int64)
     n1 = len(t1)
@@ -132,20 +133,7 @@ def _pair_kernel_diffs(t1, t2, bin_width, tmax, nbins, n_shift):
     if n1 == 0 or n2 == 0:
         return hist, np.empty(0, dtype=np.int64)
 
-    j = 0
-    for i in range(n1):
-        ti = t1[i]
-        while j < n2 and t2[j] < ti:
-            j += 1
-        for s in range(-n_shift, n_shift):
-            k = j + s
-            if 0 <= k < n2:
-                tau = t2[k] - ti
-                b = int(np.floor((tau + tmax) / bin_width))
-                if 0 <= b < nbins:
-                    hist[b] += 1
-
-    diffs = np.empty(int(hist.sum()), dtype=np.int64)
+    diffs = np.empty(2 * n_shift * n1, dtype=np.int64)
     idx = 0
     j = 0
     for i in range(n1):
@@ -158,10 +146,11 @@ def _pair_kernel_diffs(t1, t2, bin_width, tmax, nbins, n_shift):
                 tau = t2[k] - ti
                 b = int(np.floor((tau + tmax) / bin_width))
                 if 0 <= b < nbins:
+                    hist[b] += 1
                     diffs[idx] = tau
                     idx += 1
 
-    return hist, diffs
+    return hist, diffs[:idx]
 
 
 # Both kernels are warmed from ONE thread behind this lock. 16 threads
@@ -223,17 +212,74 @@ def rebin_diffs(diffs: np.ndarray, bin_width: float, tmax: float, nbins: int) ->
     return np.bincount(b[mask], minlength=nbins).astype(np.int64)
 
 
+# t1 events per pool task. The kernel is linear in len(t1) and additive over
+# t1 subsets (each t1 event is binned independently against t2), so a pair is
+# split into chunks that run on different threads: one busy pair used to be a
+# single-thread job no matter how many cores were idle, and its diffs were one
+# allocation the size of the whole batch.
+CHUNK_EVENTS = 1 << 20
+# Smaller for the diffs kernel, which preallocates 2*n_shift taus per t1 event.
+DIFF_CHUNK_EVENTS = 1 << 16
+
+
+def _chunks(t1, t2, tmax, chunk_events):
+    """Yield (t1_chunk, t2_slice) covering t1 in order. t2 is cut to the
+    +-tmax window around the chunk, which contains every t2 event the kernel
+    could bin for it -- neighbours outside that window are out of range and
+    dropped by the kernel anyway, and the kernel indexes t2 only relative to
+    the chunk's own start, so the result is identical to the whole-array run."""
+    n1 = len(t1)
+    if n1 <= chunk_events:
+        yield t1, t2
+        return
+    # Integer bounds: searchsorted with a float scalar casts the ENTIRE int64
+    # t2 to float64 on every call (measured: 3 s of slicing per 2 s of data).
+    reach = int(np.ceil(tmax)) + 1
+    for a in range(0, n1, chunk_events):
+        c1 = t1[a:a + chunk_events]
+        lo = np.searchsorted(t2, np.int64(c1[0]) - reach, side='left')
+        hi = np.searchsorted(t2, np.int64(c1[-1]) + reach, side='right')
+        yield c1, t2[lo:hi]
+
+
 class PairPool:
     """Runs `_pair_kernel` over many pairs concurrently.
 
     Threads, not processes: the kernel is nogil, so the arrays stay shared and
     nothing is pickled. The pool is reused across batches -- creating one per
-    batch would pay thread startup on every poll.
+    batch would pay thread startup on every poll. Each pair is further split
+    into CHUNK_EVENTS-sized t1 chunks (see _chunks) so one pair can use every
+    core.
     """
 
-    def __init__(self, max_workers=None) -> None:
+    def __init__(self, max_workers=None, chunk_events: int = CHUNK_EVENTS) -> None:
         self._ex = ThreadPoolExecutor(
             max_workers=max_workers, thread_name_prefix='g2pair')
+        self._window = 2 * (self._ex._max_workers or 4)
+        self._chunk_events = int(chunk_events)
+
+    def _tasks(self, batches, fn, bin_width, tmax, nbins, n_shift):
+        chunk = self._chunk_events if fn is _pair_kernel else min(
+            self._chunk_events, DIFF_CHUNK_EVENTS)
+        for key, t1, t2 in batches:
+            for c1, c2 in _chunks(t1, t2, tmax, chunk):
+                yield key, (fn, c1, c2, float(bin_width), float(tmax),
+                            int(nbins), int(n_shift))
+
+    def _run_bounded(self, tasks, consume) -> None:
+        """Submit lazily with at most `_window` tasks in flight, and hand each
+        result to consume(key, result) in submission order. Bounding matters
+        for the diffs path: every finished-but-unconsumed chunk holds its diffs
+        array, so submitting a whole backlog up front would hold it all."""
+        pending = collections.deque()
+        for key, args in tasks:
+            pending.append((key, self._ex.submit(*args)))
+            if len(pending) >= self._window:
+                k, f = pending.popleft()
+                consume(k, f.result())
+        while pending:
+            k, f = pending.popleft()
+            consume(k, f.result())
 
     def run(self, batches, bin_width: float, tmax: float, nbins: int,
             n_shift: int) -> dict:
@@ -244,28 +290,50 @@ class PairPool:
         across a spectrum vary by an order of magnitude.
         """
         prewarm()
-        futs = {}
-        for key, t1, t2 in batches:
-            futs[key] = self._ex.submit(
-                _pair_kernel, t1, t2, float(bin_width), float(tmax),
-                int(nbins), int(n_shift))
-        return {k: f.result() for k, f in futs.items()}
+        out = {}
+
+        def consume(key, h):
+            if key in out:
+                out[key] += h
+            else:
+                out[key] = h
+        self._run_bounded(self._tasks(batches, _pair_kernel, bin_width, tmax,
+                                      nbins, n_shift), consume)
+        return out
 
     def run_with_diffs(self, batches, bin_width: float, tmax: float, nbins: int,
-                        n_shift: int) -> dict:
+                        n_shift: int, sink=None) -> dict:
         """Like run(), but {key: (histogram, diffs)}. diffs holds every
-        in-range tau the histogram binned, already trimmed to its exact size.
+        in-range tau the histogram binned, in t1 order.
+
+        With `sink` -- sink(key, diffs_chunk), called in order as chunks
+        finish -- the diffs are handed off and dropped instead of accumulated,
+        so memory stays bounded by the in-flight window rather than the batch;
+        the returned diffs are then empty arrays.
 
         Only dispatched by the caller when diff-capture is active -- run()
         stays the plain, cheaper histogram-only path for ordinary use.
         """
         prewarm()
-        futs = {}
-        for key, t1, t2 in batches:
-            futs[key] = self._ex.submit(
-                _pair_kernel_diffs, t1, t2, float(bin_width), float(tmax),
-                int(nbins), int(n_shift))
-        return {k: f.result() for k, f in futs.items()}
+        hists, diffs = {}, {}
+
+        def consume(key, res):
+            h, d = res
+            if key in hists:
+                hists[key] += h
+            else:
+                hists[key] = h
+            if sink is not None:
+                if d.size:
+                    sink(key, d)
+            else:
+                diffs.setdefault(key, []).append(d)
+        self._run_bounded(self._tasks(batches, _pair_kernel_diffs, bin_width,
+                                      tmax, nbins, n_shift), consume)
+        empty = np.empty(0, dtype=np.int64)
+        return {k: (h, (np.concatenate(diffs[k]) if sink is None and diffs.get(k)
+                        else empty))
+                for k, h in hists.items()}
 
     def shutdown(self) -> None:
         self._ex.shutdown(wait=False)
@@ -457,6 +525,25 @@ def _selftest() -> int:
     got_diffs = pool.run_with_diffs(pairs, BW, TMAX, nbins, 5)
     ck('run_with_diffs histograms == run()\'s',
        all(np.array_equal(got_diffs[k][0], got[k]) for k, a, b in pairs))
+    # Chunking: a tiny chunk_events forces many t1 chunks per pair; results
+    # must equal the whole-array kernel exactly, hist and diffs (in order).
+    cpool = PairPool(chunk_events=997)
+    got_c = cpool.run(pairs, BW, TMAX, nbins, 5)
+    ck('chunked run() == whole-array kernel, every pair',
+       all(np.array_equal(got_c[k], got[k]) for k, a, b in pairs))
+    got_cd = cpool.run_with_diffs(pairs, BW, TMAX, nbins, 5)
+    ck('chunked run_with_diffs hist and diffs == whole-array kernel',
+       all(np.array_equal(got_cd[k][0], got[k]) and
+           np.array_equal(got_cd[k][1],
+                          _pair_kernel_diffs(a, b, BW, TMAX, nbins, 5)[1])
+           for k, a, b in pairs))
+    sunk = {}
+    got_cs = cpool.run_with_diffs(
+        pairs, BW, TMAX, nbins, 5,
+        sink=lambda k, d: sunk.setdefault(k, []).append(d.copy()))
+    ck('sink receives the same diffs in order and run_with_diffs returns none',
+       all(np.array_equal(np.concatenate(sunk[k]), got_cd[k][1]) and
+           got_cs[k][1].size == 0 for k, a, b in pairs if got_cd[k][1].size))
     ck('run_with_diffs diff count == histogram count, every pair',
        all(got_diffs[k][1].size == got_diffs[k][0].sum() for k, a, b in pairs))
     pool.shutdown()

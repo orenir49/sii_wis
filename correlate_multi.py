@@ -214,6 +214,7 @@ class MultiCorrelateWindow(tk.Toplevel):
         # differences). Told by ReceiverGUI.set_diff_capture_enabled.
         self._diff_capture_enabled = False
         self._diff_files: dict = {}    # (p1, p2) -> open file handle, this session
+        self._diff_lock = threading.Lock()   # guards _diff_files vs the writer thread
         self._diff_paths: dict = {}    # (p1, p2) -> path, kept after close for consolidation
         self._diff_session_dir: str | None = None
         self._spill_session_dir: str | None = None
@@ -779,6 +780,21 @@ class MultiCorrelateWindow(tk.Toplevel):
             self._diff_paths[(p1, p2)] = path
             self._diff_files[(p1, p2)] = open(path, 'wb')
 
+    def _write_diffs(self, key, arr) -> None:
+        """PairPool sink: append one chunk of taus to that pair's file. Runs on
+        the correlation worker thread; the lock is against _stop_diff_capture
+        closing the handles from the Tk thread mid-write."""
+        with self._diff_lock:
+            f = self._diff_files.get(key)
+            if f is not None:
+                arr.tofile(f)
+
+    def backlog_bytes(self) -> int:
+        """RAM currently buffered in the channel graph, for ReceiverGUI's
+        backlog guard. Spilled (on-disk) data is not counted."""
+        g = self._graph
+        return int(g.nbytes) if g is not None else 0
+
     def _flush_diff_handles(self) -> None:
         for f in self._diff_files.values():
             try:
@@ -787,13 +803,14 @@ class MultiCorrelateWindow(tk.Toplevel):
                 pass
 
     def _stop_diff_capture(self, consolidate: bool = True) -> None:
-        had_files = bool(self._diff_files)
-        for f in self._diff_files.values():
-            try:
-                f.close()
-            except OSError:
-                pass
-        self._diff_files = {}
+        with self._diff_lock:
+            had_files = bool(self._diff_files)
+            for f in self._diff_files.values():
+                try:
+                    f.close()
+                except OSError:
+                    pass
+            self._diff_files = {}
         if had_files and consolidate:
             self._save_npz()
 
@@ -886,18 +903,24 @@ class MultiCorrelateWindow(tk.Toplevel):
             t0 = time.perf_counter()
             batches = [((p1, p2), t1, t2) for p1, p2, t1, t2 in rel.batches]
             if self._diff_capture_enabled and self._diff_files:
-                results = self._pool.run_with_diffs(batches, bw, tmax, nbins, nshift)
-                hists = {k: h for k, (h, d) in results.items()}
-                diffs = {k: d for k, (h, d) in results.items()}
+                # Diffs stream to disk chunk by chunk from here (this worker
+                # thread) instead of riding the result queue as one array per
+                # pair per batch: a backlog batch's diffs are ~24 B per t1
+                # event, and holding them all until the Tk poll wrote them
+                # was an unbounded RAM cost.
+                results = self._pool.run_with_diffs(
+                    batches, bw, tmax, nbins, nshift, sink=self._write_diffs)
+                hists = {k: h for k, (h, _d) in results.items()}
+                with self._diff_lock:
+                    self._flush_diff_handles()
             else:
                 hists = self._pool.run(batches, bw, tmax, nbins, nshift)
-                diffs = None
             dt = time.perf_counter() - t0
             self._kernel_s_total += dt
             self._kernel_batches += 1
             sizes = {(p1, p2): (int(t1.size), int(t2.size))
                      for p1, p2, t1, t2 in rel.batches}
-            self._result_q.put(('ok', hists, sizes, rel, dt, diffs))
+            self._result_q.put(('ok', hists, sizes, rel, dt))
         except Exception as exc:
             self._result_q.put(('err', str(exc)))
         finally:
@@ -915,7 +938,7 @@ class MultiCorrelateWindow(tk.Toplevel):
             if res[0] == 'err':
                 self._set_status(f'Correlation error: {res[1]}', bad=True)
                 continue
-            _, hists, sizes, rel, dt, diffs = res
+            _, hists, sizes, rel, dt = res
             self._last_kernel_s = dt
             for key, h in hists.items():
                 if int(h.sum()) == 0:
@@ -929,18 +952,6 @@ class MultiCorrelateWindow(tk.Toplevel):
                 n1, n2 = sizes[key]
                 self._counts[key][0] += n1
                 self._counts[key][1] = max(self._counts[key][1], n2)
-            # Written on this thread, not the kernel worker -- one writer per
-            # handle at a time, same as run_session_loop's own file writes.
-            # Flushed every batch (not just at Save/stop): without it the
-            # bytes sit in Python's BufferedWriter and the .bin file can read
-            # as empty/stale for the whole run even though data is arriving,
-            # and a big backlog then hits Save .npz's np.fromfile all at once.
-            if diffs:
-                for key, arr in diffs.items():
-                    f = self._diff_files.get(key)
-                    if f is not None and arr.size:
-                        arr.tofile(f)
-                        f.flush()
             drawn = True
         if drawn:
             if zero_pairs:
@@ -1192,16 +1203,21 @@ class MultiCorrelateWindow(tk.Toplevel):
         extra = {}
         if self._diff_paths:
             self._flush_diff_handles()
-            diff_arrays = [np.fromfile(self._diff_paths[k], dtype=np.int64)
-                           if k in self._diff_paths and os.path.exists(self._diff_paths[k])
-                           else np.empty(0, dtype=np.int64)
-                           for k in keys]
-            offsets = np.zeros(len(diff_arrays) + 1, dtype=np.int64)
-            offsets[1:] = np.cumsum([d.size for d in diff_arrays])
-            extra = dict(
-                diffs_ps=(np.concatenate(diff_arrays) if diff_arrays
-                         else np.empty(0, dtype=np.int64)),
-                diffs_offset=offsets)
+            # One preallocated array filled file by file: concatenating a list
+            # of per-pair arrays held every diff twice. (The result is still
+            # the whole run's diffs in RAM -- fine for a short run, not for a
+            # multi-GB one; the per-pair .bin files are the record either way.)
+            sizes = [os.path.getsize(self._diff_paths[k]) // 8
+                     if k in self._diff_paths and os.path.exists(self._diff_paths[k])
+                     else 0 for k in keys]
+            offsets = np.zeros(len(sizes) + 1, dtype=np.int64)
+            offsets[1:] = np.cumsum(sizes)
+            all_diffs = np.empty(int(offsets[-1]), dtype=np.int64)
+            for n, (k, sz) in enumerate(zip(keys, sizes)):
+                if sz:
+                    all_diffs[offsets[n]:offsets[n + 1]] = np.fromfile(
+                        self._diff_paths[k], dtype=np.int64, count=sz)
+            extra = dict(diffs_ps=all_diffs, diffs_offset=offsets)
             meta['diff_capture'] = True
             meta['diff_dir'] = self._diff_session_dir
         else:
