@@ -1,0 +1,1040 @@
+<title>g² Sweep</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Manrope:wght@500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap">
+<style>
+  :root {
+    --bg: #f3f5f8;
+    --panel: #ffffff;
+    --panel-2: #eef1f6;
+    --border: rgba(16,24,38,0.10);
+    --text: #101826;
+    --muted: #5b6b80;
+    --accent: #0d9488;
+    --accent-soft: rgba(13,148,136,0.14);
+    --warn: #b45309;
+    --warn-soft: rgba(180,83,9,0.12);
+    --good: #059669;
+    --good-soft: rgba(5,150,105,0.12);
+    --bad: #dc2626;
+    --bad-soft: rgba(220,38,38,0.10);
+    --grid-line: rgba(16,24,38,0.08);
+    --font-display: 'Manrope', system-ui, sans-serif;
+    --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0a0e14;
+      --panel: #10161f;
+      --panel-2: #161d29;
+      --border: rgba(255,255,255,0.09);
+      --text: #dbe4ef;
+      --muted: #8291a8;
+      --accent: #5eead4;
+      --accent-soft: rgba(94,234,212,0.12);
+      --warn: #fbbf24;
+      --warn-soft: rgba(251,191,36,0.12);
+      --good: #34d399;
+      --good-soft: rgba(52,211,153,0.12);
+      --bad: #f87171;
+      --bad-soft: rgba(248,113,113,0.12);
+      --grid-line: rgba(255,255,255,0.07);
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0a0e14;
+    --panel: #10161f;
+    --panel-2: #161d29;
+    --border: rgba(255,255,255,0.09);
+    --text: #dbe4ef;
+    --muted: #8291a8;
+    --accent: #5eead4;
+    --accent-soft: rgba(94,234,212,0.12);
+    --warn: #fbbf24;
+    --warn-soft: rgba(251,191,36,0.12);
+    --good: #34d399;
+    --good-soft: rgba(52,211,153,0.12);
+    --bad: #f87171;
+    --bad-soft: rgba(248,113,113,0.12);
+    --grid-line: rgba(255,255,255,0.07);
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-display);
+    padding-inline: 18px;
+    padding-block: 20px 40px;
+  }
+  * { box-sizing: border-box; }
+  .wrap { max-width: 1180px; margin: 0 auto; }
+  .tabnums { font-variant-numeric: tabular-nums; }
+
+  header.top {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 14px;
+    margin-bottom: 18px;
+  }
+  h1 {
+    font-family: var(--font-mono);
+    font-weight: 700;
+    font-size: 26px;
+    letter-spacing: -0.01em;
+    margin: 0;
+  }
+  h1 sup { font-size: 15px; color: var(--accent); }
+  .subtitle { color: var(--muted); font-size: 13px; margin-top: 4px; }
+
+  .status-panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 14px 18px;
+    min-width: 280px;
+    flex: 1 1 360px;
+    max-width: 520px;
+  }
+  .status-row {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    font-size: 13px;
+    color: var(--muted);
+    margin-bottom: 8px;
+  }
+  .status-row strong { font-family: var(--font-mono); color: var(--text); font-size: 13px; }
+  .bar-track { height: 8px; border-radius: 999px; background: var(--panel-2); overflow: hidden; margin-bottom: 10px; }
+  .bar-fill {
+    height: 100%;
+    background: linear-gradient(90deg, var(--accent), var(--good));
+    border-radius: 999px;
+    transition: width 0.6s ease;
+    width: 0%;
+  }
+  .pixel-flow {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    margin-bottom: 8px;
+  }
+  .pixel-flow .prev { color: var(--muted); }
+  .pixel-flow .arrow { color: var(--muted); }
+  .pixel-flow .now { color: var(--text); font-weight: 700; }
+  .status-bottom { display: flex; justify-content: space-between; align-items: center; font-size: 12px; color: var(--muted); }
+  .phase-chip {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    padding: 3px 9px;
+    border-radius: 999px;
+    background: var(--accent-soft);
+    color: var(--accent);
+  }
+  .phase-chip.resetting { background: var(--warn-soft); color: var(--warn); }
+  .phase-chip.complete { background: var(--good-soft); color: var(--good); }
+
+  .summary-strip { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 16px; }
+  .summary-tile { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 10px 16px; flex: 1 1 130px; }
+  .summary-tile .n { font-family: var(--font-mono); font-size: 22px; font-weight: 700; }
+  .summary-tile .l { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-top: 2px; }
+
+  .panel-block {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 16px 18px 12px;
+    margin-bottom: 22px;
+  }
+  .panel-block h2 {
+    font-family: var(--font-mono);
+    font-size: 14px;
+    font-weight: 700;
+    margin: 0 0 2px;
+  }
+  .panel-block .panel-sub { font-size: 11.5px; color: var(--muted); margin-bottom: 10px; font-family: var(--font-mono); }
+  .summary-chart-box { width: 100%; height: 260px; }
+  .summary-chart-box svg { width: 100%; height: 100%; display: block; overflow: visible; }
+
+  .view-tabs { display: flex; gap: 8px; margin-bottom: 14px; }
+  .view-tab {
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    font-weight: 700;
+    color: var(--muted);
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 8px 14px;
+    cursor: pointer;
+  }
+  .view-tab.active { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); }
+
+  .cut-tabs { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+  .cut-tab, .px-tab {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    font-weight: 600;
+    color: var(--muted);
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 5px 12px;
+    cursor: pointer;
+  }
+  .cut-tab.active, .px-tab.active { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); }
+  .analysis-img-box { width: 100%; background: #fff; border-radius: 10px; overflow: hidden; border: 1px solid var(--border); }
+  .analysis-img { width: 100%; display: block; }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 12px;
+  }
+  @media (max-width: 620px) {
+    .grid { grid-template-columns: 1fr; }
+  }
+
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 14px 16px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .card.repeat { border-color: var(--warn); border-style: dashed; }
+  .card.excluded { opacity: 0.55; }
+  .excl-tag { font-family: var(--font-mono); font-size: 10.5px; color: var(--muted); background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px; padding: 3px 7px; line-height: 1.45; }
+  .card-head { display: flex; align-items: center; justify-content: space-between; }
+  .pixel-id { font-family: var(--font-mono); font-size: 21px; font-weight: 700; letter-spacing: -0.02em; }
+  .pixel-id .px { font-size: 11px; color: var(--muted); font-weight: 500; margin-right: 3px; }
+  .pixel-id .repeat-tag { font-size: 11px; color: var(--warn); font-weight: 600; margin-left: 6px; vertical-align: middle; }
+  .pair-note { font-size: 11px; color: var(--muted); font-family: var(--font-mono); }
+  .badge {
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    padding: 3px 8px;
+    border-radius: 999px;
+    white-space: nowrap;
+  }
+  .badge.sig { background: var(--good-soft); color: var(--good); }
+  .badge.nsig { background: var(--bad-soft); color: var(--bad); }
+
+  .chart-box { width: 100%; height: 76px; }
+  .chart-box svg { width: 100%; height: 100%; display: block; }
+  .chart-axis { display: flex; justify-content: space-between; font-family: var(--font-mono); font-size: 9.5px; color: var(--muted); margin-top: -4px; }
+
+  .stats-row { display: grid; grid-template-columns: repeat(2, 1fr); gap: 6px 10px; font-family: var(--font-mono); }
+  .stat .v { font-size: 13.5px; font-weight: 600; }
+  .stat .k { font-size: 9.5px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; margin-top: 1px; }
+
+  .empty-state { color: var(--muted); font-size: 13px; padding: 40px 0; text-align: center; grid-column: 1 / -1; }
+
+  /* No-jump tab */
+  .nj-tools { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; font-family: var(--font-mono); font-size: 11.5px; color: var(--muted); margin-bottom: 8px; }
+  .nj-tools label { display: inline-flex; gap: 6px; align-items: center; cursor: pointer; }
+  .nj-tools input { accent-color: var(--accent); }
+  .nj-legend { display: flex; gap: 14px; flex-wrap: wrap; font-family: var(--font-mono); font-size: 11px; color: var(--muted); margin-top: 4px; }
+  .nj-legend i { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 5px; vertical-align: -1px; }
+
+  footer.note { margin-top: 8px; color: var(--muted); font-size: 11.5px; line-height: 1.6; }
+</style>
+
+<div class="wrap">
+  <header class="top">
+    <div>
+      <h1>g<sup>2</sup> Sweep</h1>
+      <div class="subtitle">Per-pixel bunching peaks, live from the automated SPAD sweep &middot; 100&nbsp;ps bins &middot; 20&nbsp;min/round</div>
+    </div>
+    <div class="status-panel">
+      <div class="status-row">
+        <span><span id="roundLabel">Round</span> <strong id="roundNow" class="tabnums">&ndash;</strong> / <strong id="roundTotal" class="tabnums">&ndash;</strong></span>
+        <span id="phaseChip" class="phase-chip">&ndash;</span>
+      </div>
+      <div class="bar-track"><div class="bar-fill" id="barFill"></div></div>
+      <div class="pixel-flow">
+        <span class="prev" id="prevPixels">&ndash;</span>
+        <span class="arrow" id="flowArrow"></span>
+        <span class="now" id="currentPixels">&ndash;</span>
+      </div>
+      <div class="status-bottom">
+        <span>updated</span>
+        <span id="updatedAt" class="tabnums">&ndash;</span>
+      </div>
+      <div class="status-bottom" id="netRow-master" style="margin-top:4px;" hidden>
+        <span>master (this PC) wifi</span>
+        <span id="netIp-master" class="tabnums">&ndash;</span>
+      </div>
+      <div class="status-bottom" id="netRow-node1" hidden>
+        <span>node1 ssh</span>
+        <span id="netIp-node1" class="tabnums">&ndash;</span>
+      </div>
+      <div class="status-bottom" id="netRow-node2" hidden>
+        <span>node2 wifi</span>
+        <span id="netIp-node2" class="tabnums">&ndash;</span>
+      </div>
+    </div>
+  </header>
+
+  <div class="view-tabs">
+    <button class="view-tab active" data-view="viewMain">Main sweep</button>
+    <button class="view-tab" data-view="viewReliability">Reliability &middot; px 151 / 164</button>
+    <button class="view-tab" data-view="viewNoJump">No-jump &middot; px 151</button>
+  </div>
+
+  <div id="viewMain">
+    <div class="summary-strip">
+      <div class="summary-tile"><div class="n tabnums" id="sumDone">0</div><div class="l">Pixels done</div></div>
+      <div class="summary-tile"><div class="n tabnums" id="sumSig">0</div><div class="l">Significant (SNR&ge;5.7)</div></div>
+      <div class="summary-tile"><div class="n tabnums">0.683 &plusmn; 0.010%</div><div class="l">&#10216;amplitude&#10217; (SNR&gt;6, n=49)</div></div>
+      <div class="summary-tile"><div class="n tabnums">1.24</div><div class="l">&chi;&sup2;/dof</div></div>
+    </div>
+
+    <div class="panel-block">
+      <h2>Best-fit Gaussian amplitude (fixed &sigma;) vs pixel</h2>
+      <div class="panel-sub">
+        Fixed-width (&sigma; = 70.7&nbsp;ps, the cross-node TDC instrument width) Gaussian fit to <strong>peak height</strong>,
+        as % of baseline &mdash; back from the free-&sigma; peak-<em>area</em> metric used 24-9-26&ndash;27-9-26: area/&sigma;
+        is a nonlinear ratio of two parameters that a free-&sigma; fit can't independently pin down once the peak
+        (FWHM &asymp; 166&nbsp;ps) spans only ~1.7 of these 100&nbsp;ps bins, so amplitude and fitted &sigma; are strongly
+        correlated under this binning; fixing &sigma; sidesteps that degeneracy at the cost of undercounting area on
+        runs whose peak is genuinely broadened (long-run clock drift). Poisson errors, validated against 3,063
+        off-peak null fits (pull RMS 0.99). Points trimmed by the active cut are still drawn, greyed out, for
+        context &mdash; they never enter the mean, &chi;&sup2;/dof or trend line. Static analysis &mdash; regenerate via
+        <code>tools/g2_analysis/</code> after new sweep data; last run 27-9-26 on the full 97-result set. Full
+        write-up: <code>tools/g2_analysis/CLAUDE.md</code>.
+        <br><br><strong>Split-peak cut</strong> (28-9-26, no SNR cut): all 97 results were searched with a 70.7&nbsp;ps matched filter.
+        A result is <em>split</em> when a second bunching component with MF-SNR&nbsp;&ge;&nbsp;3.5 sits at any whole multiple of &plusmn;100&nbsp;ns
+        (&plusmn;0.3&nbsp;ns) from the best matched-filter peak &mdash; the signature of the 100&nbsp;ns timing jumps seen in the
+        px&nbsp;151 reliability runs, which divide the signal and bias the single-peak amplitude low (~1 false flag expected
+        over the whole sweep). 10 results qualify (123&nbsp;rep, 139, 141, 143&nbsp;rep, 147, 147&nbsp;rep, 159, 159&nbsp;rep, 165&nbsp;rep, 175&nbsp;rep); they are
+        flagged <code>split_peak</code> in the database, drawn as grey open squares and excluded. Every other result is kept,
+        including non-detections, so &chi;&sup2;/dof here is dominated by low-SNR fits.
+      </div>
+      <div class="cut-tabs">
+        <button class="cut-tab active" data-img="imgSnr6">SNR &gt; 6</button>
+        <button class="cut-tab" data-img="imgPlee">p&#8347; &lt; 3.17&middot;10&#8315;&#8309; (4&sigma;)</button>
+        <button class="cut-tab" data-img="imgAmp">amplitude &gt; 0.55%</button>
+        <button class="cut-tab" data-img="imgNoSplit">split peaks excluded (no SNR cut)</button>
+      </div>
+      <div class="analysis-img-box">
+        <img id="imgSnr6" class="analysis-img" src="plots/amplitude_vs_pixel_fixed_sigma_snr6.png" alt="fixed-sigma amplitude vs pixel, SNR > 6">
+        <img id="imgPlee" class="analysis-img" hidden src="plots/amplitude_vs_pixel_fixed_sigma_plee4sigma.png" alt="fixed-sigma amplitude vs pixel, p_LEE < 3.17e-5 (4-sigma)">
+        <img id="imgAmp" class="analysis-img" hidden src="plots/amplitude_vs_pixel_fixed_sigma_gt0p55pct.png" alt="fixed-sigma amplitude vs pixel, amplitude > 0.55%">
+        <img id="imgNoSplit" class="analysis-img" hidden src="plots/amplitude_vs_pixel_fixed_sigma_nosplit.png" alt="fixed-sigma amplitude vs pixel, no SNR cut, split bunching peaks excluded">
+      </div>
+    </div>
+
+    <div class="grid" id="grid">
+      <div class="empty-state">Waiting for the first pixel to finish&hellip;</div>
+    </div>
+  </div>
+
+  <div id="viewReliability" hidden>
+    <div class="panel-block">
+      <h2>Repeat reliability check &middot; px 151 &amp; 164</h2>
+      <div class="panel-sub">
+        Up to 50 independent 20-min repeats, both pixels active simultaneously (identity pairs, one full
+        lSPAD reset + recalibration between repeats, same as the main sweep). Motivation: 151 has shown
+        inconsistent bunching across separate runs (present but at varying &tau;/strength, sometimes absent);
+        164 has looked rock solid every time. This tab exists to answer empirically whether the point-to-point
+        scatter here matches the quoted Poisson error bars, or whether 151 is genuinely unstable.
+        Each repeat is pushed live as its round finishes (fixed-&sigma; amplitude fit, same convention as the
+        main panel); the weighted mean/&chi;&sup2;/dof below update as repeats arrive &mdash; a &chi;&sup2;/dof
+        near 1 means the scatter is explained by the quoted errors, &raquo;1 means it isn't.
+        <br><br>Rounds flagged <code>excluded</code> in the database are drawn greyed out and do not enter the mean or
+        &chi;&sup2;/dof. Rule (applied 28-9-26): every round below the SNR&nbsp;5.7 cut was searched with a 70.7&nbsp;ps matched filter at
+        all 100&nbsp;ns timing-ladder positions; <em>split</em> = bunching found at &ge;2 positions (MF-SNR&nbsp;&ge;&nbsp;3), i.e. a timing
+        jump during the run divided the signal; <em>lost</em> = only one weak component, most signal missing. Weak rounds with a single
+        clean peak would have been kept &mdash; none occurred. px&nbsp;151: 7 split + 2 lost of 50; px&nbsp;164: none.
+      </div>
+      <div class="summary-strip" id="reliabilitySummary">
+        <div class="summary-tile"><div class="n tabnums">&ndash;</div><div class="l">px 151 &mdash; no fits yet</div></div>
+        <div class="summary-tile"><div class="n tabnums">&ndash;</div><div class="l">px 164 &mdash; no fits yet</div></div>
+      </div>
+    </div>
+
+    <div class="panel-block">
+      <h2>Amplitude vs repeat #</h2>
+      <div class="panel-sub" id="reliabilityChartSub">px 151 &mdash; no fits yet</div>
+      <div class="cut-tabs">
+        <button class="px-tab active" data-px="151">px 151</button>
+        <button class="px-tab" data-px="164">px 164</button>
+      </div>
+      <div class="summary-chart-box" id="reliabilityChartBox"></div>
+    </div>
+
+    <div class="grid" id="reliabilityGrid">
+      <div class="empty-state">Waiting for the first repeat to finish&hellip;</div>
+    </div>
+  </div>
+
+  <div id="viewNoJump" hidden>
+    <div class="panel-block">
+      <h2>px 151 with live timing-jump correction &middot; 50 &times; 20 min</h2>
+      <div class="panel-sub">
+        The px&nbsp;151 reliability sweep, repeated with the master-chip correction running live. Pixel 151 sits on the master chip,
+        whose clock can jump by a whole 100&nbsp;ns tick against the slave chip in the middle of a run; that is what split or lost
+        9 of the 50 earlier rounds. Here a dwell-marker tracker watches each node's master&minus;slave offset, and the correlator
+        removes a confirmed jump from the 151&times;151 time differences from that moment on (data already released stays as it was).
+        Pixel&nbsp;0, a slave-chip pixel, is kept active on both nodes only to supply the slave dwell markers; it is not correlated.
+        Everything else matches the main sweep: 100&nbsp;ps bins, 20-minute rounds, a full lSPAD reset and recalibration before each
+        round, fixed-&sigma; (70.7&nbsp;ps) amplitude fit. Every round is shown; a round with jumps is not dropped. Only a round whose
+        tracker never found a level (correction not running) is greyed out and left out of the mean. Each round is added about five
+        minutes after it ends, drawn like the other tabs: the raw histogram, &plusmn;200&nbsp;ns around its peak.
+      </div>
+      <div class="summary-strip" id="njSummary">
+        <div class="summary-tile"><div class="n tabnums">&ndash;</div><div class="l">rounds completed</div></div>
+      </div>
+    </div>
+
+    <div class="panel-block">
+      <h2>Amplitude vs round #</h2>
+      <div class="panel-sub" id="njChartSub">no rounds yet</div>
+      <div class="nj-tools">
+        <label for="njOverlay"><input type="checkbox" id="njOverlay"> overlay the earlier sweep of px 151, no correction (grey)</label>
+      </div>
+      <div class="summary-chart-box" id="njChartBox"></div>
+      <div class="nj-legend"><span><i style="background:#2a78d6"></i>live-corrected</span><span><i style="background:var(--muted);opacity:.7"></i>earlier, uncorrected (overlay)</span></div>
+    </div>
+
+    <div class="panel-block">
+      <h2>Timing jumps per round</h2>
+      <div class="panel-sub" id="njJumpSub">no rounds yet</div>
+      <div class="summary-chart-box" id="njJumpBox" style="height:170px"></div>
+      <div class="nj-legend"><span><i style="background:#2a78d6"></i>node 1 master chip</span><span><i style="background:#eb6834"></i>node 2 master chip</span></div>
+    </div>
+
+    <div class="grid" id="njGrid">
+      <div class="empty-state">Waiting for the first round to finish&hellip;</div>
+    </div>
+  </div>
+
+  <footer class="note">
+    p<sub>LEE</sub> (shown on each card) is a look-elsewhere-corrected p-value: the local Poisson p-value of the
+    tallest bin in the full &plusmn;500&nbsp;ns / 10,001-bin window, corrected for that many trials
+    (p<sub>LEE</sub> = 1&minus;(1&minus;p<sub>local</sub>)<sup>10001</sup>). A peak is counted as significant when its SNR &ge; 5.7. Each card shows the full &plusmn;200&nbsp;ns window at native 100&nbsp;ps
+    resolution; amplitude is a fixed-width Gaussian fit (&sigma; = 70.7&nbsp;ps, the cross-node TDC
+    instrument width) over a &plusmn;2&nbsp;ns window around the tallest bin, reported as % of baseline
+    &plusmn; 1&sigma; fit uncertainty.
+  </footer>
+</div>
+
+<script>
+(function () {
+  const $ = (id) => document.getElementById(id);
+  const grid = $('grid');
+  // significance: SNR >= 5.7
+  const SNR_SIG = 5.7;
+  const isSig = (d) => typeof d.snr === 'number' && d.snr >= SNR_SIG;
+  const HALF_WIN = 200; // ns shown either side of the peak
+
+  // each card's window is centred on that pixel's own fitted peak (mu_ns), not
+  // on zero delay -- the session-relative calibration offset means the peak
+  // can land anywhere across rounds, so a fixed 0-centred window sometimes
+  // didn't even include it.
+  function peakCentre(doc) { return doc.mu_ns; }
+  function fmtNs(x) {
+    const r = Math.round(x * 10) / 10;
+    return (r > 0 ? '+' : r < 0 ? '&minus;' : '') + Math.abs(r).toFixed(Number.isInteger(r) ? 0 : 1);
+  }
+  const cardsByPixel = new Map();
+  let latestDocs = [];
+
+  function fmtSci(x) {
+    if (x === 0) return '0';
+    if (x < 1e-3) {
+      const s = x.toExponential(1);
+      const [m, e] = s.split('e');
+      return m + '&middot;10' + toSup(parseInt(e, 10));
+    }
+    return x.toPrecision(2);
+  }
+  function toSup(n) {
+    const map = {'-':'⁻','0':'⁰','1':'¹','2':'²','3':'³','4':'⁴','5':'⁵','6':'⁶','7':'⁷','8':'⁸','9':'⁹'};
+    return String(n).split('').map(c => map[c] || c).join('');
+  }
+
+  function stairsPath(hist, W, H, pad, lo, hi) {
+    const { t0_ns, bin_width_ns } = hist;
+    const half = bin_width_ns / 2;
+    const iLo = Math.max(0, Math.ceil((lo - t0_ns) / bin_width_ns));
+    const iHi = Math.min(hist.counts.length - 1, Math.floor((hi - t0_ns) / bin_width_ns));
+    const counts = hist.counts.slice(iLo, iHi + 1);
+    const tStart = t0_ns + iLo * bin_width_ns;
+    const n = counts.length;
+    const lowC = Math.min.apply(null, counts), highC = Math.max.apply(null, counts);
+    const span = Math.max(highC - lowC, 1);
+    const xOf = (tns) => pad + ((tns - lo) / (hi - lo)) * (W - 2 * pad);
+    const yOf = (c) => H - pad - ((c - lowC) / span) * (H - 2 * pad);
+    const parts = [];
+    let prevY = null;
+    for (let i = 0; i < n; i++) {
+      const tCenter = tStart + i * bin_width_ns;
+      const xL = xOf(tCenter - half);
+      const xR = xOf(tCenter + half);
+      const y = yOf(counts[i]);
+      if (i === 0) {
+        parts.push('M ' + xL.toFixed(2) + ' ' + y.toFixed(2));
+      } else if (prevY !== y) {
+        parts.push('L ' + xL.toFixed(2) + ' ' + y.toFixed(2));
+      }
+      parts.push('L ' + xR.toFixed(2) + ' ' + y.toFixed(2));
+      prevY = y;
+    }
+    const d = parts.join(' ');
+    const peakI = counts.indexOf(highC);
+    const peakX = xOf(tStart + peakI * bin_width_ns);
+    const peakY = yOf(highC);
+    const dataL = xOf(tStart - half), dataR = xOf(tStart + (n - 1) * bin_width_ns + half);
+    return { d, peakX, peakY, dataL, dataR, baselineY: yOf(lowC + span * 0.15) };
+  }
+
+  function sparkSvg(doc) {
+    if (!doc.hist || !doc.hist.counts || !doc.hist.counts.length) return '';
+    const W = 400, H = 76, PAD = 3;
+    const c = peakCentre(doc), lo = c - HALF_WIN, hi = c + HALF_WIN;
+    const { d, peakX, peakY, dataL, dataR } = stairsPath(doc.hist, W, H, PAD, lo, hi);
+    const stroke = doc.significant ? 'var(--accent)' : 'var(--muted)';
+    const dot = doc.significant ? 'var(--good)' : 'var(--muted)';
+    const muX = PAD + ((doc.mu_ns - lo) / (hi - lo)) * (W - 2 * PAD);
+    // grey out the part of the window the stored histogram doesn't cover
+    let gaps = '';
+    if (dataL > PAD + 0.5) gaps += '<rect x="0" y="0" width="' + dataL.toFixed(1) + '" height="' + H + '" fill="var(--panel-2)"></rect>';
+    if (dataR < W - PAD - 0.5) gaps += '<rect x="' + dataR.toFixed(1) + '" y="0" width="' + (W - dataR).toFixed(1) + '" height="' + H + '" fill="var(--panel-2)"></rect>';
+    return '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none">' + gaps +
+      '<line x1="' + muX.toFixed(1) + '" y1="0" x2="' + muX.toFixed(1) + '" y2="' + H + '" stroke="' + (doc.significant ? 'var(--warn)' : 'var(--border)') + '" stroke-width="1" stroke-dasharray="2,2"></line>' +
+      '<path d="' + d + '" fill="none" stroke="' + stroke + '" stroke-width="1.1" stroke-linejoin="round"></path>' +
+      '<circle cx="' + peakX.toFixed(1) + '" cy="' + peakY.toFixed(1) + '" r="2.2" fill="' + dot + '"></circle>' +
+      '</svg>';
+  }
+
+  function cardHtml(doc) {
+    const sig = !!doc.significant;
+    const ampStr = (typeof doc.amp_pct === 'number' && typeof doc.amp_pct_err === 'number')
+      ? doc.amp_pct.toFixed(2) + '&plusmn;' + doc.amp_pct_err.toFixed(2) + '%' : '&ndash;';
+    return '' +
+      '<div class="card-head">' +
+        '<div class="pixel-id"><span class="px">px</span>' + doc.pixel + (doc.is_repeat ? ' <span class="repeat-tag">&times; repeat</span>' : '') + '</div>' +
+        '<span class="badge ' + (sig ? 'sig' : 'nsig') + '">' + (sig ? 'significant' : 'no peak') + '</span>' +
+      '</div>' +
+      '<div class="pair-note">round ' + doc.round + (doc.paired_with ? ' &middot; paired with px' + doc.paired_with : ' &middot; solo') + '</div>' +
+      (doc.split_peak ? '<div class="excl-tag" title="' + String(doc.split_reason || '').replace(/"/g, '&quot;') + '">' + (doc.split_reason || 'split peak') + '</div>' : '') +
+      (doc.excluded ? '<div class="excl-tag" title="' + String(doc.exclude_reason || '').replace(/"/g, '&quot;') + '">excluded from &chi;&sup2; &middot; ' +
+        (doc.exclude_class === 'split' ? 'split peak' : 'signal lost') + ' &mdash; ' + (doc.exclude_reason || '') + '</div>' : '') +
+      '<div class="chart-box">' + sparkSvg(doc) + '</div>' +
+      (doc.hist && doc.hist.counts && doc.hist.counts.length ? (function () { const c = peakCentre(doc);
+        return '<div class="chart-axis"><span>' + fmtNs(c - HALF_WIN) + ' ns</span><span>' + fmtNs(c) + '</span><span>' + fmtNs(c + HALF_WIN) + ' ns</span></div>'; })() : '') +
+      '<div class="stats-row">' +
+        '<div class="stat"><div class="v tabnums">' + doc.mu_ns.toFixed(2) + '</div><div class="k">&mu; (ns)</div></div>' +
+        '<div class="stat"><div class="v tabnums">' + (doc.snr != null ? doc.snr.toFixed(1) : '&ndash;') + '</div><div class="k">SNR</div></div>' +
+        '<div class="stat"><div class="v tabnums">' + ampStr + '</div><div class="k">amplitude</div></div>' +
+        '<div class="stat"><div class="v tabnums">' + fmtSci(doc.p_lee) + '</div><div class="k">p LEE</div></div>' +
+      '</div>';
+  }
+
+  // shared by both grids (main sweep + reliability); each keeps its own
+  // element cache so repeated onSnapshot renders patch cards in place
+  // instead of rebuilding the DOM.
+  function upsertCardInto(doc, cardMap) {
+    let el = cardMap.get(doc._id);
+    if (!el) {
+      el = document.createElement('div');
+      cardMap.set(doc._id, el);
+    }
+    el.className = 'card' + (doc.is_repeat ? ' repeat' : '') + (doc.excluded ? ' excluded' : '');
+    el.innerHTML = cardHtml(doc);
+    return el;
+  }
+  function upsertCard(doc) { return upsertCardInto(doc, cardsByPixel); }
+
+  // static amplitude analysis panel: just swaps which pre-rendered plot image
+  // is visible. The fit itself (bounded nonlinear least squares, Poisson
+  // weights, fixed sigma = 70.7 ps) runs in
+  // tools/g2_analysis/scripts/g2_analysis.py, not here -- reproducing that
+  // faithfully in JS wasn't worth the risk of drift.
+  function initCutTabs() {
+    const tabs = document.querySelectorAll('.cut-tab');
+    tabs.forEach(tab => {
+      tab.addEventListener('click', () => {
+        tabs.forEach(t => t.classList.remove('active'));
+        tab.classList.add('active');
+        document.querySelectorAll('.analysis-img').forEach(img => { img.hidden = true; });
+        const target = $(tab.dataset.img);
+        if (target) target.hidden = false;
+      });
+    });
+  }
+
+  function initViewTabs() {
+    const tabs = document.querySelectorAll('.view-tab');
+    tabs.forEach(tab => {
+      tab.addEventListener('click', () => {
+        tabs.forEach(t => t.classList.remove('active'));
+        tab.classList.add('active');
+        ['viewMain', 'viewReliability', 'viewNoJump'].forEach(id => { $(id).hidden = tab.dataset.view !== id; });
+      });
+    });
+  }
+
+  function renderAll(docs) {
+    docs.forEach(d => { d.significant = isSig(d); });
+    latestDocs = docs;
+    const empty = grid.querySelector('.empty-state');
+    if (empty) empty.remove();
+    docs.sort((a, b) => a.pixel - b.pixel || (!!a.is_repeat - !!b.is_repeat));
+    docs.forEach(upsertCard);
+    grid.innerHTML = '';
+    if (!docs.length) {
+      grid.innerHTML = '<div class="empty-state">Waiting for the first pixel to finish&hellip;</div>';
+    } else {
+      docs.forEach(d => grid.appendChild(cardsByPixel.get(d._id)));
+    }
+
+    const uniquePixels = new Set(docs.map(d => d.pixel)).size;
+    const nRepeats = docs.filter(d => d.is_repeat).length;
+    $('sumDone').textContent = uniquePixels + (nRepeats ? ' (+' + nRepeats + ' repeat)' : '');
+    $('sumSig').textContent = docs.filter(d => d.significant).length + ' / ' + docs.length;
+  }
+
+  // -------------------------------------------------------------------
+  // Reliability tab (px 151/164, up to 50-repeat campaign) -- its own
+  // grid/map, subscribed to a SEPARATE db collection so it can never
+  // collide with or clutter the main sweep's `results`. The weighted
+  // mean/chi2 here is plain inverse-variance arithmetic over already-fitted
+  // amp_pct/err values (no nonlinear fit), so it's safe to do live in JS
+  // rather than needing a static Python-regenerated image like the main
+  // panel above -- the same reasoning covers the round-series chart below.
+  // -------------------------------------------------------------------
+  const relCardsByPixel = new Map();
+  let latestReliabilityDocs = [];
+  let reliabilityPixelChoice = 151;
+  let reliabilityTotalRounds = 50;
+  const PX_COLOR = { 151: '#2a78d6', 164: '#eb6834' };
+
+  function wmean(vals, errs) {
+    let sw = 0, swv = 0;
+    for (let i = 0; i < vals.length; i++) { const w = 1 / (errs[i] * errs[i]); sw += w; swv += w * vals[i]; }
+    const m = swv / sw;
+    let chi2 = 0;
+    for (let i = 0; i < vals.length; i++) { const d = (vals[i] - m) / errs[i]; chi2 += d * d; }
+    return { mean: m, err: Math.sqrt(1 / sw), chi2dof: vals.length > 1 ? chi2 / (vals.length - 1) : NaN, n: vals.length };
+  }
+
+  function renderReliabilitySummary(docs) {
+    const box = $('reliabilitySummary');
+    const pixels = Array.from(new Set(docs.map(d => d.pixel))).sort((a, b) => a - b);
+    if (!pixels.length) {
+      box.innerHTML = '<div class="summary-tile"><div class="n tabnums">&ndash;</div><div class="l">px 151 &mdash; no fits yet</div></div>' +
+        '<div class="summary-tile"><div class="n tabnums">&ndash;</div><div class="l">px 164 &mdash; no fits yet</div></div>';
+      return;
+    }
+    box.innerHTML = pixels.map(px => {
+      const all = docs.filter(d => d.pixel === px && typeof d.amp_pct === 'number' && typeof d.amp_pct_err === 'number' && d.amp_pct_err > 0);
+      const rows = all.filter(d => !d.excluded);
+      const nEx = all.length - rows.length;
+      if (!rows.length) return '<div class="summary-tile"><div class="n tabnums">&ndash;</div><div class="l">px ' + px + ' &mdash; no fits yet</div></div>';
+      const s = wmean(rows.map(d => d.amp_pct), rows.map(d => d.amp_pct_err));
+      return '<div class="summary-tile"><div class="n tabnums">' + s.mean.toFixed(3) + '&plusmn;' + s.err.toFixed(3) + '%</div>' +
+        '<div class="l">px ' + px + ' (n=' + s.n + (nEx ? ', ' + nEx + ' excluded' : '') + ') &middot; &chi;&sup2;/dof ' + (isFinite(s.chi2dof) ? s.chi2dof.toFixed(2) : '&ndash;') + '</div></div>';
+    }).join('');
+  }
+
+  // 'Nice' tick step (1/2/5 x 10^k) for an axis spanning [lo, hi] into
+  // roughly `count` gridlines -- plain axis arithmetic, not a fit.
+  function niceTicks(lo, hi, count) {
+    if (!(hi > lo)) hi = lo + 1;
+    const raw = (hi - lo) / count;
+    const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+    const norm = raw / mag;
+    const step = (norm >= 5 ? 5 : norm >= 2 ? 2 : 1) * mag;
+    const start = Math.ceil(lo / step) * step;
+    const ticks = [];
+    for (let v = start; v <= hi + 1e-9; v += step) ticks.push(Math.round(v * 1e6) / 1e6);
+    return ticks;
+  }
+
+  // Amplitude +- error vs repeat #, one pixel at a time (toggled). x-axis
+  // always spans 1..reliabilityTotalRounds (50) even before every repeat
+  // has landed, so the chart itself shows how far into the campaign we are.
+  function roundSeriesSvg(rows, color) {
+    const W = 720, H = 230, padL = 40, padR = 10, padT = 10, padB = 26;
+    const innerW = W - padL - padR, innerH = H - padT - padB;
+    const maxX = Math.max(reliabilityTotalRounds, rows.length ? Math.max.apply(null, rows.map(r => r.round)) : 1, 1);
+    const xOf = (round) => padL + ((round - 0.5) / maxX) * innerW;
+
+    let yLo = 0, yHi = 1;
+    if (rows.length) {
+      const lo = Math.min.apply(null, rows.map(r => r.amp_pct - r.amp_pct_err));
+      const hi = Math.max.apply(null, rows.map(r => r.amp_pct + r.amp_pct_err));
+      const pad = Math.max((hi - lo) * 0.18, 0.02);
+      yLo = Math.max(0, lo - pad); yHi = hi + pad;
+    }
+    const yOf = (v) => padT + innerH - ((v - yLo) / (yHi - yLo)) * innerH;
+
+    const xTickStep = maxX > 20 ? 10 : 5;
+    const xTicks = [1];
+    for (let v = xTickStep; v <= maxX; v += xTickStep) if (v !== 1) xTicks.push(v);
+
+    let svg = '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none">';
+    niceTicks(yLo, yHi, 4).forEach(v => {
+      const y = yOf(v);
+      svg += '<line x1="' + padL + '" y1="' + y.toFixed(1) + '" x2="' + (W - padR) + '" y2="' + y.toFixed(1) + '" stroke="var(--grid-line)" stroke-width="1"></line>';
+      svg += '<text x="' + (padL - 6) + '" y="' + (y + 3).toFixed(1) + '" text-anchor="end" font-size="9" fill="var(--muted)" font-family="var(--font-mono)">' + v.toFixed(2) + '</text>';
+    });
+    xTicks.forEach(r => {
+      const x = xOf(r);
+      svg += '<text x="' + x.toFixed(1) + '" y="' + (H - padB + 14) + '" text-anchor="middle" font-size="9" fill="var(--muted)" font-family="var(--font-mono)">' + r + '</text>';
+    });
+    svg += '<text x="' + (padL + innerW / 2) + '" y="' + (H - 4) + '" text-anchor="middle" font-size="9.5" fill="var(--muted)" font-family="var(--font-mono)">repeat #</text>';
+
+    let stat = null;
+    if (rows.length) {
+      const used = rows.filter(r => !r.excluded);
+      stat = used.length ? wmean(used.map(r => r.amp_pct), used.map(r => r.amp_pct_err)) : null;
+    }
+    if (stat) {
+      const yMean = yOf(stat.mean), yBandLo = yOf(stat.mean - stat.err), yBandHi = yOf(stat.mean + stat.err);
+      svg += '<rect x="' + padL + '" y="' + Math.min(yBandLo, yBandHi).toFixed(1) + '" width="' + innerW +
+        '" height="' + Math.max(Math.abs(yBandHi - yBandLo), 0.5).toFixed(1) + '" fill="' + color + '" opacity="0.14"></rect>';
+      svg += '<line x1="' + padL + '" y1="' + yMean.toFixed(1) + '" x2="' + (W - padR) + '" y2="' + yMean.toFixed(1) +
+        '" stroke="' + color + '" stroke-width="1.2" stroke-dasharray="4,3"></line>';
+    }
+    rows.forEach(r => {
+      const x = xOf(r.round), yTop = yOf(r.amp_pct + r.amp_pct_err), yBot = yOf(r.amp_pct - r.amp_pct_err), y = yOf(r.amp_pct);
+      const col = r.excluded ? 'var(--muted)' : color, op = r.excluded ? ' opacity="0.5"' : '';
+      svg += '<line x1="' + x.toFixed(1) + '" y1="' + yTop.toFixed(1) + '" x2="' + x.toFixed(1) + '" y2="' + yBot.toFixed(1) +
+        '" stroke="' + col + '" stroke-width="1.3"' + op + '></line>';
+      svg += r.excluded
+        ? '<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="2.8" fill="var(--panel)" stroke="var(--muted)" stroke-width="1.2"' + op + '><title>round ' + r.round + ' excluded: ' + (r.reason || '').replace(/</g, '&lt;') + '</title></circle>'
+        : '<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="2.6" fill="' + color + '"><title>round ' + r.round + ': ' + r.amp_pct.toFixed(3) + ' ± ' + r.amp_pct_err.toFixed(3) + '%</title></circle>';
+    });
+    svg += '</svg>';
+    return { svg, stat };
+  }
+
+  function renderReliabilityChart() {
+    const rows = latestReliabilityDocs
+      .filter(d => d.pixel === reliabilityPixelChoice && typeof d.amp_pct === 'number' && typeof d.amp_pct_err === 'number' && d.amp_pct_err > 0)
+      .map(d => ({ round: d.round, amp_pct: d.amp_pct, amp_pct_err: d.amp_pct_err, excluded: !!d.excluded, reason: d.exclude_reason }))
+      .sort((a, b) => a.round - b.round);
+    const { svg, stat } = roundSeriesSvg(rows, PX_COLOR[reliabilityPixelChoice] || 'var(--accent)');
+    $('reliabilityChartBox').innerHTML = svg;
+    $('reliabilityChartSub').textContent = stat
+      ? ('px ' + reliabilityPixelChoice + ': n=' + stat.n + ', ' + stat.mean.toFixed(3) + ' ± ' + stat.err.toFixed(3) +
+         '%, χ²/dof ' + (isFinite(stat.chi2dof) ? stat.chi2dof.toFixed(2) : '–') +
+         (rows.some(r => r.excluded) ? ' · excluded (grey, open): rounds ' + rows.filter(r => r.excluded).map(r => r.round).join(', ') : '') +
+         (rows.length < reliabilityTotalRounds ? ' — ' + rows.length + '/' + reliabilityTotalRounds + ' repeats so far' : ''))
+      : ('px ' + reliabilityPixelChoice + ' — no fits yet');
+  }
+
+  function initPxTabs() {
+    const tabs = document.querySelectorAll('.px-tab');
+    tabs.forEach(tab => {
+      tab.addEventListener('click', () => {
+        tabs.forEach(t => t.classList.remove('active'));
+        tab.classList.add('active');
+        reliabilityPixelChoice = parseInt(tab.dataset.px, 10);
+        renderReliabilityChart();
+      });
+    });
+  }
+
+  function renderReliability(docs) {
+    docs.forEach(d => { d.significant = isSig(d); });
+    docs.sort((a, b) => a.pixel - b.pixel || (a.round - b.round));
+    latestReliabilityDocs = docs;
+    const relGrid = $('reliabilityGrid');
+    relGrid.innerHTML = '';
+    if (!docs.length) {
+      relGrid.innerHTML = '<div class="empty-state">Waiting for the first repeat to finish&hellip;</div>';
+    } else {
+      docs.forEach(d => relGrid.appendChild(upsertCardInto(d, relCardsByPixel)));
+    }
+    renderReliabilitySummary(docs);
+    renderReliabilityChart();
+    renderNoJumpAll();
+  }
+
+  // -------------------------------------------------------------------
+  // No-jump tab: px 151 with the live master-chip correction. Own collection
+  // (`nojump151`), so it never mixes with `results` or `reliability`. The
+  // amplitude numbers are already-fitted values (fixed-sigma, same convention
+  // as the reliability tab), so the weighted mean / chi2 here is plain
+  // inverse-variance arithmetic, done live in JS.
+  // -------------------------------------------------------------------
+  const njCards = new Map();
+  let njDocs = [];
+  let njTotalRounds = 50;
+  const NJ_BLUE = '#2a78d6', NJ_ORANGE = '#eb6834';
+
+  // A round's card is the same card the Main and Reliability tabs draw: the raw histogram, +-200 ns around its
+  // own peak (sparkSvg), with mu / SNR / amplitude / p LEE. The only addition is the round's timing jumps in the header line.
+  function njCardHtml(d) {
+    const nj = d.n_jumps || 0;
+    d.significant = isSig(d);
+    const sig = d.significant;
+    const ampStr = (typeof d.amp_pct === 'number' && typeof d.amp_pct_err === 'number')
+      ? d.amp_pct.toFixed(2) + '&plusmn;' + d.amp_pct_err.toFixed(2) + '%' : '&ndash;';
+    const jtxt = nj ? ' &middot; ' + nj + (nj === 1 ? ' timing jump' : ' timing jumps') + ' (' + (d.jumps || []).map(j => 'n' + j.node + ' ' + (j.delta_ns >= 0 ? '+' : '&minus;') + Math.abs(j.delta_ns).toFixed(0) + ' ns @ ' + j.t_s.toFixed(0) + ' s').join(', ') + ')' : ' &middot; no timing jumps';
+    const hasHist = d.hist && d.hist.counts && d.hist.counts.length;
+    return '' +
+      '<div class="card-head">' +
+        '<div class="pixel-id"><span class="px">round</span>' + d.round + '</div>' +
+        '<span class="badge ' + (sig ? 'sig' : 'nsig') + '">' + (sig ? 'significant' : 'no peak') + '</span>' +
+      '</div>' +
+      '<div class="pair-note">' + (d.completed_at || '') + jtxt + '</div>' +
+      (d.excluded ? '<div class="excl-tag">excluded from the mean &middot; ' + (d.exclude_reason || '') + '</div>' : '') +
+      '<div class="chart-box">' + sparkSvg(d) + '</div>' +
+      (hasHist ? (function () { const c = peakCentre(d);
+        return '<div class="chart-axis"><span>' + fmtNs(c - HALF_WIN) + ' ns</span><span>' + fmtNs(c) + '</span><span>' + fmtNs(c + HALF_WIN) + ' ns</span></div>'; })() : '') +
+      '<div class="stats-row">' +
+        '<div class="stat"><div class="v tabnums">' + (typeof d.mu_ns === 'number' ? d.mu_ns.toFixed(2) : '&ndash;') + '</div><div class="k">&mu; (ns)</div></div>' +
+        '<div class="stat"><div class="v tabnums">' + (typeof d.snr === 'number' ? d.snr.toFixed(1) : '&ndash;') + '</div><div class="k">SNR</div></div>' +
+        '<div class="stat"><div class="v tabnums">' + ampStr + '</div><div class="k">amplitude</div></div>' +
+        '<div class="stat"><div class="v tabnums">' + (typeof d.p_lee === 'number' ? fmtSci(d.p_lee) : '&ndash;') + '</div><div class="k">p LEE</div></div>' +
+      '</div>';
+  }
+
+  function njUpsertCard(d) {
+    let el = njCards.get(d._id);
+    if (!el) { el = document.createElement('div'); njCards.set(d._id, el); }
+    el.className = 'card' + (d.excluded ? ' excluded' : '');
+    el.innerHTML = njCardHtml(d);
+    return el;
+  }
+
+  function njFitRows(docs) {
+    return docs.filter(d => typeof d.amp_pct === 'number' && typeof d.amp_pct_err === 'number' && d.amp_pct_err > 0)
+      .map(d => ({ round: d.round, v: d.amp_pct, e: d.amp_pct_err, excluded: !!d.excluded, why: d.exclude_reason }))
+      .sort((a, b) => a.round - b.round);
+  }
+
+  function njSeriesSvg(rows, oldRows, showOld) {
+    const W = 720, H = 240, padL = 40, padR = 10, padT = 10, padB = 26;
+    const innerW = W - padL - padR, innerH = H - padT - padB;
+    const maxX = Math.max(njTotalRounds, rows.length ? Math.max.apply(null, rows.map(r => r.round)) : 1, 1);
+    const xOf = (round, dx) => padL + ((round - 0.5 + (dx || 0)) / maxX) * innerW;
+    const all = rows.concat(showOld ? oldRows : []);
+    let yLo = 0, yHi = 1;
+    if (all.length) {
+      const lo = Math.min.apply(null, all.map(r => r.v - r.e));
+      const hi = Math.max.apply(null, all.map(r => r.v + r.e));
+      const pad = Math.max((hi - lo) * 0.15, 0.02);
+      yLo = Math.max(0, lo - pad); yHi = hi + pad;
+    }
+    const yOf = (v) => padT + innerH - ((v - yLo) / (yHi - yLo)) * innerH;
+    let svg = '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none">';
+    niceTicks(yLo, yHi, 4).forEach(v => {
+      const y = yOf(v);
+      svg += '<line x1="' + padL + '" y1="' + y.toFixed(1) + '" x2="' + (W - padR) + '" y2="' + y.toFixed(1) + '" stroke="var(--grid-line)" stroke-width="1"></line>';
+      svg += '<text x="' + (padL - 6) + '" y="' + (y + 3).toFixed(1) + '" text-anchor="end" font-size="9" fill="var(--muted)" font-family="var(--font-mono)">' + v.toFixed(2) + '</text>';
+    });
+    const step = maxX > 20 ? 10 : 5;
+    const ticks = [1];
+    for (let v = step; v <= maxX; v += step) if (v !== 1) ticks.push(v);
+    ticks.forEach(r => {
+      svg += '<text x="' + xOf(r).toFixed(1) + '" y="' + (H - padB + 14) + '" text-anchor="middle" font-size="9" fill="var(--muted)" font-family="var(--font-mono)">' + r + '</text>';
+    });
+    svg += '<text x="' + (padL + innerW / 2) + '" y="' + (H - 4) + '" text-anchor="middle" font-size="9.5" fill="var(--muted)" font-family="var(--font-mono)">round #</text>';
+    if (showOld) {
+      oldRows.forEach(r => {
+        const x = xOf(r.round, -0.22);
+        svg += '<line x1="' + x.toFixed(1) + '" y1="' + yOf(r.v + r.e).toFixed(1) + '" x2="' + x.toFixed(1) + '" y2="' + yOf(r.v - r.e).toFixed(1) + '" stroke="var(--muted)" stroke-width="1" opacity="0.55"></line>';
+        svg += '<rect x="' + (x - 2.2).toFixed(1) + '" y="' + (yOf(r.v) - 2.2).toFixed(1) + '" width="4.4" height="4.4" fill="var(--muted)" opacity="0.7" transform="rotate(45 ' + x.toFixed(1) + ' ' + yOf(r.v).toFixed(1) + ')"><title>earlier sweep, round ' + r.round + ': ' + r.v.toFixed(3) + ' &plusmn; ' + r.e.toFixed(3) + '%</title></rect>';
+      });
+    }
+    const used = rows.filter(r => !r.excluded);
+    const stat = used.length ? wmean(used.map(r => r.v), used.map(r => r.e)) : null;
+    if (stat) {
+      const yM = yOf(stat.mean), yA = yOf(stat.mean - stat.err), yB = yOf(stat.mean + stat.err);
+      svg += '<rect x="' + padL + '" y="' + Math.min(yA, yB).toFixed(1) + '" width="' + innerW + '" height="' + Math.max(Math.abs(yB - yA), 0.5).toFixed(1) + '" fill="' + NJ_BLUE + '" opacity="0.14"></rect>';
+      svg += '<line x1="' + padL + '" y1="' + yM.toFixed(1) + '" x2="' + (W - padR) + '" y2="' + yM.toFixed(1) + '" stroke="' + NJ_BLUE + '" stroke-width="1.2" stroke-dasharray="4,3"></line>';
+    }
+    rows.forEach(r => {
+      const x = xOf(r.round), y = yOf(r.v);
+      const col = r.excluded ? 'var(--muted)' : NJ_BLUE;
+      svg += '<line x1="' + x.toFixed(1) + '" y1="' + yOf(r.v + r.e).toFixed(1) + '" x2="' + x.toFixed(1) + '" y2="' + yOf(r.v - r.e).toFixed(1) + '" stroke="' + col + '" stroke-width="1.3"' + (r.excluded ? ' opacity="0.5"' : '') + '></line>';
+      svg += r.excluded
+        ? '<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="2.8" fill="var(--panel)" stroke="var(--muted)" stroke-width="1.2"><title>round ' + r.round + ' excluded: ' + String(r.why || '').replace(/</g, '&lt;') + '</title></circle>'
+        : '<circle cx="' + x.toFixed(1) + '" cy="' + y.toFixed(1) + '" r="2.6" fill="' + NJ_BLUE + '"><title>round ' + r.round + ': ' + r.v.toFixed(3) + ' &plusmn; ' + r.e.toFixed(3) + '%</title></circle>';
+    });
+    return { svg: svg + '</svg>', stat };
+  }
+
+  function njJumpSvg(docs) {
+    const W = 720, H = 170, padL = 40, padR = 10, padT = 8, padB = 24;
+    const innerW = W - padL - padR, innerH = H - padT - padB;
+    const maxX = Math.max(njTotalRounds, docs.length ? Math.max.apply(null, docs.map(d => d.round)) : 1, 1);
+    const top = Math.max(2, Math.max.apply(null, docs.map(d => (d.n_jumps_node1 || 0) + (d.n_jumps_node2 || 0)).concat([0])));
+    const xOf = (round) => padL + ((round - 0.5) / maxX) * innerW;
+    const yOf = (v) => padT + innerH - (v / (top + 1)) * innerH;
+    const bw = Math.max(innerW / maxX * 0.7, 2);
+    let svg = '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="none">';
+    for (let v = 0; v <= top + 1; v++) {
+      const y = yOf(v);
+      svg += '<line x1="' + padL + '" y1="' + y.toFixed(1) + '" x2="' + (W - padR) + '" y2="' + y.toFixed(1) + '" stroke="var(--grid-line)" stroke-width="1"></line>';
+      svg += '<text x="' + (padL - 6) + '" y="' + (y + 3).toFixed(1) + '" text-anchor="end" font-size="9" fill="var(--muted)" font-family="var(--font-mono)">' + v + '</text>';
+    }
+    const step = maxX > 20 ? 10 : 5;
+    const ticks = [1];
+    for (let v = step; v <= maxX; v += step) if (v !== 1) ticks.push(v);
+    ticks.forEach(r => {
+      svg += '<text x="' + xOf(r).toFixed(1) + '" y="' + (H - padB + 14) + '" text-anchor="middle" font-size="9" fill="var(--muted)" font-family="var(--font-mono)">' + r + '</text>';
+    });
+    docs.forEach(d => {
+      const a = d.n_jumps_node1 || 0, b = d.n_jumps_node2 || 0, x = xOf(d.round) - bw / 2;
+      if (a) svg += '<rect x="' + x.toFixed(1) + '" y="' + yOf(a).toFixed(1) + '" width="' + bw.toFixed(1) + '" height="' + (yOf(0) - yOf(a)).toFixed(1) + '" fill="' + NJ_BLUE + '"><title>round ' + d.round + ': node 1 ' + a + '</title></rect>';
+      if (b) svg += '<rect x="' + x.toFixed(1) + '" y="' + yOf(a + b).toFixed(1) + '" width="' + bw.toFixed(1) + '" height="' + (yOf(a) - yOf(a + b)).toFixed(1) + '" fill="' + NJ_ORANGE + '"><title>round ' + d.round + ': node 2 ' + b + '</title></rect>';
+    });
+    return svg + '</svg>';
+  }
+
+  function renderNoJumpAll() {
+    const docs = njDocs;
+    const rows = njFitRows(docs);
+    const oldRows = njFitRows(latestReliabilityDocs.filter(d => d.pixel === 151)).map(r => Object.assign({}, r, { excluded: false }));
+    const showOld = $('njOverlay') && $('njOverlay').checked;
+    const { svg, stat } = njSeriesSvg(rows, oldRows, showOld);
+    $('njChartBox').innerHTML = svg;
+    const oldStat = oldRows.length > 1 ? wmean(oldRows.map(r => r.v), oldRows.map(r => r.e)) : null;
+    $('njChartSub').textContent = stat
+      ? ('live-corrected: n=' + stat.n + ', ' + stat.mean.toFixed(3) + ' ± ' + stat.err.toFixed(3) + '%, χ²/dof ' + (isFinite(stat.chi2dof) ? stat.chi2dof.toFixed(2) : '–') +
+         (oldStat ? ' · earlier uncorrected sweep (all ' + oldStat.n + ' rounds): ' + oldStat.mean.toFixed(3) + ' ± ' + oldStat.err.toFixed(3) + '%, χ²/dof ' + oldStat.chi2dof.toFixed(2) : '') +
+         (rows.length < njTotalRounds ? ' — ' + rows.length + '/' + njTotalRounds + ' rounds so far' : ''))
+      : 'no rounds yet';
+    $('njJumpBox').innerHTML = njJumpSvg(docs);
+    const nJ = docs.reduce((s, d) => s + (d.n_jumps || 0), 0), nR = docs.filter(d => (d.n_jumps || 0) > 0).length;
+    $('njJumpSub').textContent = docs.length ? (nJ + ' timing jump' + (nJ === 1 ? '' : 's') + ' in ' + docs.length + ' round' + (docs.length === 1 ? '' : 's') + '; ' + nR + ' round' + (nR === 1 ? '' : 's') + ' had at least one') : 'no rounds yet';
+
+    const tiles = [];
+    tiles.push('<div class="summary-tile"><div class="n tabnums">' + docs.length + ' / ' + njTotalRounds + '</div><div class="l">rounds completed</div></div>');
+    if (stat) {
+      tiles.push('<div class="summary-tile"><div class="n tabnums">' + stat.mean.toFixed(3) + '&plusmn;' + stat.err.toFixed(3) + '%</div><div class="l">amplitude, corrected (n=' + stat.n + ') &middot; &chi;&sup2;/dof ' + (isFinite(stat.chi2dof) ? stat.chi2dof.toFixed(2) : '&ndash;') + '</div></div>');
+    }
+    if (oldStat) {
+      tiles.push('<div class="summary-tile"><div class="n tabnums">' + oldStat.mean.toFixed(3) + '&plusmn;' + oldStat.err.toFixed(3) + '%</div><div class="l">earlier sweep, uncorrected (n=' + oldStat.n + ') &middot; &chi;&sup2;/dof ' + oldStat.chi2dof.toFixed(2) + '</div></div>');
+    }
+    tiles.push('<div class="summary-tile"><div class="n tabnums">' + nJ + '</div><div class="l">timing jumps &middot; ' + nR + ' round' + (nR === 1 ? '' : 's') + '</div></div>');
+    $('njSummary').innerHTML = tiles.join('');
+  }
+
+  function renderNoJump(docs) {
+    docs.sort((a, b) => b.round - a.round);
+    njDocs = docs.slice().sort((a, b) => a.round - b.round);
+    const g = $('njGrid');
+    g.innerHTML = '';
+    if (!docs.length) {
+      g.innerHTML = '<div class="empty-state">Waiting for the first round to finish&hellip;</div>';
+    } else {
+      docs.forEach(d => g.appendChild(njUpsertCard(d)));
+    }
+    renderNoJumpAll();
+  }
+
+  function initNoJump() {
+    const cb = $('njOverlay');
+    if (cb) cb.addEventListener('change', renderNoJumpAll);
+  }
+
+  function renderMeta(m) {
+    if (!m) return;
+    if (m.campaign === 'nojump151') {
+      const total = m.total_rounds || 50, done = m.completed || 0;
+      njTotalRounds = total;
+      $('roundLabel').textContent = 'No-jump sweep: completed';
+      $('roundNow').textContent = done;
+      $('roundTotal').textContent = total;
+      $('barFill').style.width = Math.min(100, (100 * done) / total) + '%';
+      const phase = m.phase || '–';
+      $('phaseChip').textContent = phase;
+      $('phaseChip').className = 'phase-chip' + (phase === 'resetting' ? ' resetting' : phase === 'complete' ? ' complete' : '');
+      $('currentPixels').textContent = 'px ' + (m.pixels || []).join('+') + ((m.prev_pixels || []).length ? ' (+ px ' + m.prev_pixels.join('+') + ' dummy)' : '');
+      $('prevPixels').textContent = (m.n_jumps_total != null) ? (m.n_jumps_total + ' jump' + (m.n_jumps_total === 1 ? '' : 's') + ' so far') : '';
+      $('flowArrow').textContent = (m.n_jumps_total != null) ? '·' : '';
+      $('updatedAt').textContent = m.updated_at || '';
+      renderNoJumpAll();
+      return;
+    }
+    $('roundLabel').textContent = m.campaign === 'repeat' ? 'Repeat round' : 'Round';
+    $('roundNow').textContent = m.round ?? '–';
+    $('roundTotal').textContent = m.total_rounds ?? '–';
+    const pct = m.total_rounds ? Math.min(100, (100 * (m.round - 1)) / m.total_rounds) : 0;
+    $('barFill').style.width = pct + '%';
+    const chip = $('phaseChip');
+    const phase = m.phase || '–';
+    chip.textContent = phase;
+    chip.className = 'phase-chip' + (phase === 'resetting' ? ' resetting' : phase === 'complete' ? ' complete' : '');
+    $('currentPixels').textContent = m.pixels && m.pixels.length ? ('now: px ' + m.pixels.join('+')) : '–';
+    if (m.prev_pixels && m.prev_pixels.length) {
+      $('prevPixels').textContent = 'prev: px ' + m.prev_pixels.join('+');
+      $('flowArrow').textContent = '→';
+    } else {
+      $('prevPixels').textContent = '';
+      $('flowArrow').textContent = '';
+    }
+    $('updatedAt').textContent = m.updated_at || '';
+    if (m.campaign === 'repeat' && m.total_rounds) {
+      reliabilityTotalRounds = m.total_rounds;
+      renderReliabilityChart();
+    }
+  }
+
+  async function boot() {
+    const db = await (window.claude && window.claude.use ? window.claude.use('db') : Promise.resolve(null));
+    if (!db) return;
+
+    db.collection('results').onSnapshot(
+      (snap) => renderAll(snap.docs.map(d => Object.assign({ _id: d.id }, d.data()))),
+      () => {}
+    );
+
+    db.collection('reliability').onSnapshot(
+      (snap) => renderReliability(snap.docs.map(d => Object.assign({ _id: d.id }, d.data()))),
+      () => {}
+    );
+
+    db.collection('nojump151').onSnapshot(
+      (snap) => renderNoJump(snap.docs.map(d => Object.assign({ _id: d.id }, d.data()))),
+      () => {}
+    );
+
+    db.doc('meta/status').onSnapshot(
+      (snap) => renderMeta(snap.exists ? snap.data() : null),
+      () => {}
+    );
+
+    db.doc('meta/network').onSnapshot(
+      (snap) => {
+        const data = snap.exists ? snap.data() : {};
+        ['master', 'node1', 'node2'].forEach((key) => {
+          const row = $('netRow-' + key);
+          const entry = data[key];
+          if (!entry || !entry.ip) { row.hidden = true; return; }
+          row.hidden = false;
+          $('netIp-' + key).textContent = entry.ip + (entry.checked_at ? ' (checked ' + entry.checked_at + ')' : '');
+        });
+      },
+      () => {}
+    );
+  }
+
+  initCutTabs();
+  initViewTabs();
+  initPxTabs();
+  initNoJump();
+  boot();
+})();
+</script>
+
+
+
