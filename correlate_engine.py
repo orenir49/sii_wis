@@ -417,7 +417,10 @@ class ChannelGraph:
                  check_monotonic: bool = False,
                  spill_dir: str | None = None,
                  spill_tail_bytes: int = DEFAULT_SPILL_TAIL_BYTES,
-                 clock=time.monotonic) -> None:
+                 clock=time.monotonic,
+                 shifters: dict | None = None,
+                 master_pixels: dict | None = None,
+                 retain_margin_ps: float = 0.0) -> None:
         self.tmax = float(tmax_ps)
         self.offset = int(offset)
         self.stall_grace_s = float(stall_grace_s)
@@ -432,6 +435,22 @@ class ChannelGraph:
         self.spill_dir = spill_dir
         self.spill_tail_bytes = int(spill_tail_bytes)
         self.clock = clock
+
+        # Master-chip timebase correction (tools/dwell_offset.py, chip_map.py). The master
+        # chip can jump a whole coarse tick relative to the slave chip mid-session, which
+        # moves every master pixel's stamps and nothing else. `shifters[node].steps()` is
+        # the confirmed piecewise-constant shift to subtract; `master_pixels[node]` says
+        # which channels it applies to. It is applied to the TIME DIFFERENCES handed to
+        # the kernel (a corrected copy inside release()) -- never to Channel.arr, so the
+        # stored timestamps, their sortedness and every retention decision stay in the
+        # chip's own clock. Default None/empty: behaviour is bit-identical to before.
+        self.shifters = dict(shifters) if shifters else {}
+        self.master_px = {n: frozenset((master_pixels or {}).get(n, ())) for n in (1, 2)}
+        # A shift moves a partner window by up to that much, so retention asks the partners
+        # for this much more data than tmax -- else the outer edge of the histogram would be
+        # short of partners on the shifted side only. 0 (the default) changes nothing.
+        self.retain_margin_ps = float(retain_margin_ps)
+        self.tmax_ret = self.tmax + self.retain_margin_ps
 
         self.pairs = [(p.p1, p.p2) for p in pair_list.pairs]
         self.partners1 = pair_list.partners_node1()
@@ -647,7 +666,7 @@ class ChannelGraph:
                 if c2.last_ts is None:
                     blocked = True      # partner still within its grace period
                     break
-                limits.append(c2.last_ts - self.tmax)
+                limits.append(c2.last_ts - self.tmax_ret)
             if blocked:
                 continue
             if not limits:
@@ -748,16 +767,49 @@ class ChannelGraph:
             t2_now[p2] = c2.arr
             c2.arr = c2.arr[self._keep_for(p2, c2):]
 
+        corrected: dict = {}        # (node, pixel) -> corrected copy, shared by every pair using it
         for p1, p2 in self.pairs:
             t1b = batches.get(p1)
             t2a = t2_now.get(p2)
             if t1b is None or t2a is None or t1b.size == 0 or t2a.size == 0:
                 continue
+            if self.shifters:
+                if p1 in self.master_px[1]:
+                    t1b = corrected.setdefault((1, p1), self._chip_corrected(1, t1b))
+                if p2 in self.master_px[2]:
+                    t2a = corrected.setdefault((2, p2), self._chip_corrected(2, t2a))
             rel.batches.append((p1, p2, t1b, t2a))
 
         self._spill_overflow()
         rel.waiting_on = self._waiting_report()
         return rel
+
+    def _chip_corrected(self, node: int, arr: np.ndarray) -> np.ndarray:
+        """`arr` with the master-chip shift in force taken out, as a new array; `arr` itself
+        (a view of Channel.arr) is left alone. Returns `arr` unchanged, no copy, in the common
+        case where no shift applies anywhere in it.
+
+        The shift is piecewise constant, so this costs one searchsorted per step plus one copy,
+        not a per-event lookup. A step inside `arr` moves the events after it by a whole tick,
+        which can put them before events just ahead of the step; the kernel needs sorted input,
+        so the copy is re-sorted -- only when that actually happened.
+        """
+        sh = self.shifters.get(node)
+        if sh is None or arr.size == 0:
+            return arr
+        steps = sh.steps()
+        if not steps or not any(s for _, s in steps):
+            return arr
+        starts = np.searchsorted(arr, np.array([t for t, _ in steps], dtype=np.int64), side='left')
+        edges = np.concatenate([[0], starts, [arr.size]])
+        shifts = [0] + [s for _, s in steps]
+        out = arr.copy()
+        for lo, hi, s in zip(edges[:-1], edges[1:], shifts):
+            if s and hi > lo:
+                out[lo:hi] -= s
+        if out.size > 1 and bool(np.any(out[1:] < out[:-1])):
+            out.sort()
+        return out
 
     def _reload_ready_spills(self) -> None:
         """Bring back any spilled node-1 data that this poll's cut would now
@@ -860,7 +912,7 @@ class ChannelGraph:
                 continue
             if c2.last_ts is None:
                 return None, False   # inside its grace period: wait, do not lose it
-            limits.append(c2.last_ts - self.tmax)
+            limits.append(c2.last_ts - self.tmax_ret)
         if not limits:
             return None, True        # every partner is dead: nothing to wait for
         return min(limits), False
@@ -913,7 +965,7 @@ class ChannelGraph:
             nxt = c1.next_needed()
             if nxt is None:
                 return 0            # partner has never delivered: keep everything
-            limits.append(nxt - self.tmax)
+            limits.append(nxt - self.tmax_ret)
         if not limits:
             return int(c2.arr.size)
         return int(np.searchsorted(c2.arr, min(limits), side='left'))

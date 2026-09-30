@@ -174,8 +174,13 @@ def test_end_to_end_comb():
         check('enable built a channel graph keyed by distinct pixel',
               w._graph is not None and set(w._graph.ch1) == set(range(150, 158))
               and set(w._graph.ch2) == set(range(150, 158)))
+        pix = lambda h: sorted(k for k in h if k < 320)
         check('hooks expose one queue per pixel per node',
-              len(w.hooks_node1) == 8 and len(w.hooks_node2) == 8)
+              len(pix(w.hooks_node1)) == 8 and len(pix(w.hooks_node2)) == 8)
+        # Pixels 150..157 include master-chip locations, so each node also hands the receiver this
+        # window's own dwell-marker queues (keys 320/323) for the chip-offset tracker.
+        check('master-chip pairs: each node also exposes its own dwell queues (320, 323)',
+              all(sorted(k for k in h if k >= 320) == [320, 323] for h in (w.hooks_node1, w.hooks_node2)))
 
         w.start_with_offset(OFFSET)
         check('start_with_offset begins accumulation at the given offset',

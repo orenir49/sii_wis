@@ -44,6 +44,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tools'))
 
 import pair_map
+import dwell_offset
+import chip_map
 from scipy.stats import poisson, norm
 
 from correlate_engine import PS_PER_S, ChannelGraph
@@ -51,6 +53,7 @@ from correlate_kernel import (PairPool, bin_edges, prewarm, rebin_diffs,
                               suggest_n_shift, tau_coverage_ps)
 from sii_calculator import SIICalculatorWindow
 
+CHIP_MARGIN_TICKS = 1.5   # extra partner data retained per side, in coarse ticks, when a chip shift can apply
 MAX_PAIRS = 320           # guard: grid mode is how you ask for 6400 by accident
 BACKLOG_WARN_S = 2.0
 POLL_MS = 5000            # how often to check the queues for a new batch --
@@ -219,6 +222,19 @@ class MultiCorrelateWindow(tk.Toplevel):
         self._diff_session_dir: str | None = None
         self._spill_session_dir: str | None = None
         self._result_q: queue.Queue = queue.Queue()
+        # Master-chip timebase correction (tools/dwell_offset.py, chip_map.py): the master
+        # chip can jump a whole coarse tick against the slave chip mid-session. Derive looks
+        # up each pair's chips; pairs holding a master-chip pixel are flagged, and their
+        # TIME DIFFERENCES are corrected inside ChannelGraph.release() from dwell markers.
+        self._master_px: dict = {1: frozenset(), 2: frozenset()}   # master-chip pixels in the derived pairs
+        self._chip_pairs: list = []                # (p1, p2) that contain one
+        self._trackers = {n: dwell_offset.DwellOffsetTracker() for n in (1, 2)}
+        # Own subscriber queues on keys 320 (master_dwell) / 323 (slave_dwell), per node --
+        # NodePanel's calibration drains its own, and two readers of one queue would steal
+        # markers from each other.
+        self._dwell_q = {n: (queue.Queue(), queue.Queue()) for n in (1, 2)}
+        self._chip_active = False                  # correction armed for this Enable
+        self._jump_log: list = []                  # (node, t_ps, delta_ps), as confirmed
         self._last_kernel_s = 0.0
         # Scale measurements the plan asks for at 4 -> 16 -> 80 pairs.
         self._kernel_s_total = 0.0
@@ -348,6 +364,9 @@ class MultiCorrelateWindow(tk.Toplevel):
         self.enable_btn.grid(row=0, column=0, padx=3)
         ttk.Button(btn, text='Disable', width=8, command=self._disable).grid(row=0, column=1, padx=3)
         ttk.Button(btn, text='Reset data', width=10, command=self._reset).grid(row=0, column=2, padx=3)
+        self.chip_corr_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(btn, text='Correct master-chip jumps', variable=self.chip_corr_var
+                        ).grid(row=0, column=5, padx=(14, 3))
         self.save_btn = ttk.Button(btn, text='Save .npz', width=10, command=self._save_npz)
         self.save_btn.grid(row=0, column=3, padx=(14, 3))
         ttk.Button(btn, text='Export pair → .txt', width=17,
@@ -357,6 +376,10 @@ class MultiCorrelateWindow(tk.Toplevel):
         self.status_var = tk.StringVar(value='Disabled.')
         self.status_lbl = ttk.Label(cfg, textvariable=self.status_var, anchor='w')
         self.status_lbl.grid(row=6, column=0, columnspan=6, sticky='w', padx=6, pady=(0, 4))
+        self.chip_var = tk.StringVar(value='')
+        ttk.Label(cfg, textvariable=self.chip_var, anchor='w', foreground='#555555',
+                  wraplength=760, justify='left').grid(row=7, column=0, columnspan=6, sticky='w',
+                                                       padx=6, pady=(0, 4))
 
         # ── plot ──────────────────────────────────────────────────────
         ff = ttk.LabelFrame(self, text='g² Histogram')
@@ -584,8 +607,14 @@ class MultiCorrelateWindow(tk.Toplevel):
             return
 
         self._pairs = pl
+        self._master_px = {1: chip_map.master_locs(p.p1 for p in pl.pairs),
+                           2: chip_map.master_locs(p.p2 for p in pl.pairs)}
+        self._chip_pairs = [(p.p1, p.p2) for p in pl.pairs
+                            if p.p1 in self._master_px[1] or p.p2 in self._master_px[2]]
         self.enable_btn.configure(state='normal')
-        self.pairs_var.set(pl.summary())
+        self.pairs_var.set(pl.summary() + (
+            f'  |  {len(self._chip_pairs)} pair(s) contain a master-chip pixel'
+            if self._chip_pairs else ''))
         # The status line has to move too. It said "Derive a pair list, then
         # Enable" from the end of the prewarm, and _derive only ever set it on
         # FAILURE -- so a successful derive left the window telling you to do the
@@ -620,14 +649,24 @@ class MultiCorrelateWindow(tk.Toplevel):
         for p1, p2, reason in pl.dropped[:10]:
             ttk.Label(top, foreground='#aa6600', anchor='w',
                       text=f'dropped {p1} → {p2}: {reason}').pack(fill='x', padx=8)
+        if self._chip_pairs:
+            ttk.Label(top, foreground='#0b5cad', anchor='w', wraplength=500,
+                      text=(f'MASTER-CHIP PIXELS: {len(self._chip_pairs)} pair(s) contain one '
+                            f'(node 1: {sorted(self._master_px[1]) or "none"}, node 2: '
+                            f'{sorted(self._master_px[2]) or "none"}). The master chip can jump '
+                            f'a whole 100 ns tick against the slave chip mid-run; the time '
+                            f'differences of these pairs are corrected from the dwell markers '
+                            f'once a jump is confirmed (not retroactively).')
+                      ).pack(fill='x', padx=8, pady=(2, 0))
 
-        cols = ('pix1', 'pix2', 'shared with', 'status')
+        cols = ('pix1', 'pix2', 'chips', 'shared with', 'status')
         tv = ttk.Treeview(top, columns=cols, show='headings', height=16)
-        for c, w in zip(cols, (70, 70, 130, 220)):
+        for c, w in zip(cols, (60, 60, 60, 110, 200)):
             tv.heading(c, text=c)
             tv.column(c, width=w, anchor='w')
-        for row in pair_map.preview_rows(pl, m1, m2):
-            tv.insert('', 'end', values=row)
+        for p, row in zip(pl.pairs, pair_map.preview_rows(pl, m1, m2)):
+            chips = f'{chip_map.chip_of_loc(p.p1)[0]}→{chip_map.chip_of_loc(p.p2)[0]}'
+            tv.insert('', 'end', values=(row[0], row[1], chips, row[2], row[3]))
         sb = ttk.Scrollbar(top, orient='vertical', command=tv.yview)
         tv.configure(yscrollcommand=sb.set)
         tv.pack(side='left', fill='both', expand=True, padx=(8, 0), pady=8)
@@ -712,11 +751,19 @@ class MultiCorrelateWindow(tk.Toplevel):
         except Exception as exc:
             self.status_var.set(f'Error: {exc}')
             return
-        self._graph = ChannelGraph(self._pairs, tmax, offset=0)
+        self._chip_active = bool(self.chip_corr_var.get()) and bool(self._chip_pairs)
+        if self._chip_active:
+            tracked = {n: self._trackers[n] for n in (1, 2) if self._master_px[n]}
+            self._graph = ChannelGraph(
+                self._pairs, tmax, offset=0, shifters=tracked, master_pixels=self._master_px,
+                retain_margin_ps=CHIP_MARGIN_TICKS * dwell_offset.TICK_PS)
+        else:
+            self._graph = ChannelGraph(self._pairs, tmax, offset=0)
         self._active = True
         self._set_accumulating(False)
         self.status_var.set(
             f'Enabled — {len(self._pairs)} pairs, waiting for DWELL calibration …')
+        self._update_chip_label()
 
     def _disable(self) -> None:
         self._active = False
@@ -826,17 +873,25 @@ class MultiCorrelateWindow(tk.Toplevel):
     # Hooks / calibration
     # ------------------------------------------------------------------
 
+    def _node_hooks(self, node: int, pixel_hooks: dict) -> dict:
+        """Pixel queues, plus this window's own dwell-marker queues (keys 320/323) for a node
+        that has a master-chip pixel in a pair -- those feed the chip-offset tracker."""
+        if self._chip_active and self._master_px[node]:
+            qm, qs = self._dwell_q[node]
+            return {**pixel_hooks, 320: qm, 323: qs}
+        return pixel_hooks
+
     @property
     def hooks_node1(self) -> dict:
         if not self._active or self._graph is None:
             return {}
-        return self._graph.hooks_node1
+        return self._node_hooks(1, self._graph.hooks_node1)
 
     @property
     def hooks_node2(self) -> dict:
         if not self._active or self._graph is None:
             return {}
-        return self._graph.hooks_node2
+        return self._node_hooks(2, self._graph.hooks_node2)
 
     def start_with_offset(self, offset: int) -> None:
         if not self._active or self._graph is None:
@@ -845,6 +900,7 @@ class MultiCorrelateWindow(tk.Toplevel):
         self._spill_session_dir = self._new_spill_session_dir()
         self._graph.set_spill_dir(self._spill_session_dir)
         self._offset = int(offset)
+        self._start_trackers()
         self._graph.start(offset=int(offset))
         self._hist.clear()
         self._counts.clear()
@@ -856,6 +912,84 @@ class MultiCorrelateWindow(tk.Toplevel):
     # ------------------------------------------------------------------
     # Polling
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Master-chip offset tracking
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _drain_i64(q: queue.Queue) -> np.ndarray:
+        chunks = []
+        while True:
+            try:
+                chunks.append(np.frombuffer(q.get_nowait(), dtype=np.int64))
+            except queue.Empty:
+                break
+        return np.concatenate(chunks) if chunks else np.empty(0, dtype=np.int64)
+
+    @staticmethod
+    def _session_tail(a: np.ndarray) -> np.ndarray:
+        """Markers from the newest session only. Each run's clock restarts near zero, so a
+        backwards step in a marker stream is a session boundary; anything before the last one
+        is a previous run's leftover and would poison this run's level."""
+        back = np.flatnonzero(np.diff(a) < 0)
+        return a[back[-1] + 1:] if back.size else a
+
+    def _start_trackers(self) -> None:
+        """A fresh tracker per run, preloaded with whatever dwell markers this run's session has
+        already delivered (the receiver calibrates for seconds before the correlator starts --
+        those markers are this session's and let the level be known at once)."""
+        self._jump_log = []
+        for n in (1, 2):
+            self._trackers[n] = dwell_offset.DwellOffsetTracker()
+            if self._graph is not None and n in self._graph.shifters:
+                self._graph.shifters[n] = self._trackers[n]
+            qm, qs = self._dwell_q[n]
+            m, s = self._session_tail(self._drain_i64(qm)), self._session_tail(self._drain_i64(qs))
+            if self._chip_active and self._master_px[n] and (m.size or s.size):
+                for j in self._trackers[n].feed(m, s):
+                    self._note_jump(n, j)
+        self._update_chip_label()
+
+    def _feed_trackers(self) -> None:
+        if not self._chip_active:
+            return
+        for n in (1, 2):
+            if not self._master_px[n]:
+                continue
+            qm, qs = self._dwell_q[n]
+            m, s = self._drain_i64(qm), self._drain_i64(qs)
+            if m.size or s.size:
+                for j in self._trackers[n].feed(m, s):
+                    self._note_jump(n, j)
+        self._update_chip_label()
+
+    def _note_jump(self, node: int, j) -> None:
+        self._jump_log.append((node, int(j.t_ps), float(j.delta_ps)))
+
+    def _update_chip_label(self) -> None:
+        if not self._chip_pairs:
+            self.chip_var.set('')
+            return
+        if not self._chip_active:
+            self.chip_var.set(f'Master-chip correction OFF ({len(self._chip_pairs)} pair(s) contain a '
+                              f'master-chip pixel; their peaks can split by whole 100 ns ticks).')
+            return
+        parts = []
+        for n in (1, 2):
+            if not self._master_px[n]:
+                continue
+            tr = self._trackers[n]
+            if tr.level_ps is None:
+                parts.append(f'node {n}: waiting for dwell markers')
+            else:
+                txt = f'node {n}: master−slave {tr.level_ps / 1e3:+.2f} ns'
+                if tr.jumps:
+                    txt += ', ' + '; '.join(f'JUMP {j.delta_ps / 1e3:+.1f} ns at {j.t_ps / 1e12:.1f} s'
+                                            for j in tr.jumps[-3:])
+                    txt += f' (shift now {tr.shift_of_level(tr.level_ps) / 1e3:+.0f} ns)'
+                parts.append(txt)
+        self.chip_var.set(f'Master-chip correction ({len(self._chip_pairs)} pair(s)): ' + '  |  '.join(parts))
 
     def _poll_data(self) -> None:
         try:
@@ -869,6 +1003,7 @@ class MultiCorrelateWindow(tk.Toplevel):
         if g is None or not self._accumulating:
             return
 
+        self._feed_trackers()
         g.drain_all()
         if self._correlating:
             return
@@ -1184,6 +1319,16 @@ class MultiCorrelateWindow(tk.Toplevel):
             'kernel_s_per_batch': (round(self._kernel_s_total / self._kernel_batches, 5)
                                    if self._kernel_batches else None),
             'masked_off': self._pairs.masked_off,
+            # Master-chip timebase correction: which pairs had it, and every step it applied.
+            # Steps are in each node's own master-clock seconds.
+            'chip_correction': {
+                'enabled': bool(self._chip_active),
+                'tick_ps': dwell_offset.TICK_PS, 'nominal_ps': dwell_offset.NOMINAL_PS,
+                'margin_ps': CHIP_MARGIN_TICKS * dwell_offset.TICK_PS,
+                'master_pixels': {str(n): sorted(self._master_px[n]) for n in (1, 2)},
+                'pairs_with_master_pixel': [list(k) for k in self._chip_pairs],
+                'nodes': {str(n): self._trackers[n].summary() for n in (1, 2) if self._master_px[n]},
+            },
             # exclusion_history, not the live flags: saving usually happens
             # after the stream has stopped, when every channel reads quiet and
             # the live flags are (correctly) all clear. The history is what

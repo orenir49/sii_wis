@@ -66,10 +66,17 @@ python tools\replay.py spad_data\captures\cap_node1.raw --outdir replay_out
 .venv\Scripts\python.exe tests\test_pixel_offsets.py
 .venv\Scripts\python.exe tests\test_multi_window.py
 .venv\Scripts\python.exe tests\test_write_lock.py
+.venv\Scripts\python.exe tests\test_chip_shift.py      # master-chip correction in ChannelGraph
+.venv\Scripts\python.exe tests\test_chip_window.py     # ...through the window, real tracker
+.venv\Scripts\python.exe tools\dwell_offset.py --selftest
+.venv\Scripts\python.exe chip_map.py --selftest
 .venv\Scripts\python.exe tools\raw_dump.py --selftest
 .venv\Scripts\python.exe tools\replay.py --selftest
 .venv\Scripts\python.exe correlate_kernel.py      # kernel equivalence
 .venv\Scripts\python.exe synthetic_source.py      # generator + comb
+
+# Master-chip vs slave-chip clock offset per node, from the saved dwell markers: prints the level and any jump
+python tools\dwell_offset.py [--dir spad_data\node2] [--json out.json]
 
 # SII bunching-excess / integration-time calculator
 python tools\sii_calculator.py
@@ -106,7 +113,9 @@ Minimal GUI that starts a command server thread on launch. Receives JSON command
 | `node.py` | Node GUI shell; starts command server thread |
 | `node_backend.py` | Command server + lSPAD TCP client; contains `PIXMAP` (320-pixel array mapping); logs abnormal marker ids live (see below) |
 | `correlate_multi.py` | `MultiCorrelateWindow` — **the only correlator**. Up to ~320 pairs, one plot + pair selector, `g²`/count-distribution views, `Compute R…`. `QuadCorrelateWindow` and `CorrelateWindow` were both retired into it 2026-08-26; it also owns the shared `pick_unit`/`_mark_peak_bin` display helpers |
-| `correlate_engine.py` | `ChannelGraph` — which events are safe to correlate and which must be kept. No Tk; 59 tests |
+| `correlate_engine.py` | `ChannelGraph` — which events are safe to correlate and which must be kept, and (optionally) the master-chip time-difference correction. No Tk; 59 + 20 tests |
+| `chip_map.py` | Which chip (master/slave) a pixel *location* is on, via the inverse `PIXMAP` — **not** `loc < 170`; `--selftest` |
+| `tools/dwell_offset.py` | `DwellOffsetTracker`: master − slave chip offset from the dwell markers, live or offline; finds the 100 ns jumps; `--selftest` |
 | `correlate_kernel.py` | `_pair_kernel` (`nogil`) + `PairPool`, and the reference `_multistart_multistop` it is proved bitwise identical to — moved here from `correlate.py` so the reference and the proof have one owner; `prewarm()` warms both; `--selftest` |
 | `synthetic_source.py` | Pulsed-laser / Poisson generator — drives the whole path with no detector attached |
 | `tools/sii_calculator_backend.py` | Pure formulas: `<\|V\|^2>`, coherence time, bunching-excess `R`, required integration time |
@@ -191,6 +200,10 @@ Retention (`ChannelGraph`) generalizes the two-pixel logic: a node-1 event is re
 Scale figures ride along with each run: the status line reports kernel ms/batch (last and mean), peak buffer and peak process RSS, and the saved `.npz` meta carries `n_pairs`, `peak_buffer_bytes`, `peak_rss_bytes`, `kernel_s_total`, `kernel_batches` and `kernel_s_per_batch` — so "what did 40 pairs cost" is answerable from a saved file rather than a screenshot. The buffer high-water mark lives on `ChannelGraph.peak_nbytes` (updated in `drain_all`, cleared by `start()`), not in the window: sampling it from the UI poll would miss the gated polls, which are exactly the ones holding the most. Peak RSS reads Windows' own `PeakWorkingSetSize` via ctypes — no polling loop can miss a spike, and it avoids adding `psutil` to `requirements.txt`, which every sender node installs from.
 
 Overload policy: the correlator's own RAM cap and "hold" behaviour were removed (`46e639a`). What bounds memory now is (a) disk spill for a *lagging partner* (`docs/lag_safe_correlator.md`), (b) `PairPool` splitting every pair into `t1` chunks (`CHUNK_EVENTS`; `DIFF_CHUNK_EVENTS` for the diffs kernel) run across all cores with a bounded in-flight window, so one busy pair is no longer a single-thread job, and (c) `ReceiverGUI._check_correlator_backlog`, which soft-stops the run once the correlator holds more than `CORRELATOR_BACKLOG_STOP_BYTES` (8 GB) in RAM — the case spill does not cover, a kernel slower than the data rate. What an overload *means* still depends on whether raw per-pixel timestamps are being kept (`set_write_to_disk()`, write-mode `timestamps` only): with writes on a backlog is a delay, with them off it is permanent photon loss.
+
+**Master-chip timebase jumps** (`chip_map.py`, `tools/dwell_offset.py`, `ChannelGraph(shifters=…)`). On 30-9-26 the master chip's stamps were found to jump by exactly **+100 ns** relative to the slave chip, once, 192 s into a 10-minute run on node 2 (from −98.7 to +1.3 ns, the normal level on both nodes). Only master-chip pixels move, so a pair containing one shows a **split peak** whose weight follows how long each side lasted (32/68 % there) — the pixel-151 splits of 27-9-26 (151 is a master location; 164 is slave). Both chips stamp every dwell event, so `master_dwell − slave_dwell` (~12 markers/s) measures the offset with no photons; `DwellOffsetTracker.feed()` takes the same key 320/323 chunks the receiver queues, in any chunk sizes (the result does not depend on the chunking), and a jump needs several agreeing off-level markers, so the ~4 % isolated markers ~16.7 ns off (either level) are counted but never a jump.
+
+*Which pairs.* Derive looks up each pixel's chip (`chip_map.chip_of_loc`) and flags pairs holding a master-chip pixel on either node (pair preview: chips column + banner; the status line under the buttons shows the live level and jumps). **Chip is decided by the lSPAD id (`id < 170` = slave) that `PIXMAP` sends to the location, not by `loc < 170`:** 159/161 are master, 160/162 slave. *What is corrected.* The **time differences** handed to the kernel, not the stored timestamps: `ChannelGraph.release()` builds a corrected copy (`_chip_corrected`) for a flagged channel only, from `tracker.steps()` — a piecewise-constant shift **quantised to whole 100 ns ticks** (every observed jump was exactly one tick, and a fresh level is only known to ~1 ns) with 0 ns as the nominal level; `Channel.arr` and every retention decision stay in the chip's own clock, and batches for unflagged channels are still zero-copy views. A step inside a batch can put shifted events ahead of earlier ones, so the copy is re-sorted only when that happened. Retention asks partners for `retain_margin_ps` (150 ns) more than `tmax`, since a shift moves the partner window. *When.* Only data released **after** a level or jump is confirmed is corrected — never retroactively, by design (a few seconds are allowed to be lost): a jump is confirmed about a second after it happens, and photons stamped inside the one marker gap around it (~83 ms at 12 Hz) are placed wrongly. The tracker is per run and resets with `start_with_offset`; it is preloaded with the session's own markers already queued during calibration, and markers from a previous session are dropped (a backwards step in the marker stream is a session boundary). The window reads its **own** subscriber queues on keys 320/323 for this (two readers of `NodePanel`'s queues would steal markers from each other); the "Correct master-chip jumps" checkbox is read at Enable, and the saved `.npz` meta carries `chip_correction` (flagged pairs, every level and jump, tick model). Validated on the real node-2 run: 45 s around the jump gave a raw 48.7 / 51.3 % split and, corrected, all weight at +2.6 ns with the total excess conserved (99.9 %).
 
 Output is one batched `.npz` (`tau_ps`, `hist (N, nbins)`, `px1`, `px2`, counts, JSON `meta`), written `.tmp` then `os.replace()`. **Export pair → .txt** emits the legacy `{px1}_{px2}_{suffix}.txt` that `tools/plot_g2_result.py` reads.
 
