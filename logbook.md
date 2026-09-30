@@ -424,3 +424,11 @@ Reverting to 2:1 fiber splitter, new spectral alignment.
     tau0 = 13.469 +/- 0.008 ns, sigma = 76.4 +/- 8.1 ps (FWHM 180.0 +/- 19.0 ps), amplitude 0.653 +/- 0.059% of baseline, SNR 7.8. Amplitude matches the 27-9-26 reliability-sweep estimate (~0.64%). 
   - Saved time diffs to disk, rebinned to 20 ps bins over +/-100 ns (`spad_data/151_151_compare_peak3_rebinned.txt`):
     sigma = 79.0 +/- 8.1 ps (FWHM 186.0 +/- 19.0 ps), amplitude 0.645 +/- 0.056% of baseline.
+
+## 30-09-26
+
+- Cross-node correlation of pixel 151 produces split peaks even on SB mode acquisition.
+  - Peak split check: 151_151_SB_splitcheck{1..6} are histograms taken with SB mode acquisition, ~15 minutes each at ~4 Mcps; most of them show a split peak.
+- Rules out T mode bug; points to hardware.
+- Hypothesis: one faulty master chip occasionally skipping coarse counts.
+- Cheap test: cross-talk analysis between pixels 159+160+161+162; slave+slave and master+master cross-talk peak should always be intact. If master chip is faulty, slave+master peak is expected to be split and possibly misplaced.
