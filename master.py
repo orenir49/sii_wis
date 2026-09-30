@@ -50,6 +50,10 @@ CAL_MAX_WAIT_S = 30.0             # backstop if a period never accumulates
 # the drive is full. Checked against free space, not a spill-size cap, so it
 # scales with whatever headroom this particular master actually has.
 SPILL_FREE_SPACE_FLOOR_BYTES = 100_000_000_000  # 100 GB
+# Live correlator RAM ceiling: past this the correlator is not keeping up with
+# arrival (spill only covers a lagging partner, not a slow kernel), so the run
+# is soft-stopped rather than left to grow until the master runs out of memory.
+CORRELATOR_BACKLOG_STOP_BYTES = 8_000_000_000  # 8 GB
 
 
 def merge_hooks(*hook_maps) -> dict:
@@ -927,6 +931,7 @@ class ReceiverGUI:
         self._write_locked_last = False
         self._run_id = 0
         self._low_disk_stop_triggered = False   # latched per run; see _check_disk_space
+        self._backlog_stop_triggered = False    # latched per run; see _check_correlator_backlog
         self._cal_waiting: set[int] = set()   # nodes whose first data chunk is still pending
         self._cal_run = -1                    # run_id that opened the current wait
         self._cal_armed_run = -1              # run_id whose cal window has been opened
@@ -1212,6 +1217,7 @@ class ReceiverGUI:
 
         self._run_id += 1
         self._low_disk_stop_triggered = False
+        self._backlog_stop_triggered = False
         self._set_cal_status('')
         mode = self.write_mode_var.get()
         note = ''
@@ -1725,6 +1731,7 @@ class ReceiverGUI:
         self.node2.health_check()
         self._refresh_write_mode_lock()
         self._check_disk_space()
+        self._check_correlator_backlog()
         self._schedule_health_check()
 
     def _check_disk_space(self) -> None:
@@ -1751,6 +1758,24 @@ class ReceiverGUI:
             f'{SPILL_FREE_SPACE_FLOOR_BYTES / 1e9:.0f} GB) — soft-stopping '
             f'acquisition to protect the disk. Likely cause: a node lagging '
             f'far enough behind to spill (see spad_data/spill/).\n')
+        self._end_run('soft')
+
+    def _check_correlator_backlog(self) -> None:
+        """Soft-stop a live acquisition whose correlator is falling behind.
+        Latched per run, same as _check_disk_space."""
+        if self._backlog_stop_triggered:
+            return
+        if not any(n.is_finishing() for n in (self.node1, self.node2)):
+            return
+        held = sum(c.backlog_bytes() for c in self._correlators)
+        if held <= CORRELATOR_BACKLOG_STOP_BYTES:
+            return
+        self._backlog_stop_triggered = True
+        self._enqueue_log(
+            f'⚠ Correlator holding {held / 1e9:.1f} GB in RAM (ceiling '
+            f'{CORRELATOR_BACKLOG_STOP_BYTES / 1e9:.0f} GB) — it is not keeping '
+            f'up with the data rate; soft-stopping acquisition before the '
+            f'master runs out of memory.\n')
         self._end_run('soft')
 
     # ------------------------------------------------------------------

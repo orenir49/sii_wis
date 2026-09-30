@@ -120,7 +120,7 @@ def install_sync_tick(w):
                 return
             if res[0] == 'err':
                 raise AssertionError(f'correlation error: {res[1]}')
-            _, hists, sizes, rel, dt, diffs = res
+            _, hists, sizes, rel, dt = res
             for key, h in hists.items():
                 cur = w._hist.get(key)
                 if cur is None or cur.shape != h.shape:
@@ -131,11 +131,6 @@ def install_sync_tick(w):
                 n1, n2 = sizes[key]
                 w._counts[key][0] += n1
                 w._counts[key][1] = max(w._counts[key][1], n2)
-            if diffs:
-                for key, arr in diffs.items():
-                    f = w._diff_files.get(key)
-                    if f is not None and arr.size:
-                        arr.tofile(f)
     w._poll_results_once = poll_once
 
 
