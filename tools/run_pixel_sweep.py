@@ -10,6 +10,13 @@ accumulate the g2 histogram live, save it, move to the next round's mask.
 Usage:
     python headless_sweep.py --dry-run             # ~90s smoke test, no real sweep
     python headless_sweep.py --rounds ROUNDS.json  # the real sweep
+
+    # Reliability campaign: repeat one fixed pixel set N times instead of
+    # sweeping across pixels (--together holds both/all --pixels active
+    # every round; --repeat repeats that same round, each its own
+    # round_summaries/<suffix>/round_NN_pixel_<p>.json for later fitting).
+    python run_pixel_sweep.py --together --repeat 10 --duration-s 1200 \\
+        --pixels 151,164 --suffix reliability_151_164
 """
 import argparse
 import json
@@ -21,6 +28,7 @@ import threading
 import time
 
 import numpy as np
+from scipy.stats import poisson
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
@@ -295,11 +303,36 @@ def full_reset_and_launch(pixels: list, log=print):
     report.
     """
     shutdown_lspad_both(log=log)
-    for nid, info in NODES.items():
-        dwell = sl.launch_node(info['host'], info['user'],
-                               mask_filename='',  # applied separately below
-                               log_fn=lambda s: None)
+
+    # Launch both nodes in parallel: each is its own SSH session to a
+    # different host (schtasks + up to LSPAD_LAUNCH_ATTEMPTS*20s of port
+    # waiting), and neither depends on the other's launch finishing first --
+    # doing them one after another just doubles the wall-clock cost of every
+    # round's reset for no reason.
+    launch_results: dict[int, tuple] = {}
+
+    def _launch(nid, info):
+        try:
+            dwell = sl.launch_node(info['host'], info['user'],
+                                   mask_filename='',  # applied separately below
+                                   log_fn=lambda s: None)
+            launch_results[nid] = (dwell, None)
+        except Exception as exc:
+            launch_results[nid] = (None, exc)
+
+    threads = [threading.Thread(target=_launch, args=(nid, info), daemon=True)
+              for nid, info in NODES.items()]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    for nid in NODES:
+        dwell, exc = launch_results[nid]
+        if exc is not None:
+            raise RuntimeError(f'node{nid} launch failed: {exc}') from exc
         log(f'[node{nid}] launched, dwell_freq={dwell}')
+
     apply_identity_mask(pixels, log=log)
     for nid, info in NODES.items():
         client = sl.ssh_connect(info['host'], info['user'])
@@ -370,13 +403,21 @@ def calibrate_offset(node1: NodeLink, node2: NodeLink, log=print) -> int:
     return offset
 
 
+class StreamStalledError(RuntimeError):
+    """One node stopped delivering data mid-round while its partner kept
+    going -- ChannelGraph's own exclusion, same as the live correlator GUI's
+    "LOSING COINCIDENCES" line (correlate_engine.ChannelGraph.status()).
+    Raised (rather than silently finishing the round on whatever partial
+    data arrived) so the caller's retry loop treats it as a failed attempt."""
+
+
 # ---------------------------------------------------------------------------
 # One round: acquire, correlate live, save
 # ---------------------------------------------------------------------------
 
 def run_round(node1: NodeLink, node2: NodeLink, pixels: list, offset: int,
               duration_s: float, need_calibration: bool, suffix: str,
-              log=print) -> dict:
+              log=print, hist_outdir: str | None = None) -> dict:
     pair_list = PairList(pairs=[Pair(p1=p, p2=p) for p in pixels], mode='identity')
     graph = ChannelGraph(pair_list, tmax_ps=TMAX_PS, offset=offset)
     node1.get_hooks_fn = lambda: graph.hooks_node1
@@ -425,11 +466,14 @@ def run_round(node1: NodeLink, node2: NodeLink, pixels: list, offset: int,
         finally:
             correlating = False
 
+    checkpoint_dir = hist_outdir or OUT_DIR
+    os.makedirs(checkpoint_dir, exist_ok=True)
+
     def save_checkpoint(note: str = ''):
         """Write the histogram accumulated so far -- same file the final
         save uses, so it's always safe to plot/tail mid-round."""
         for (p1, p2), h in hist.items():
-            out_path = os.path.join(OUT_DIR, f'{p1}_{p2}_{suffix}.txt')
+            out_path = os.path.join(checkpoint_dir, f'{p1}_{p2}_{suffix}.txt')
             with open(out_path, 'w') as f:
                 f.write('tau_ps\tcounts\n')
                 for c, v in zip(centers, h):
@@ -442,56 +486,107 @@ def run_round(node1: NodeLink, node2: NodeLink, pixels: list, offset: int,
     last_checkpoint = t_start
     stop_sent = False
     stop_sent_at = None
-    while node1.session_active.is_set() or node2.session_active.is_set():
-        time.sleep(POLL_S)
-        graph.drain_all()
-        if not correlating:
+    try:
+        while node1.session_active.is_set() or node2.session_active.is_set():
+            time.sleep(POLL_S)
+            graph.drain_all()
+            if not correlating:
+                rel = graph.release()
+                if rel.batches:
+                    correlating = True
+                    threading.Thread(target=correlate_bg, args=(rel.batches,),
+                                     daemon=True).start()
+                # Same check the live correlator GUI's status line makes: a
+                # channel excluded WHILE the stream is not idle means its
+                # partner is still delivering and this one has gone
+                # genuinely silent (stall_grace_s, ~30s) -- one node stopped
+                # streaming mid-round. graph.stream_idle guards the expected
+                # post-stop_soft() drain, where both sides going quiet
+                # together is the normal ending, not a failure.
+                if not graph.stream_idle:
+                    stalled = [c for c in graph.channels if c.excluded]
+                    if stalled:
+                        names = ', '.join(f'n{c.node}px{c.pixel}' for c in stalled)
+                        reason = stalled[0].exclude_reason
+                        log(f'LOSING COINCIDENCES: {len(stalled)} channel(s) excluded '
+                            f'({names}) — {reason} -- aborting this round\n')
+                        node1.abort()
+                        node2.abort()
+                        raise StreamStalledError(
+                            f'{len(stalled)} channel(s) excluded ({names}) — {reason}')
+            if time.time() - last_checkpoint >= CHECKPOINT_S:
+                last_checkpoint = time.time()
+                save_checkpoint()
+
+            if not stop_sent and time.time() - t_start >= duration_s:
+                log(f'{duration_s:.0f}s elapsed -- sending soft stop to both nodes')
+                node1.stop_soft()
+                node2.stop_soft()
+                stop_sent = True
+                stop_sent_at = time.time()
+
+            # T-mode finalizes quickly once STOP lands (~1s in practice per the
+            # docs) -- 180s past our own stop request is a generous safety net
+            # for a node that never reports 'done', not the normal exit path.
+            if stop_sent and time.time() - stop_sent_at > 180:
+                log('WARNING: 180s after STOP and a node still has not reported '
+                    'done -- stopping anyway')
+                break
+
+        # final drain after both sessions ended
+        for _ in range(3):
+            time.sleep(POLL_S)
+            graph.drain_all()
             rel = graph.release()
             if rel.batches:
-                correlating = True
-                threading.Thread(target=correlate_bg, args=(rel.batches,),
-                                 daemon=True).start()
-        if time.time() - last_checkpoint >= CHECKPOINT_S:
-            last_checkpoint = time.time()
-            save_checkpoint()
-
-        if not stop_sent and time.time() - t_start >= duration_s:
-            log(f'{duration_s:.0f}s elapsed -- sending soft stop to both nodes')
-            node1.stop_soft()
-            node2.stop_soft()
-            stop_sent = True
-            stop_sent_at = time.time()
-
-        # T-mode finalizes quickly once STOP lands (~1s in practice per the
-        # docs) -- 180s past our own stop request is a generous safety net
-        # for a node that never reports 'done', not the normal exit path.
-        if stop_sent and time.time() - stop_sent_at > 180:
-            log('WARNING: 180s after STOP and a node still has not reported '
-                'done -- stopping anyway')
-            break
-
-    # final drain after both sessions ended
-    for _ in range(3):
-        time.sleep(POLL_S)
-        graph.drain_all()
-        rel = graph.release()
-        if rel.batches:
-            keyed = [((p1, p2), t1, t2) for p1, p2, t1, t2 in rel.batches]
-            hists = pool.run(keyed, BIN_WIDTH_PS, TMAX_PS, nbins, NSHIFT)
-            for key, h in hists.items():
-                if key in hist:
-                    hist[key] += h
-                else:
-                    hist[key] = h.copy()
-    graph.stop()
-    pool.shutdown()
+                keyed = [((p1, p2), t1, t2) for p1, p2, t1, t2 in rel.batches]
+                hists = pool.run(keyed, BIN_WIDTH_PS, TMAX_PS, nbins, NSHIFT)
+                for key, h in hists.items():
+                    if key in hist:
+                        hist[key] += h
+                    else:
+                        hist[key] = h.copy()
+    finally:
+        graph.stop()
+        pool.shutdown()
 
     save_checkpoint(note='FINAL -- ')
     for (p1, p2), h in hist.items():
-        log(f'saved {os.path.join(OUT_DIR, f"{p1}_{p2}_{suffix}.txt")} '
+        log(f'saved {os.path.join(checkpoint_dir, f"{p1}_{p2}_{suffix}.txt")} '
             f'(sum={int(h.sum()):,})')
 
-    return {'offset': fitted_offset, 'hist_keys': list(hist.keys())}
+    return {'offset': fitted_offset, 'hist_keys': list(hist.keys()), 'hist': hist,
+            'centers': centers}
+
+
+# ---------------------------------------------------------------------------
+# Per-round point estimate: tallest-bin mu/snr/p_lee, in the same
+# "results document" shape tools/g2_analysis/scripts/g2_analysis.py's
+# fit_one() (and the live artifact's `results` collection) already expect --
+# see tools/g2_analysis/CLAUDE.md's data model. Not a Gaussian fit: this is
+# the cheap, dependency-free tallest-bin statistic the main sweep's
+# `p_lee`/`snr` fields already use (docs/highrate_sweep_progress.md), good
+# enough to flag round-to-round instability live; the Gaussian area/amplitude
+# fit (free or fixed sigma) is g2_analysis.py's job, offline, once every
+# round's histogram is in hand.
+# ---------------------------------------------------------------------------
+
+def summarize_round(pixel: int, round_idx: int, centers: np.ndarray, h: np.ndarray,
+                     bw_ps: float) -> dict:
+    baseline = float(np.median(h))
+    i_max = int(np.argmax(h))
+    n_max = float(h[i_max])
+    snr = (n_max - baseline) / np.sqrt(baseline) if baseline > 0 else float('nan')
+    p_local = float(poisson.sf(n_max - 1, baseline)) if baseline > 0 else 1.0
+    nbins = len(h)
+    p_lee = 1.0 - (1.0 - p_local) ** nbins
+    return {
+        'pixel': pixel, 'round': round_idx, 'is_repeat': False,
+        'mu_ns': float(centers[i_max]) / 1000.0,
+        'snr': float(snr), 'p_lee': float(p_lee),
+        'hist': {'t0_ns': float(centers[0]) / 1000.0, 'bin_width_ns': bw_ps / 1000.0,
+                 'counts': [int(v) for v in h]},
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -550,6 +645,27 @@ def main():
                          'middle of the sorted --pixels list), instead of the default '
                          'one-pixel-per-round order; a singleton round for the middle '
                          'pixel if the list has odd length')
+    ap.add_argument('--repeat', type=int, default=1,
+                    help='repeat the single --together round this many times (a '
+                         'reliability/reproducibility campaign on a fixed pixel set, '
+                         'rather than a sweep across pixels); only meaningful with '
+                         '--together. Each repeat gets its own filename suffix '
+                         '_repNN so rounds do not overwrite each other.')
+    ap.add_argument('--repeat-start', type=int, default=1,
+                    help='label the first round of this invocation as this repeat '
+                         'number instead of 1 (e.g. --repeat-start 10 when resuming '
+                         'a reliability campaign whose reps 1-9 already ran); only '
+                         'affects the _repNN filename suffix, not --repeat\'s count.')
+    ap.add_argument('--total-rounds', type=int, default=None,
+                    help='override the total-round count written to sweep_status.json '
+                         "(default: len(rounds)) -- for a campaign resumed across "
+                         'multiple invocations, this is the overall target (e.g. 50), '
+                         'not just this invocation\'s own --repeat count.')
+    ap.add_argument('--hist-outdir', default=None,
+                    help='directory for the per-round {p1}_{p2}_{suffix}.txt histogram '
+                         'files (default: spad_data/, alongside sweep_status.json and '
+                         'round_summaries/). Status and round summaries always stay '
+                         'under spad_data/ -- only the raw histograms move.')
     args = ap.parse_args()
 
     if args.pixels:
@@ -562,7 +678,7 @@ def main():
                   171, 172, 173, 174, 175, 176, 177, 178, 179, 180, 181]
 
     if args.together:
-        rounds = [pixels]
+        rounds = [pixels] * max(1, args.repeat)
     elif args.pairs:
         rounds = build_rounds_pairs(pixels)
     else:
@@ -598,11 +714,11 @@ def main():
             node2.reconnect_ctrl()
         time.sleep(1.0)
 
-    def save_plots(pixels_r, log=print):
+    def save_plots(pixels_r, suffix, log=print):
         import subprocess
-        plot_outdir = os.path.join(ROOT, 'figs', today_tag(), args.suffix)
+        plot_outdir = os.path.join(ROOT, 'figs', today_tag(), suffix)
         for p in pixels_r:
-            path = os.path.join(OUT_DIR, f'{p}_{p}_{args.suffix}.txt')
+            path = os.path.join(args.hist_outdir or OUT_DIR, f'{p}_{p}_{suffix}.txt')
             if not os.path.exists(path):
                 continue
             try:
@@ -616,16 +732,18 @@ def main():
                 log(f'plot generation FAILED for pixel {p}: {exc.stderr}')
 
     status_path = os.path.join(OUT_DIR, 'sweep_status.json')
+    total_rounds = args.total_rounds or len(rounds)
 
     def write_status(i, pixels_r, attempt, phase):
+        overall_round = args.repeat_start + i
         with open(status_path, 'w') as f:
             json.dump({
-                'round': i + 1, 'total_rounds': len(rounds), 'pixels': pixels_r,
+                'round': overall_round, 'total_rounds': total_rounds, 'pixels': pixels_r,
                 'attempt': attempt, 'phase': phase,
                 'round_started_at': round_t0,
                 'elapsed_this_round_s': round(time.time() - round_t0, 1),
                 'round_duration_s': duration,
-                'eta_s': round((len(rounds) - i - 1) * duration, 0),
+                'eta_s': round(max(total_rounds - overall_round, 0) * duration, 0),
                 'updated_at': time.strftime('%Y-%m-%d %H:%M:%S'),
             }, f, indent=2)
 
@@ -638,31 +756,72 @@ def main():
     # master.py's GUI does on every Start.
     failed_rounds = []
     for i, pixels_r in enumerate(rounds):
-        print(f'\n=== round {i+1}/{len(rounds)}: pixels {pixels_r} ===')
+        overall_round = args.repeat_start + i
+        print(f'\n=== round {overall_round}/{total_rounds}: pixels {pixels_r} ===')
         round_t0 = time.time()
+
+        # Repeats of an identical --together pixel set would otherwise all
+        # write {p1}_{p2}_{suffix}.txt and clobber each other; give each
+        # repeat its own suffix, numbered by OVERALL repeat (--repeat-start +
+        # i), not this invocation's own round index -- so a resumed campaign
+        # (--repeat-start 10 picking up after reps 1-9 ran in an earlier
+        # invocation) produces rep10, rep11, ... directly, with no separate
+        # renumbering step needed afterward. A plain sweep's rounds already
+        # differ by pixel number, so this only changes behaviour when
+        # --repeat > 1.
+        round_suffix = args.suffix if args.repeat <= 1 else f'{args.suffix}_rep{overall_round:02d}'
 
         for attempt in range(1, 4):
             write_status(i, pixels_r, attempt, 'resetting')
-            bring_up_fresh(pixels_r, log=print)
-            round_t0 = time.time()   # bring-up time doesn't count against the exposure clock
-            write_status(i, pixels_r, attempt, 'running')
-            result = run_round(node1, node2, pixels_r, 0, duration,
-                               need_calibration=True, suffix=args.suffix, log=print)
+            # bring_up_fresh (a launch or relaunch failure, after its own
+            # internal retries are exhausted) and run_round (a mid-round
+            # StreamStalledError, or anything else) can both raise -- caught
+            # here so a single bad attempt retries with a fresh reset instead
+            # of crashing the whole multi-hour sweep, same as a node.error
+            # or empty result below.
+            try:
+                bring_up_fresh(pixels_r, log=print)
+                round_t0 = time.time()   # bring-up time doesn't count against the exposure clock
+                write_status(i, pixels_r, attempt, 'running')
+                result = run_round(node1, node2, pixels_r, 0, duration,
+                                   need_calibration=True, suffix=round_suffix, log=print,
+                                   hist_outdir=args.hist_outdir)
+            except Exception as exc:
+                print(f'round {overall_round} attempt {attempt} FAILED with '
+                      f'{type(exc).__name__}: {exc} -- retrying with a full reset'
+                      if attempt < 3 else
+                      f'round {overall_round} FAILED after {attempt} attempts '
+                      f'({type(exc).__name__}: {exc}) -- giving up on it')
+                continue
             ok = (not node1.error and not node2.error and result['hist_keys'])
             if ok:
-                print(f'round {i+1} done (attempt {attempt}): {result}')
-                save_plots(pixels_r, log=print)
+                print(f'round {overall_round} done (attempt {attempt}): offset={result["offset"]:+,}ps '
+                      f'hist_keys={result["hist_keys"]}')
+                save_plots(pixels_r, round_suffix, log=print)
+                for p in pixels_r:
+                    h = result['hist'].get((p, p))
+                    if h is None:
+                        continue
+                    row = summarize_round(p, overall_round, result['centers'], h, BIN_WIDTH_PS)
+                    row['suffix'] = round_suffix
+                    summary_dir = os.path.join(OUT_DIR, 'round_summaries', args.suffix)
+                    os.makedirs(summary_dir, exist_ok=True)
+                    summary_path = os.path.join(summary_dir, f'round_{overall_round:02d}_pixel_{p}.json')
+                    with open(summary_path, 'w') as f:
+                        json.dump(row, f, indent=1)
+                    print(f'  pixel {p}: mu={row["mu_ns"]:+.2f}ns snr={row["snr"]:.2f} '
+                          f'p_lee={row["p_lee"]:.2e} -> {summary_path}')
                 break
-            print(f'round {i+1} attempt {attempt} FAILED '
+            print(f'round {overall_round} attempt {attempt} FAILED '
                   f'(node1.error={node1.error!r}, node2.error={node2.error!r}, '
                   f'hist_keys={result["hist_keys"]}) -- retrying with a full reset'
                   if attempt < 3 else
-                  f'round {i+1} FAILED after {attempt} attempts -- giving up on it')
+                  f'round {overall_round} FAILED after {attempt} attempts -- giving up on it')
         else:
             failed_rounds.append(pixels_r)
 
     with open(status_path, 'w') as f:
-        json.dump({'phase': 'complete', 'total_rounds': len(rounds),
+        json.dump({'phase': 'complete', 'total_rounds': total_rounds,
                    'failed_rounds': failed_rounds,
                    'updated_at': time.strftime('%Y-%m-%d %H:%M:%S')}, f, indent=2)
     print('\nSweep complete.')

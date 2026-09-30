@@ -30,6 +30,14 @@ LSPAD_SUBDIR      = 'lSPAD_standalone_win64'
 LSPAD_EXE         = 'lSPAD.exe'
 SPAD_PORT         = 9999
 
+# A launch that never opens its port (no desktop session, a GUI init hang,
+# etc.) used to be one 40s wait then a hard failure -- observed live, 27-9-26,
+# halting a multi-hour sweep on a single bad attempt. A shorter per-attempt
+# wait with retries recovers a transient miss far faster, and still gives up
+# (raises) only after this many CONSECUTIVE misses.
+LSPAD_LAUNCH_TIMEOUT_S = 20
+LSPAD_LAUNCH_ATTEMPTS  = 3
+
 
 # ---------------------------------------------------------------------------
 # SSH helpers
@@ -511,19 +519,26 @@ def launch_node(host: str, username: str,
                 f'lSPAD.exe not found under {LSPAD_SEARCH_ROOT}\\{LSPAD_SUBDIR}')
         log_fn(f'lSPAD found: {lspad_dir}\n')
 
-        # 2. Start lSPAD.exe with GUI on remote desktop
+        # 2-3. Start lSPAD.exe with GUI on remote desktop, waiting for its TCP
+        #    port each attempt. Retries the launch itself (not just the wait)
+        #    up to LSPAD_LAUNCH_ATTEMPTS times before giving up -- a relaunch
+        #    that misses once is usually just slow, not dead.
         lspad_exe = lspad_dir + '\\' + LSPAD_EXE
-        # Must run in the interactive session — see start_interactive().
-        start_interactive(client, lspad_exe, 'GUI', username)
-        log_fn('lSPAD.exe started — waiting for TCP port …\n')
-
-        # 3. Wait for lSPAD to accept connections, then let it finish initialising
-        if not wait_for_port(client, lspad_port, timeout=40):
+        for attempt in range(1, LSPAD_LAUNCH_ATTEMPTS + 1):
+            # Must run in the interactive session — see start_interactive().
+            start_interactive(client, lspad_exe, 'GUI', username)
+            log_fn(f'lSPAD.exe started (attempt {attempt}/{LSPAD_LAUNCH_ATTEMPTS}) '
+                   f'— waiting for TCP port …\n')
+            if wait_for_port(client, lspad_port, timeout=LSPAD_LAUNCH_TIMEOUT_S):
+                log_fn('lSPAD TCP port ready.\n')
+                break
+            log_fn(f'lSPAD did not open port {lspad_port} within '
+                   f'{LSPAD_LAUNCH_TIMEOUT_S} s (attempt {attempt}/{LSPAD_LAUNCH_ATTEMPTS}).\n')
+        else:
             raise RuntimeError(
-                f'lSPAD did not open port {lspad_port} within 40 s — is '
-                f'{username} logged on at the console? A GUI app cannot start '
-                f'without a desktop session.')
-        log_fn('lSPAD TCP port ready.\n')
+                f'lSPAD did not open port {lspad_port} after {LSPAD_LAUNCH_ATTEMPTS} '
+                f'attempts of {LSPAD_LAUNCH_TIMEOUT_S} s each — is {username} logged '
+                f'on at the console? A GUI app cannot start without a desktop session.')
         time.sleep(2)   # let lSPAD finish GUI/hardware init before sending commands
 
         # 4. Apply pixel mask (generated single-pixel mask takes priority over a manual filename)

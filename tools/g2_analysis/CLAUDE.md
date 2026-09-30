@@ -202,3 +202,70 @@ storage and couldn't be fit at all.
 
 Saved copies of this run's plots + fit CSV/JSON: `figs/24-9-26/g2_area_analysis/`. Logbook
 entry: `logbook.md` under `## 24-09-26`.
+
+---
+
+## 9. Dashboard state (updated 27-9-26): back to fixed-σ amplitude as the default metric
+
+**This goes back to the pre-24-9-26 amplitude approach, on the user's explicit instruction** — see
+§8's own rule against quietly reverting: this is being said clearly, not quietly. The user's
+reasoning: assuming a *constant* instrument jitter, bunching rate R scales peak height directly (a
+matched-filter-style metric), which is more physically direct than area — but §4 already showed
+jitter (fitted σ) is **not** constant (68.5 ps first measurements vs 77.9 ps repeats). The
+resolution adopted here: **fix σ at the 70.7 ps instrument width rather than fitting it free.**
+Free-σ amplitude (dN/σ) was considered and rejected first — see the discussion this session:
+with the peak's FWHM (≈166 ps) spanning only ~1.7 of the stored 100 ps bins, a free-σ fit can't
+independently pin down σ and dN from so few informative bins, so amplitude and fitted σ are
+strongly (anti-)correlated (check `C[1,3]` in `fit_one`'s Jacobian covariance against `C[1,1]`,
+`C[3,3]` — not yet surfaced as an output field, but trivial to add if this needs re-litigating).
+Fixing σ removes that degeneracy entirely, at the accepted cost of undercounting true area on any
+run whose peak really is broadened (the same bias §4 measured for the old fixed-σ dN/N: ratio
+0.952 vs free-σ on repeats). Nobody has yet run the toy-MC check (inject known amplitude/σ at the
+real bin width and count levels, refit, look for bias) that would settle whether the σ-vs-run-length
+trend itself is a real clock-drift effect or partly an artifact of free-σ fitting at this
+resolution — that MC is still open work, not done here.
+
+- **Formula:** `fit_one(doc, fixed_sigma=True)` now also returns `amplitude_pct` /
+  `amplitude_pct_err` = `100 * dN_over_N * K`, `K = erf(bw / (2·σ_instr·√2))` (the fraction of a
+  unit-area Gaussian at fixed σ=70.7 ps falling in a bin centred on the peak; ≈0.52 at 100 ps
+  bins). No extra covariance term is needed versus a free-σ amplitude, precisely because σ is
+  exact here, not fitted — that's the whole point of fixing it. These fields are `None` on the
+  free-σ path (`--fixed-sigma` not passed) rather than propagating a meaningless error.
+- **Three cuts, not two:** `select()`/`_plot()` in `scripts/g2_analysis.py` now take a `field` +
+  `op` (`gt`/`ge`/`lt`) instead of being hardwired to `snr`, and a new `plot-amp` subcommand drives
+  the three tabs. **Thresholds below are the user's own choices** (given directly after seeing the
+  first pass at 0.01/≥0.6%, which were this session's unconfirmed defaults — see the superseded
+  paragraph below): **SNR > 6** (`n=49, ⟨amplitude⟩=0.683±0.010%, χ²/dof=1.24`), **p_LEE < 3.17e-5,
+  4σ one-sided** (`n=51, ⟨amplitude⟩=0.680±0.010%, χ²/dof=1.28` — the strict, not the softer 0.01,
+  rule from §2's history), and **amplitude > 0.55%** (`n=59, ⟨amplitude⟩=0.680±0.009%,
+  χ²/dof=1.01` — `>`, not `≥`). All three now agree closely (0.680–0.683%), unlike the first pass's
+  spread (0.617–0.699%) — expected, since a stricter p_LEE cut and a looser amplitude cut both
+  moved toward the SNR>6 set rather than away from it.
+  - `--op` also generalizes plain SNR/σ plotting (`plot-dn`, `plot-sigma` unchanged, still default
+    to the old strict/non-strict `snr` semantics) so nothing there needed touching.
+  - ~~The p_LEE < 0.01 threshold is this session's own default, not confirmed by the user~~ —
+    superseded: the user asked for the stricter 4σ rule instead, confirming the concern raised
+    here was warranted (0.01 and ≥0.6% were both this session's guesses from an ambiguous
+    request). Use the thresholds above going forward, not these.
+- **Trimmed-by-cut points are drawn on every `_plot()` output, greyed out** (`#c3c9d1`, x-markers,
+  behind the colored points, `zorder=2`), not simply omitted — any fittable (`in_window`) row the
+  active cut excludes still appears for context, at its true (key, ekey) value, but is excluded
+  from the weighted mean, χ²/dof, trend line and legend n. This is a change to shared `_plot()`
+  machinery, so it also now applies to `plot-dn`/`plot-sigma` outputs, not just `plot-amp` — not
+  regenerated this session (unchanged thresholds there), but the next `plot-dn`/`plot-sigma` run
+  will pick it up automatically.
+- **Dashboard:** the panel's three tabs and headline summary-strip tile (previously the SNR>6
+  dN/N-area mean) now show the fixed-σ amplitude plots and the SNR>6 amplitude mean/χ²/dof above
+  (unchanged by the p_LEE/amplitude threshold revision, since that tab's cut didn't change). Panel
+  copy explains the switch, the amplitude/σ degeneracy reasoning, and the grey trimmed-point
+  convention. The free-σ dN/N-area and σ-vs-pixel analyses (`plot-dn`, `plot-sigma`, §§1-8 above)
+  are **unchanged and still available** — this only changes which metric the dashboard displays by
+  default; area remains the physically better-justified quantity when σ is allowed to vary for
+  real (unresolved) reasons.
+- Fresh pull that day: still the same 97 results (32+32+33 across three `list` pages, cursor
+  exhausted) — no new sweep data since 24-9-26.
+- Saved copies: `figs/27-9-26/g2_area_analysis/` (`fits_fixed_sigma_27_9_26.{json,csv}` + the
+  current three `amplitude_vs_pixel_fixed_sigma_{snr6,plee4sigma,gt0p55pct}.png` — the earlier
+  `_plee0p01`/`_ge0p6pct` files were superseded and removed, from both `plots/` and this figs
+  snapshot, and from the artifact's published files). Logbook entry: `logbook.md` under
+  `## 27-09-26`.

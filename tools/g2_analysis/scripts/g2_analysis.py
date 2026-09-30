@@ -30,6 +30,9 @@ Usage:
   python g2_analysis.py plot-dn     fits.json --cut 6   --strict -o dN_over_N_snr6.png
   python g2_analysis.py plot-dn     fits.json --cut 5.7          -o dN_over_N_snr5p7.png
   python g2_analysis.py plot-sigma  fits.json --cut 6   --strict -o sigma_snr6.png
+  python g2_analysis.py plot-amp fits_fixed_sigma.json --cut-field snr --cut 6 --strict -o amp_snr6.png
+  python g2_analysis.py plot-amp fits_fixed_sigma.json --cut-field p_lee --cut 0.01 --op lt -o amp_plee.png
+  python g2_analysis.py plot-amp fits_fixed_sigma.json --cut-field amplitude_pct --cut 0.6 -o amp_ge0p6.png
 """
 import argparse, csv, glob, json, os
 import numpy as np
@@ -109,11 +112,24 @@ def fit_one(doc, fixed_sigma=False):
     B, dN, mu = best.x[:3]
     s = SIGMA_INSTR_NS if fixed_sigma else best.x[3]
     g = np.zeros(len(best.x)); g[0], g[1] = -dN / B ** 2, 1 / B   # d(dN/N) incl. cov(N, dN)
-    row.update(N=B, dN=dN, dN_err=float(np.sqrt(C[1, 1])), dN_over_N=dN / B,
-               dN_over_N_err=float(np.sqrt(g @ C @ g)), mu=mu, sigma_ps=s * 1000,
+    dN_over_N, dN_over_N_err = dN / B, float(np.sqrt(g @ C @ g))
+    row.update(N=B, dN=dN, dN_err=float(np.sqrt(C[1, 1])), dN_over_N=dN_over_N,
+               dN_over_N_err=dN_over_N_err, mu=mu, sigma_ps=s * 1000,
                sigma_err_ps=None if fixed_sigma else float(np.sqrt(C[3, 3]) * 1000),
                chi2_dof=2 * best.cost / (len(n) - len(best.x)),
-               sigma_at_bound=(not fixed_sigma) and bool(s < 0.021 or s > 0.299))
+               sigma_at_bound=(not fixed_sigma) and bool(s < 0.021 or s > 0.299),
+               p_lee=doc.get('p_lee'))
+    if fixed_sigma:
+        # Peak-bin fraction of a unit-area Gaussian at fixed sigma: amplitude_pct is the
+        # continuous peak height (dN_over_N scaled from "per bin" to "at bin centre"), valid
+        # only because sigma is exact here -- no extra covariance term vs. a free-sigma fit,
+        # where amplitude = dN/sigma would need Cov(dN, sigma) folded in (see the amplitude/
+        # sigma degeneracy discussion in ../CLAUDE.md's 27-9-26 section: fixed sigma sidesteps
+        # exactly that degeneracy rather than requiring the extra covariance propagation).
+        K = float(erf(bw / (2 * SIGMA_INSTR_NS * np.sqrt(2))))
+        row.update(amplitude_pct=100 * dN_over_N * K, amplitude_pct_err=100 * dN_over_N_err * K)
+    else:
+        row.update(amplitude_pct=None, amplitude_pct_err=None)
     return row
 
 
@@ -138,8 +154,13 @@ def cmd_fit(a):
     print(f'{len(rows)} results, {sum(r["in_window"] for r in rows)} fittable -> {a.output}')
 
 
-def select(rows, cut, strict):
-    ok = lambda r: r.get('snr') is not None and (r['snr'] > cut if strict else r['snr'] >= cut)
+def select(rows, cut, strict, field='snr', op=None):
+    """op: 'gt' (>cut), 'ge' (>=cut), 'lt' (<cut). Defaults to the SNR cut's existing
+    strict/non-strict convention (gt/ge) when not given, so old callers are unaffected."""
+    if op is None:
+        op = 'gt' if strict else 'ge'
+    cmp = {'gt': lambda v: v > cut, 'ge': lambda v: v >= cut, 'lt': lambda v: v < cut}[op]
+    ok = lambda r: r.get(field) is not None and cmp(r[field])
     return [r for r in rows if r['in_window'] and ok(r)], [r['id'] for r in rows if not r['in_window'] and ok(r)]
 
 
@@ -151,10 +172,15 @@ def wmean(v, e):
     return m, 1 / np.sqrt(w.sum()), (w * (v - m) ** 2).sum() / max(len(v) - 1, 1), len(v)
 
 
-def _plot(rows, cut, strict, key, ekey, scale, ylabel, title, unit, out, fmt, ref=None):
+def _plot(rows, cut, strict, key, ekey, scale, ylabel, title, unit, out, fmt, ref=None,
+          field='snr', op=None, cut_label=None):
     import matplotlib; matplotlib.use('Agg'); import matplotlib.pyplot as plt
-    sel, missing = select(rows, cut, strict)
+    sel, missing = select(rows, cut, strict, field=field, op=op)
     sel = [r for r in sel if r.get(ekey) is not None]
+    sel_ids = {r['id'] for r in sel}
+    # Trimmed: fittable (in_window) rows with a valid (key, ekey) that the cut excluded --
+    # plotted greyed out for context, never counted in the mean/trend/legend stats.
+    trimmed = [r for r in rows if r['in_window'] and r.get(ekey) is not None and r['id'] not in sel_ids]
     first = [r for r in sel if not r['repeat']]; rep = [r for r in sel if r['repeat']]
     val = lambda rs: [scale * r[key] for r in rs]; err = lambda rs: [scale * r[ekey] for r in rs]
     A = wmean(val(sel), err(sel))
@@ -172,6 +198,11 @@ def _plot(rows, cut, strict, key, ekey, scale, ylabel, title, unit, out, fmt, re
         if len(rs) == 2:
             o, q = sorted(rs, key=lambda r: r['repeat'])
             ax.plot([px - .15, px + .15], [scale * o[key], scale * q[key]], color='#999', lw=.8, zorder=1)
+    if trimmed:
+        tdx = [r['pixel'] + (.15 if r['repeat'] else -.15) for r in trimmed]
+        ax.errorbar(tdx, val(trimmed), err(trimmed), fmt='x', ms=5, color='#c3c9d1', ecolor='#d3d8de',
+                    elinewidth=1, capsize=2, zorder=2, alpha=0.85,
+                    label=f'trimmed by cut (n={len(trimmed)}, excluded from mean/trend)')
     for rs, dx, mk, col, lab in [(first, -.15, 'o', C_FIRST, 'first measurement'), (rep, .15, 'D', C_REPEAT, 'repeat, longer runs')]:
         if not rs: continue
         m = wmean(val(rs), err(rs))
@@ -185,13 +216,16 @@ def _plot(rows, cut, strict, key, ekey, scale, ylabel, title, unit, out, fmt, re
             ax.annotate(f'μ={r["mu"]:.0f} ns', (r['pixel'] + (.15 if r['repeat'] else -.15), scale * (r[key] - r[ekey])),
                         xytext=(0, -12), textcoords='offset points', ha='center', fontsize=8.5, color=C_GREY)
     ax.set_xlabel('pixel #'); ax.set_ylabel(ylabel); ax.set_ylim(bottom=0)
-    ax.set_title(title.format(cut=('SNR > ' if strict else 'SNR ≥ ') + f'{cut:g}'), fontsize=11.5, loc='left')
-    ax.grid(axis='y', color='#000', alpha=.08); ax.set_xlim(p.min() - 1.5, p.max() + 1.5)
+    label = cut_label if cut_label is not None else ('SNR > ' if strict else 'SNR ≥ ') + f'{cut:g}'
+    ax.set_title(title.format(cut=label), fontsize=11.5, loc='left')
+    ax.grid(axis='y', color='#000', alpha=.08)
+    all_p = np.array([r['pixel'] for r in sel + trimmed], float)
+    ax.set_xlim(all_p.min() - 1.5, all_p.max() + 1.5)
     ax.legend(loc='lower left', frameon=False, fontsize=9.5)
     fig.text(.99, .01, f'linear trend {b[1]:+.4f} ± {np.sqrt(Cv[1,1]):.4f} {unit}/pixel  ·  not shown (peak outside stored ±500 ns): '
              + (', '.join(missing) or 'none'), ha='right', fontsize=8, color='#666')
     fig.tight_layout(); fig.savefig(out)
-    print(f'{out}: n={A[3]} mean {A[0]:{fmt}} ± {A[1]:{fmt}} {unit}, chi2/dof {A[2]:.2f}; missing {missing}')
+    print(f'{out}: n={A[3]} mean {A[0]:{fmt}} ± {A[1]:{fmt}} {unit}, chi2/dof {A[2]:.2f}; trimmed {len(trimmed)}; missing {missing}')
 
 
 def cmd_plot_dn(a):
@@ -199,6 +233,22 @@ def cmd_plot_dn(a):
     width = 'fixed σ = 70.7 ps' if all(r.get('sigma_err_ps') is None for r in rows if r['in_window']) else 'free-width Gaussian (σ fitted per peak)'
     _plot(rows, a.cut, a.strict, 'dN_over_N', 'dN_over_N_err', 100, 'dN / N  (%)',
           'Bunching peak area dN/N vs pixel  ·  {cut}  ·  ' + width + ', ±1σ errors', '%', a.output, '.3f')
+
+
+def cmd_plot_amp(a):
+    """Best-fit Gaussian amplitude (fixed sigma=70.7 ps) vs pixel, cut on one of
+    snr / p_lee / amplitude_pct -- see ../CLAUDE.md's 27-9-26 section for why fixed
+    sigma (not free) is used here: it sidesteps the amplitude/sigma degeneracy a
+    free-sigma fit has under this histogram's ~1.7-bin-FWHM sampling."""
+    rows = json.load(open(a.fits))
+    op = a.op or ('gt' if a.strict else 'ge')
+    sign = {'gt': '> ', 'ge': '≥ ', 'lt': '< '}[op]
+    fname = {'snr': 'SNR', 'p_lee': 'P_LEE', 'amplitude_pct': 'amplitude'}.get(a.cut_field, a.cut_field)
+    unit_suffix = '%' if a.cut_field == 'amplitude_pct' else ''
+    cut_label = f'{fname} {sign}{a.cut:g}{unit_suffix}'
+    _plot(rows, a.cut, a.strict, 'amplitude_pct', 'amplitude_pct_err', 1, 'peak amplitude  (%)',
+          'Best-fit Gaussian amplitude (fixed σ = 70.7 ps) vs pixel  ·  {cut}  ·  ±1σ errors',
+          '%', a.output, '.3f', field=a.cut_field, op=op, cut_label=cut_label)
 
 
 def cmd_plot_sigma(a):
@@ -217,4 +267,12 @@ if __name__ == '__main__':
         p = sp.add_parser(name); p.add_argument('fits'); p.add_argument('--cut', type=float, default=6)
         p.add_argument('--strict', action='store_true', help='use SNR > cut instead of >='); p.add_argument('-o', '--output', default=default)
         p.set_defaults(fn=fn)
+    pa = sp.add_parser('plot-amp'); pa.add_argument('fits')
+    pa.add_argument('--cut-field', default='snr', choices=['snr', 'p_lee', 'amplitude_pct'])
+    pa.add_argument('--cut', type=float, required=True)
+    pa.add_argument('--op', choices=['gt', 'ge', 'lt'], default=None,
+                     help='comparison vs --cut; default is gt if --strict else ge (ignored if given)')
+    pa.add_argument('--strict', action='store_true', help='use > cut instead of >= when --op is not given')
+    pa.add_argument('-o', '--output', default='amplitude_vs_pixel.png')
+    pa.set_defaults(fn=cmd_plot_amp)
     a = ap.parse_args(); a.fn(a)
