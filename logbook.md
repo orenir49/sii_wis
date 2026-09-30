@@ -432,3 +432,5 @@ Reverting to 2:1 fiber splitter, new spectral alignment.
 - Rules out T mode bug; points to hardware.
 - Hypothesis: one faulty master chip occasionally skipping coarse counts.
 - Cheap test: cross-talk analysis between pixels 159+160+161+162; slave+slave and master+master cross-talk peak should always be intact. If master chip is faulty, slave+master peak is expected to be split and possibly misplaced.
+- Node2 cross-talk check crashed after 180 sec, shows evidence of 100ns master offset
+- Node2 master chip 100 ns jump confirmed, data files `spad_data/160_161_node2_xtalk600c.txt` (full), `..._lt180s.txt`, `..._gt200s.txt`; figures `figs/30-9-26/crosstalk test 600c/node2_dwell_master_minus_slave.png`, `figs/30-9-26/crosstalk test 600c/node2_160x161_before_after_jump_vs_full.png`; during the 10 minute run the master jumped once by 100 ns, identifiable from dwell markers.
