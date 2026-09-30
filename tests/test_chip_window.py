@@ -60,7 +60,7 @@ def put(q, arr):
     q.put(np.asarray(arr, dtype=np.int64).tobytes())
 
 
-def drive_window(w, a1, b1, a2, b2, mk_m, mk_s, n_chunks, preload_markers):
+def drive_window(w, a1, b1, a2, b2, mk_m, mk_s, n_chunks, preload_markers, offset=0):
     """Push time-ordered slices of everything through the window's own pieces and collect taus
     per pair. `preload_markers`: how many markers are delivered before start_with_offset (the
     receiver's calibration seconds)."""
@@ -70,7 +70,7 @@ def drive_window(w, a1, b1, a2, b2, mk_m, mk_s, n_chunks, preload_markers):
     # the chip offset on its master pixel via the stamps handed in by the caller.
     qm, qs = w._dwell_q[2]
     put(qm, mk_m[:preload_markers]); put(qs, mk_s[:preload_markers])
-    w.start_with_offset(0)
+    w.start_with_offset(offset)
     parts = {k: np.array_split(v, n_chunks) for k, v in
              {'a1': a1, 'b1': b1, 'a2': a2, 'b2': b2, 'mm': mk_m[preload_markers:], 'ms': mk_s[preload_markers:]}.items()}
     for i in range(n_chunks):
@@ -83,7 +83,7 @@ def drive_window(w, a1, b1, a2, b2, mk_m, mk_s, n_chunks, preload_markers):
         for p1, p2, t1b, t2a in rel.batches:
             taus.setdefault((p1, p2), []).extend(brute_taus(t1b, t2a))
     top = max((c.last_ts or 0) for c in g.channels) + 10 ** 15
-    put(g.ch2[160].q, [top]); put(g.ch2[161].q, [top])
+    put(g.ch2[160].q, [top + offset]); put(g.ch2[161].q, [top + offset])
     for _ in range(2):
         w._feed_trackers(); g.drain_all()
         for p1, p2, t1b, t2a in g.release().batches:
@@ -249,6 +249,29 @@ def main():
               f'level {tr.level_ps}, jumps {tr.jumps}')
         w.destroy()
 
+
+        # -- the live case: a non-zero cross-node offset. Node 2's photons AND its dwell markers are in its own clock; the
+        # graph's node-2 channels hold offset-corrected time, so the tracker's steps must be mapped across (they were not,
+        # until 30-9-26: the correction then started |offset| early at each jump).
+        OFFS = -14_459_111_615
+        w = fresh(True)
+        a_, b_, span_ = streams(np.random.default_rng(21))
+        tj = span_ // 3
+        lv = lambda t: np.where(t < tj, INTRINSIC - TICK, INTRINSIC)
+        b161r = np.sort(b_ + lv(b_)) + OFFS
+        mk_m_, mk_s_ = markers(span_, tj)
+        taus_o = drive_window(w, a_, a_, b_ + INTRINSIC + OFFS, b161r, mk_m_ + OFFS, mk_s_ + OFFS, n_chunks=50,
+                              preload_markers=30, offset=OFFS)
+        stp = w._trackers[2].steps()
+        st_t2 = np.array([t for t, _ in stp], dtype=np.int64)
+        st_s2 = np.array([0] + [x for _, x in stp], dtype=np.int64)
+        exp_raw = np.sort(b161r - st_s2[np.searchsorted(st_t2, b161r, side='right')])
+        check('offset != 0: the master pair equals the steps-implied stamps exactly (steps are in the raw node-2 clock)',
+              sorted(taus_o[(161, 161)]) == sorted(brute_taus(a_, exp_raw - OFFS)),
+              f'{len(taus_o[(161, 161)])} taus')
+        check('offset != 0: the slave pair is still untouched',
+              sorted(taus_o[(160, 160)]) == sorted(brute_taus(a_, b_ + INTRINSIC)))
+        w.destroy()
 
         # -- 'except px': a corrected pair and an uncorrected control that see the SAME jump ------------
         w, _ = masked_window(root, [159, 161], [159, 161])

@@ -82,7 +82,7 @@ def pair_list(px1, px2):
 
 
 def run(streams1, streams2, n_chunks=40, shifters=None, master_pixels=None, margin=0.0,
-        confirm_at_cycle=None, late_steps=None):
+        confirm_at_cycle=None, late_steps=None, offset=0):
     """Drive one graph through `n_chunks` interleaved polls plus a flush. Returns
     (taus per pair, list of per-cycle tau lists, graph). `late_steps`: {node: steps} installed
     only from cycle `confirm_at_cycle` on, i.e. the correction is not known before then."""
@@ -90,7 +90,7 @@ def run(streams1, streams2, n_chunks=40, shifters=None, master_pixels=None, marg
     pl = pair_list(px1, px2)
     clock = FakeClock()
     g = ChannelGraph(pl, TMAX, clock=clock, shifters=shifters, master_pixels=master_pixels,
-                     retain_margin_ps=margin)
+                     retain_margin_ps=margin, offset=offset)
     g.start()
     parts1 = {p: np.array_split(v, n_chunks) for p, v in streams1.items()}
     parts2 = {p: np.array_split(v, n_chunks) for p, v in streams2.items()}
@@ -120,7 +120,7 @@ def run(streams1, streams2, n_chunks=40, shifters=None, master_pixels=None, marg
                 g.shifters[node]._steps = list(st)
         cycle({p: parts1[p][i] for p in px1}, {p: parts2[p][i] for p in px2}, i)
     top = max((c.last_ts or 0) for c in g.channels) + 10 ** 15
-    cycle({}, {p: np.array([top], dtype=np.int64) for p in px2}, n_chunks)
+    cycle({}, {p: np.array([top + offset], dtype=np.int64) for p in px2}, n_chunks)
     cycle({}, {}, n_chunks + 1)
     return taus, cycles, g, batches_seen
 
@@ -216,6 +216,18 @@ def main():
     check('cycles before confirmation match the uncorrected run cycle by cycle',
           all(sorted(x) == sorted(y) for x, y in zip(first_half,
               [c.get((161, 161), []) for c in run({161: a}, {161: b_master}, margin=1.5 * TICK)[1][:30]])))
+
+    print('cross-node offset (the live case: node-2 stamps carry the offset; steps are in the raw node-2 clock):')
+    OFFSET = -14_459_111_615                                   # the 30-9-26 live run's calibration
+    sh_off = FakeShifter([(step_t + OFFSET, S)])               # first marker on the new level, in node 2's raw clock
+    fixed_off, _, _, _ = run({161: a}, {161: b_master + OFFSET}, shifters={2: sh_off}, master_pixels={2: {161}},
+                             margin=1.5 * TICK, offset=OFFSET)
+    check('offset != 0, corrected: taus equal the unjumped run exactly (steps mapped into corrected time)',
+          sorted(fixed_off[(161, 161)]) == sorted(truth[(161, 161)]),
+          f'{len(fixed_off[(161, 161)])} vs {len(truth[(161, 161)])}')
+    unc_off, _, _, _ = run({161: a}, {161: b_master + OFFSET}, offset=OFFSET)
+    check('offset != 0, uncorrected: still the wrong-position peak (the test is sensitive)',
+          sorted(unc_off[(161, 161)]) != sorted(truth[(161, 161)]))
 
     print('retention margin:')
     nomargin, _, _, _ = run({161: a}, {161: b_master}, shifters={2: sh2}, master_pixels={2: {161}}, margin=0.0)

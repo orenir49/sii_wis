@@ -800,7 +800,11 @@ class ChannelGraph:
         steps = sh.steps()
         if not steps or not any(s for _, s in steps):
             return arr
-        starts = np.searchsorted(arr, np.array([t for t, _ in steps], dtype=np.int64), side='left')
+        # Channel.arr holds corrected time -- node 2's stamps already have the cross-node offset taken out -- while a
+        # shifter's steps are in that node's OWN clock (the dwell markers' clock). Map the step times into arr's clock, or
+        # the correction starts |offset| early/late at every jump (30-9-26: -14.5 s on the 151+184 live run).
+        clock = self.offset if node == 2 else 0
+        starts = np.searchsorted(arr, np.array([t - clock for t, _ in steps], dtype=np.int64), side='left')
         edges = np.concatenate([[0], starts, [arr.size]])
         shifts = [0] + [s for _, s in steps]
         out = arr.copy()
