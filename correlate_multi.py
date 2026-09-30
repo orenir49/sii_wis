@@ -228,6 +228,8 @@ class MultiCorrelateWindow(tk.Toplevel):
         # TIME DIFFERENCES are corrected inside ChannelGraph.release() from dwell markers.
         self._master_px: dict = {1: frozenset(), 2: frozenset()}   # master-chip pixels in the derived pairs
         self._chip_pairs: list = []                # (p1, p2) that contain one
+        # The subset actually corrected this Enable: master pixels minus the 'except px' list.
+        self._corr_px: dict = {1: frozenset(), 2: frozenset()}
         self._trackers = {n: dwell_offset.DwellOffsetTracker() for n in (1, 2)}
         # Own subscriber queues on keys 320 (master_dwell) / 323 (slave_dwell), per node --
         # NodePanel's calibration drains its own, and two readers of one queue would steal
@@ -367,6 +369,11 @@ class MultiCorrelateWindow(tk.Toplevel):
         self.chip_corr_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(btn, text='Correct master-chip jumps', variable=self.chip_corr_var
                         ).grid(row=0, column=5, padx=(14, 3))
+        # Pixels (locations) to leave UNcorrected on both nodes, e.g. '147'. A jump is chip-wide, so a
+        # listed master pixel beside a corrected one is a same-run, same-jump control.
+        ttk.Label(btn, text='except px:').grid(row=0, column=6, padx=(6, 2))
+        self.chip_skip_var = tk.StringVar(value='')
+        ttk.Entry(btn, textvariable=self.chip_skip_var, width=12).grid(row=0, column=7, padx=(0, 3))
         self.save_btn = ttk.Button(btn, text='Save .npz', width=10, command=self._save_npz)
         self.save_btn.grid(row=0, column=3, padx=(14, 3))
         ttk.Button(btn, text='Export pair → .txt', width=17,
@@ -751,11 +758,18 @@ class MultiCorrelateWindow(tk.Toplevel):
         except Exception as exc:
             self.status_var.set(f'Error: {exc}')
             return
-        self._chip_active = bool(self.chip_corr_var.get()) and bool(self._chip_pairs)
+        try:
+            skip = {int(x) for x in self.chip_skip_var.get().replace(',', ' ').split()}
+        except ValueError:
+            self.status_var.set("'except px' must be pixel numbers, e.g. 147 or 147,150.")
+            return
+        self._corr_px = {n: frozenset(self._master_px[n] - skip) for n in (1, 2)}
+        self._chip_active = (bool(self.chip_corr_var.get()) and bool(self._chip_pairs)
+                             and any(self._corr_px.values()))
         if self._chip_active:
-            tracked = {n: self._trackers[n] for n in (1, 2) if self._master_px[n]}
+            tracked = {n: self._trackers[n] for n in (1, 2) if self._corr_px[n]}
             self._graph = ChannelGraph(
-                self._pairs, tmax, offset=0, shifters=tracked, master_pixels=self._master_px,
+                self._pairs, tmax, offset=0, shifters=tracked, master_pixels=self._corr_px,
                 retain_margin_ps=CHIP_MARGIN_TICKS * dwell_offset.TICK_PS)
         else:
             self._graph = ChannelGraph(self._pairs, tmax, offset=0)
@@ -876,7 +890,7 @@ class MultiCorrelateWindow(tk.Toplevel):
     def _node_hooks(self, node: int, pixel_hooks: dict) -> dict:
         """Pixel queues, plus this window's own dwell-marker queues (keys 320/323) for a node
         that has a master-chip pixel in a pair -- those feed the chip-offset tracker."""
-        if self._chip_active and self._master_px[node]:
+        if self._chip_active and self._corr_px[node]:
             qm, qs = self._dwell_q[node]
             return {**pixel_hooks, 320: qm, 323: qs}
         return pixel_hooks
@@ -946,7 +960,7 @@ class MultiCorrelateWindow(tk.Toplevel):
                 self._graph.shifters[n] = self._trackers[n]
             qm, qs = self._dwell_q[n]
             m, s = self._session_tail(self._drain_i64(qm)), self._session_tail(self._drain_i64(qs))
-            if self._chip_active and self._master_px[n] and (m.size or s.size):
+            if self._chip_active and self._corr_px[n] and (m.size or s.size):
                 for j in self._trackers[n].feed(m, s):
                     self._note_jump(n, j)
         self._update_chip_label()
@@ -955,7 +969,7 @@ class MultiCorrelateWindow(tk.Toplevel):
         if not self._chip_active:
             return
         for n in (1, 2):
-            if not self._master_px[n]:
+            if not self._corr_px[n]:
                 continue
             qm, qs = self._dwell_q[n]
             m, s = self._drain_i64(qm), self._drain_i64(qs)
@@ -963,6 +977,10 @@ class MultiCorrelateWindow(tk.Toplevel):
                 for j in self._trackers[n].feed(m, s):
                     self._note_jump(n, j)
         self._update_chip_label()
+
+    def _corrected_pairs(self) -> list:
+        return [(p1, p2) for p1, p2 in self._chip_pairs
+                if p1 in self._corr_px[1] or p2 in self._corr_px[2]]
 
     def _note_jump(self, node: int, j) -> None:
         self._jump_log.append((node, int(j.t_ps), float(j.delta_ps)))
@@ -975,9 +993,10 @@ class MultiCorrelateWindow(tk.Toplevel):
             self.chip_var.set(f'Master-chip correction OFF ({len(self._chip_pairs)} pair(s) contain a '
                               f'master-chip pixel; their peaks can split by whole 100 ns ticks).')
             return
+        n_corr = len(self._corrected_pairs())
         parts = []
         for n in (1, 2):
-            if not self._master_px[n]:
+            if not self._corr_px[n]:
                 continue
             tr = self._trackers[n]
             if tr.level_ps is None:
@@ -989,7 +1008,10 @@ class MultiCorrelateWindow(tk.Toplevel):
                                             for j in tr.jumps[-3:])
                     txt += f' (shift now {tr.shift_of_level(tr.level_ps) / 1e3:+.0f} ns)'
                 parts.append(txt)
-        self.chip_var.set(f'Master-chip correction ({len(self._chip_pairs)} pair(s)): ' + '  |  '.join(parts))
+        left = len(self._chip_pairs) - n_corr
+        self.chip_var.set(f'Master-chip correction ({n_corr} pair(s) corrected'
+                          + (f', {left} master-chip pair(s) deliberately NOT corrected' if left else '')
+                          + '): ' + '  |  '.join(parts))
 
     def _poll_data(self) -> None:
         try:
@@ -1326,8 +1348,10 @@ class MultiCorrelateWindow(tk.Toplevel):
                 'tick_ps': dwell_offset.TICK_PS, 'nominal_ps': dwell_offset.NOMINAL_PS,
                 'margin_ps': CHIP_MARGIN_TICKS * dwell_offset.TICK_PS,
                 'master_pixels': {str(n): sorted(self._master_px[n]) for n in (1, 2)},
+                'corrected_pixels': {str(n): sorted(self._corr_px[n]) for n in (1, 2)},
                 'pairs_with_master_pixel': [list(k) for k in self._chip_pairs],
-                'nodes': {str(n): self._trackers[n].summary() for n in (1, 2) if self._master_px[n]},
+                'pairs_corrected': [list(k) for k in self._corrected_pairs()],
+                'nodes': {str(n): self._trackers[n].summary() for n in (1, 2) if self._corr_px[n]},
             },
             # exclusion_history, not the live flags: saving usually happens
             # after the stream has stopped, when every channel reads quiet and
