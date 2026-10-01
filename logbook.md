@@ -438,9 +438,11 @@ Reverting to 2:1 fiber splitter, new spectral alignment.
 
 ## 01-10-26
 
-- Per-pixel TDC offsets characterized from the nearest-neighbour cross-talk peak chain, node 1 (node 2 in progress).
+- Per-pixel TDC offsets characterized from the nearest-neighbour cross-talk peak chain, both nodes.
   - Method: 30 s timestamp runs with 12 overlapping sub-masks tiling `mask_sparse.txt` (7-8 pixels each, so the count rate stays low enough; parts 1-12, masks `.claude/masks/mask_sparse_part_K.txt`). In each run, the g2 of neighbouring pixels on the same node has a cross-talk peak (~350 ps wide) whose position is the TDC offset between the two. Chaining the neighbours through the overlap pixels links all 80 active pixels (118-216) to pixel 160. Master/slave pairs are corrected with the dwell offset first.
   - Result: offsets span about -1.0 to +2.6 ns relative to pixel 160. Master-chip pixels sit about 1 ns later than slave-chip ones even after the dwell correction - cause not understood yet.
-  - Offset vector saved to `calibration/pixel_offsets_ps_node1.txt` (in git; push to the node as `pixel_offsets_ps.txt` with `tools/push_offsets.py`). Not pushed yet.
-  - Raw data and per-pair histograms in `spad_data/crosstalk_align/` (`node{1,2}/`, `node1/analysis/`). Figures in `figs/1-10-26/` (`crosstalk_offsets_node1.png`, `crosstalk_peak_shapes_node1.png`). Code: `tools/crosstalk_offsets.py`, `tools/tile_mask.py`, `tools/stash_part.py`.
+  - Offset vectors saved to `calibration/pixel_offsets_ps_node1.txt` and `calibration/pixel_offsets_ps_node2.txt` (in git; push to a node as `pixel_offsets_ps.txt` with `tools/push_offsets.py`). Not pushed yet.
+  - Raw data and per-pair histograms in `spad_data/crosstalk_align/` (`node{1,2}/`, `node1/analysis/`). Figures in `figs/1-10-26/` (`crosstalk_offsets_node{1,2}.png`, `crosstalk_peak_shapes_node{1,2}.png`). Code: `tools/crosstalk_offsets.py`.
   - The tiled masks were removed from both nodes' lSPAD directories afterwards.
+  - Node 2: same method, same picture (offsets -1.2 to +2.7 ns vs pixel 160; master-chip pixels ~1.2 ns later than slave ones, node 1 ~1 ns). Node 2's per-pixel offsets track node 1's (correlation 0.91, mean difference 0.17 ns), so much of the pattern is shared between the two detectors. The master chip's +100 ns state occurred mid-run in three of the twelve runs (parts 1, 4, 11) and was corrected from the dwell markers.
+  - Node 2 caveat: the link 200 -> 208 shows no cross-talk peak at all, so pixels 208, 212, 214 and 216 are not tied to the rest of the chain; their entries in the node 2 file are 0 (no correction). Everything below pixel 208 is fine.
