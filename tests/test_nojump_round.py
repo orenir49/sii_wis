@@ -138,7 +138,12 @@ def main():
     sd = json.load(open(w[2]['file_path']))
     check('the status doc says campaign nojump151, 2 completed, total jumps, dummy pixel',
           sd['campaign'] == 'nojump151' and sd['completed'] == 2 and sd['n_jumps_total'] == 0 and sd['prev_pixels'] is not None, str(sd))
+    out0 = cli('build', '--rounds', '--status-version', '8')    # no rounds named and (below) nothing pending: status-only
     cli('mark', '--rounds', '1', '3')
+    out_so = cli('build', '--status-version', '8')
+    so = json.loads(out_so.stdout)
+    check('with nothing pending, build still emits the status update (campaign header at launch)',
+          so['rounds'] == [] and len(so['writes']) == 1 and so['writes'][0]['doc_id'] == 'status' and so['writes'][0]['if_version'] == 8, out_so.stdout + out_so.stderr)
     check('mark records the uploads; nothing is pending afterwards', json.loads(cli('pending').stdout) == [])
 
     print('the watcher:')

@@ -229,7 +229,7 @@ def write_status(*, round_now, phase, completed, failed, pixels, dummy, duration
     st = dict(campaign='nojump151', round=round_now, total_rounds=total, completed=completed, failed_rounds=failed,
               phase=phase, pixels=list(pixels), dummy_pixels=list(dummy), round_duration_s=duration_s,
               round_started_ts=round_started_ts, updated_at=time.strftime('%Y-%m-%d %H:%M:%S'), updated_ts=time.time(),
-              eta_s=round(left * (mean_round_s or (duration_s + 240)), 0))
+              eta_s=round(left * (mean_round_s or (duration_s + 100)), 0))   # +100 s: measured bring-up overhead of the 27-9-26 sweep (rounds ~1270-1297 s apart)
     tmp = os.path.join(HIST_DIR, STATUS + '.tmp')
     with open(tmp, 'w') as f:
         json.dump(st, f, indent=1)

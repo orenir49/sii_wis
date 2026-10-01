@@ -85,6 +85,10 @@ class DwellOffsetTracker:
         self.init_n = init_n
         self.tick_ps = int(tick_ps)
         self.nominal_ps = float(nominal_ps)
+        # True when the cross-node offset was calibrated on the MASTER dwell: that calibration already contains each master chip's level
+        # at that moment, so later shifts must be relative to it (nominal := the first level) -- an absolute 0 ns reference would move
+        # master pixels by a whole tick whenever the session happened to start on the -1 tick state.
+        self.relative_to_first = False
         self._m = np.empty(0, np.int64)       # master markers not yet matched
         self._s = np.empty(0, np.int64)       # slave markers still needed for matching
         self._init: list = []                 # (t, d) until the first level is set
@@ -150,6 +154,8 @@ class DwellOffsetTracker:
             if len(self._init) == self.init_n:
                 self._buf = [x[1] for x in self._init]
                 self.level_ps = float(np.median(self._buf))
+                if self.relative_to_first:
+                    self.nominal_ps = self.level_ps
                 self.history.append((self._init[0][0], self.level_ps))
             return
         if abs(d - self.level_ps) <= self.level_tol_ps:
@@ -338,6 +344,11 @@ def _selftest() -> int:
     flat = DwellOffsetTracker()
     flat.feed(master[:jump_i], slave[slave < master[jump_i - 1] + 1_000_000]); flat.flush()
     check(not flat.jumps and abs(flat.level_ps + 98_700) < 500, 'no jump on a flat stream')
+    rel = DwellOffsetTracker()
+    rel.relative_to_first = True
+    rel.feed(master, slave); rel.flush()
+    check([x[1] for x in rel.steps()] == [0, 100_000],
+          f'relative_to_first: the first level is the reference (shift 0), the +1 tick jump is +100 ns: {[x[1] for x in rel.steps()]}')
     # a long off-level burst that disagrees with itself is not a jump
     bm = t[:200] + 1_300 + np.where(np.arange(200) % 2 == 0, 40_000, 20_000)
     bm[:30] = t[:30] + 1_300

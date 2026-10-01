@@ -386,7 +386,8 @@
         whose clock can jump by a whole 100&nbsp;ns tick against the slave chip in the middle of a run; that is what split or lost
         9 of the 50 earlier rounds. Here a dwell-marker tracker watches each node's master&minus;slave offset, and the correlator
         removes a confirmed jump from the 151&times;151 time differences from that moment on (data already released stays as it was).
-        Pixel&nbsp;0, a slave-chip pixel, is kept active on both nodes only to supply the slave dwell markers; it is not correlated.
+        Pixel&nbsp;4, a peripheral slave-chip pixel, is kept active on both nodes only so the slave chip sends its dwell markers; it is not
+        correlated. Its markers arrive 30 to 60 seconds into a round, so the first minute of each round runs uncorrected.
         Everything else matches the main sweep: 100&nbsp;ps bins, 20-minute rounds, a full lSPAD reset and recalibration before each
         round, fixed-&sigma; (70.7&nbsp;ps) amplitude fit. Every round is shown; a round with jumps is not dropped. Only a round whose
         tracker never found a level (correction not running) is greyed out and left out of the mean. Each round is added about five

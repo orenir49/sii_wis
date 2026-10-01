@@ -15,7 +15,7 @@ everything here is testable offline.
 No images are uploaded. Each document carries the raw histogram window (+-200 ns around the peak, 100 ps bins) and the page draws
 it the same way the Main and Reliability tabs draw theirs; the histogram and peak-zoom PNGs stay in figs\\30-9-26\\nojump151_sweep.
 
-Timing: a round takes ~20 min of integration plus ~3-5 min of bring-up, so rounds finish every ~24 min, not every 20. `wait`
+Timing: a round takes 20 min of integration plus ~1-1.5 min of bring-up (measured on the 27-9-26 sweep: rounds 1270-1297 s apart), so rounds finish every ~21.5 min, not every 20. `wait`
 is therefore keyed to each round's completion, not to a fixed clock: READY arrives `--delay` seconds (5 min) after the round
 ended, however the rounds drift.
 
@@ -156,12 +156,12 @@ def cmd_build(a):
     wanted = sorted(a.rounds) if a.rounds else sorted(r['round'] for r in pending_rounds())
     writes = []
     rounds = []
+    os.makedirs(a.out, exist_ok=True)       # also when nothing is pending: a status-only build still writes its file
     for j in wanted:
         if j not in recs:
             sys.exit(f'round {j} has no record -- nothing to build')
         d = doc_for(recs[j], hist_window(recs[j]))
         p = os.path.join(a.out, f'doc_r{j:02d}.json')
-        os.makedirs(a.out, exist_ok=True)
         with open(p, 'w') as f:
             json.dump(d, f)
         writes.append(dict(op='set', collection=COLLECTION, doc_id=f'r{j:02d}', file_path=p))

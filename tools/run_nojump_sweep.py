@@ -2,13 +2,16 @@
 
 Validates the g2 reliability of pixel 151 now that the master chip's 100 ns timebase jumps are corrected in real time
 (chip_map.py, tools/dwell_offset.py, ChannelGraph shifters). Pixel 151 is a master-chip location, so each node's master chip
-can jump against its slave chip; pixel 0 is a slave-chip location, kept active on BOTH nodes only so the slave chip emits
-the dwell markers the tracker and the cross-node calibration need (it is never correlated).
+can jump against its slave chip; pixel 4 is a peripheral slave-chip location, kept active on BOTH nodes only so the slave chip
+emits the dwell markers the tracker needs (it is never correlated). A nearly dark pixel (4; 0 is fully dark) makes the slave chip
+slow to send its first markers: they arrive ~30-60 s into a round, AFTER the dwell calibration, which therefore falls back to the
+master dwell. The trackers then correct relative to their first level (DwellOffsetTracker.relative_to_first), and the first
+30-60 s of each round run uncorrected (a jump in that window leaves a small displaced piece).
 
 Built on tools/run_pixel_sweep.py (same bring-up: full lSPAD shutdown + relaunch + mask + TDC calibration + dwell-offset
 calibration before every round, 3 attempts per round). What differs:
   * a DwellOffsetTracker per node, fed from its own subscriber queues on keys 320/323, steps handed to the ChannelGraph
-  * only (151, 151) is correlated; pixel 0's data is discarded
+  * only (151, 151) is correlated; the dummy pixel's data is discarded
   * every round writes 151_151_nojump_{j}.txt + nojump151_{j}.npz (levels + jumps per node) + the histogram and peak-zoom
     figures, and appends a record the artifact uploader (tools/nojump_publish.py) reads -- see tools/nojump_round.py
   * --replay re-runs the same round loop on a recorded run, with no hardware, to test the whole path
@@ -91,7 +94,16 @@ class LiveSource:
             node.start_acquisition(0)          # T,0: lSPAD's own duration caps near 15 min, so we STOP ourselves
 
     def calibrate(self, log):
-        return rps.calibrate_offset(self.nodes[0], self.nodes[1], log=log)
+        seen = []
+
+        def tap(msg):
+            seen.append(str(msg))
+            log(msg)
+        off = rps.calibrate_offset(self.nodes[0], self.nodes[1], log=tap)
+        self.calibration_source = 'master' if any('falling back to master dwell' in m for m in seen) else 'slave'
+        if self.calibration_source == 'master':
+            log('NOTE: calibrated on the MASTER dwell (no slave markers yet): the trackers correct relative to their first level, not to 0 ns')
+        return off
 
     calibration_source = 'slave'
 
@@ -236,6 +248,8 @@ def run_round(source, pixels, duration_s, round_idx, log=print, partial_path=Non
                         f'(shift now {tr.shift_of_level(tr.level_ps) / 1e3:+.0f} ns)')
 
     fitted_offset = source.calibrate(log)
+    for tr in trackers.values():
+        tr.relative_to_first = (source.calibration_source == 'master')
     graph.set_offset(fitted_offset)
     graph.start(offset=fitted_offset)
     source.mark()
@@ -334,6 +348,45 @@ def keep_awake():
         ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
 
 
+def nodes_on_battery() -> list:
+    """Nodes that POSITIVELY report running on battery. A laptop node on battery never starts lSPAD (the launch task is 'don't start on
+    battery' and sits Queued), so every attempt of every round would fail -- 30-9-26: node 2 unplugged, round 1 failed twice in 6 min.
+    Anything we cannot read (SSH error, odd output) counts as fine: this gate may delay a round, never stall the campaign on a bad reading."""
+    bad = []
+    script = (r"try { $r = Get-CimInstance -Namespace root\wmi -ClassName BatteryStatus -ErrorAction Stop | Select-Object -First 1; "
+              "if ($r -and -not $r.PowerOnline) { 'BATTERY' } else { 'AC' } } catch { 'UNKNOWN' }")
+    for n, info in rps.NODES.items():
+        try:
+            c = rps.sl.ssh_connect(info['host'], info['user'])
+            try:
+                out, _ = rps.sl.run_ps(c, script)
+            finally:
+                c.close()
+            if out.strip() == 'BATTERY':
+                bad.append(n)
+        except Exception:
+            pass
+    return bad
+
+
+def wait_for_ac(log, status_fn, max_wait_s=12 * 3600, poll_s=60):
+    t0, last = time.time(), 0.0
+    while True:
+        bad = nodes_on_battery()
+        if not bad:
+            if last:
+                log(f'AC power is back on every node after {(time.time() - t0) / 60:.0f} min -- continuing')
+            return True
+        if time.time() - t0 > max_wait_s:
+            log(f'gave up waiting for AC power on node(s) {bad} after {max_wait_s / 3600:.0f} h')
+            return False
+        if time.time() - last > 600 or last == 0.0:
+            log(f'node(s) {bad} running on battery (lSPAD will not start there) -- waiting for AC power; rechecking every {poll_s} s')
+            last = time.time()
+        status_fn('waiting_power')          # keeps the status fresh so the watcher does not call this a stall
+        time.sleep(poll_s)
+
+
 def ports_free():
     busy = []
     for p in (rps.NODES[1]['data_port'], rps.NODES[2]['data_port']):      # 50010 is the NODES' command port, not bound here
@@ -377,7 +430,7 @@ def main():
     ap.add_argument('--first-round', type=int, default=1, help='label of the first round run (resume: 12 after 1..11 are done)')
     ap.add_argument('--duration-s', type=float, default=1200.0)
     ap.add_argument('--pixels', type=lambda s: [int(x) for x in s.split(',')], default=[nr.PIXEL])
-    ap.add_argument('--dummy', type=lambda s: [int(x) for x in s.split(',')], default=[0],
+    ap.add_argument('--dummy', type=lambda s: [int(x) for x in s.split(',')], default=[4],
                     help='slave-chip pixels kept active on both nodes only for their dwell markers (never correlated)')
     ap.add_argument('--dry-run', action='store_true', help='2 rounds x 60 s on the real nodes; outputs go to *_dryrun folders')
     ap.add_argument('--replay', default=None, help='hardware-free: replay a recorded run from this spad_data dir')
@@ -385,6 +438,12 @@ def main():
     ap.add_argument('--replay-npz', default=os.path.join(ROOT, 'spad_data', 'correct_jumps_test2.npz'),
                     help='the recording\'s own npz, for its cross-node offset')
     args = ap.parse_args()
+    # Importing master (via run_pixel_sweep) pulls in correlate_multi, which selects TkAgg. A TkAgg figure left behind by finalize_round is
+    # garbage-collected later in a worker thread -> fatal 'Tcl_AsyncDelete: async handler deleted by the wrong thread' (killed round 23).
+    import matplotlib
+    matplotlib.use('Agg', force=True)
+    import matplotlib.pyplot as _plt
+    _plt.switch_backend('Agg')
 
     if args.dry_run:
         args.rounds, args.duration_s = 2, 60.0
@@ -439,6 +498,9 @@ def main():
         j = args.first_round + i
         print(f'\n=== round {j}/{total}: pixel {args.pixels} (+dummy {args.dummy}) ===', flush=True)
         t_round = time.time()
+        if not args.replay:
+            wait_for_ac(print, lambda ph: nr.write_status(round_now=j, phase=ph, completed=len(nr.load_records()), failed=failed,
+                                                          pixels=args.pixels, dummy=args.dummy, duration_s=args.duration_s, total=total))
         for attempt in range(1, 4):
             nr.write_status(round_now=j, phase='resetting', completed=len(nr.load_records()), failed=failed, pixels=args.pixels,
                             dummy=args.dummy, duration_s=args.duration_s, total=total, round_started_ts=t_round,
