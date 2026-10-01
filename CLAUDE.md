@@ -48,15 +48,6 @@ python tools\push_offsets.py pixel_offsets_ps.txt [--node 1|2]
 # Generate pixel_offsets_ps.txt from a single-detector pulsed-laser run
 python .claude\skills\temporal-align\align_time.py --base spad_data\<session>
 
-# Raw lSPAD capture (Stage 2 Phase 0) -- off by default
-# Set on the MASTER before launching master.py; forwarded to each node as
-# <that node repo>\<value>_node{1,2}. Relative is preferred: the two nodes have
-# different usernames, so an absolute master-side path names a missing home dir.
-$env:SII_WIS_RAW_DUMP = 'spad_data\cap.raw'   # optional: SII_WIS_RAW_DUMP_MAX_MB (2048)
-python tools\fetch_capture.py                 # pull both captures to the master
-python tools\raw_dump.py --info spad_data\captures\cap_node1.raw
-python tools\replay.py spad_data\captures\cap_node1.raw --outdir replay_out
-
 # Test suite (plain asserts; no pytest in requirements.txt)
 .venv\Scripts\python.exe tests\test_epoch_fix.py
 .venv\Scripts\python.exe run_log.py
@@ -71,8 +62,6 @@ python tools\replay.py spad_data\captures\cap_node1.raw --outdir replay_out
 .venv\Scripts\python.exe tools\dwell_offset.py --selftest
 .venv\Scripts\python.exe chip_map.py --selftest
 .venv\Scripts\python.exe tests\test_nojump_round.py     # no-jump sweep post-processing + uploader glue
-.venv\Scripts\python.exe tools\raw_dump.py --selftest
-.venv\Scripts\python.exe tools\replay.py --selftest
 .venv\Scripts\python.exe correlate_kernel.py      # kernel equivalence
 .venv\Scripts\python.exe synthetic_source.py      # generator + comb
 
@@ -131,9 +120,6 @@ Minimal GUI that starts a command server thread on launch. Receives JSON command
 | `tools/sii_calculator.py` | `SIICalculatorWindow` — interactive bunching-excess / integration-time calculator |
 | `tools/plot_g2_result.py` | Peak-annotated g² histogram + count-distribution PNGs from a saved `{px1}_{px2}_{suffix}.txt` |
 | `tools/analyze_g2_pairs_offline.py` | Offline g² for arbitrary pixel pairs with the robust slave-dwell clock offset (matches the live correlator) |
-| `tools/raw_dump.py` | Reader + `--selftest` for the sender's env-gated raw lSPAD capture (`SII_WIS_RAW_DUMP`); length-prefixed chunks so a replay reproduces the original recv() boundaries |
-| `tools/replay.py` | Replays a capture through `node_backend.run()` into the real receiver loop, and diffs two replays (`px_*.bin` bytes + input-derived stats). The check a parser rewrite has to pass; `--selftest` |
-| `tools/fetch_capture.py` | Pulls both nodes' raw captures back to the master over SFTP and summarizes them (chunks, records, truncation) |
 | `tools/pair_map.py` | Pure (node-1, node-2) pair derivation — identity / grid (both mask-driven) and file for the GUI, plus affine for `align_arc --emit-pairs`; mask cross-check, `--selftest` |
 | `tools/push_mask.py` | Uploads a local mask file to both nodes' lSPAD directories over SFTP, with readback verification. Copies only — applying is still through `master.py` |
 | `ssh_launcher.py` | Paramiko-based remote automation for launching sender nodes |
@@ -234,7 +220,7 @@ Automates sender node startup via paramiko password auth:
 3. Apply pixel mask (`M,<path>`), run TDC calibration (`T,v,1` → `T,c,1`)
 4. Git pull the repo, launch `node.py` detached via venv `pythonw.exe`
 
-`start_detached()` takes an optional `env`. It cannot be done by exporting over SSH: a `Win32_Process.Create` child inherits the **WMI service's** environment, not the session's, so `$env:X = …` is invisible to it. Rather than nest quotes three deep in the WMI command line — where one stray quote silently launches the wrong thing — a small `_launch_env.cmd` is uploaded beside the target and `Create` runs that; nothing persists on the node beyond that file, unlike a Machine-scope variable. This is what lets `SII_WIS_RAW_DUMP` reach the sender at all, since the capture has to be enabled in the sender's own environment at launch. `download_file()` is the counterpart to `upload_file()`, used by `tools/fetch_capture.py`.
+`start_detached()` takes an optional `env`. It cannot be done by exporting over SSH: a `Win32_Process.Create` child inherits the **WMI service's** environment, not the session's, so `$env:X = …` is invisible to it. Rather than nest quotes three deep in the WMI command line — where one stray quote silently launches the wrong thing — a small `_launch_env.cmd` is uploaded beside the target and `Create` runs that; nothing persists on the node beyond that file, unlike a Machine-scope variable. It exists so an environment variable can reach the sender at all. `download_file()` is the counterpart to `upload_file()`.
 
 ### Data files
 
