@@ -435,3 +435,12 @@ Reverting to 2:1 fiber splitter, new spectral alignment.
 - Node2 cross-talk check crashed after 180 sec, shows evidence of 100ns master offset
 - Node2 master chip 100 ns jump confirmed, data files `spad_data/160_161_node2_xtalk600c.txt` (full), `..._lt180s.txt`, `..._gt200s.txt`; figures `figs/30-9-26/crosstalk test 600c/node2_dwell_master_minus_slave.png`, `figs/30-9-26/crosstalk test 600c/node2_160x161_before_after_jump_vs_full.png`; during the 10 minute run the master jumped once by 100 ns, identifiable from dwell markers.
 - Tested live fix on 151 (master) + 184 (slave), two confirmed timing jumps for 151 throughout 30 minutes of integration, but bunching peak is clear and properly positioned. Figures in `figs/30-9-26/jump_fix_demo/`: `live_npz_histograms.png`, `dwell_levels_both_nodes.png` (live run); `offline_raw_vs_corrected_vs_live.png`, `excess_at_three_positions.png`, `peak_vs_time_raw_vs_corrected.png` (same raw data offline, with and without the correction).
+
+## 01-10-26
+
+- Per-pixel TDC offsets characterized from the nearest-neighbour cross-talk peak chain, node 1 (node 2 in progress).
+  - Method: 30 s timestamp runs with 12 overlapping sub-masks tiling `mask_sparse.txt` (7-8 pixels each, so the count rate stays low enough; parts 1-12, masks `.claude/masks/mask_sparse_part_K.txt`). In each run, the g2 of neighbouring pixels on the same node has a cross-talk peak (~350 ps wide) whose position is the TDC offset between the two. Chaining the neighbours through the overlap pixels links all 80 active pixels (118-216) to pixel 160. Master/slave pairs are corrected with the dwell offset first.
+  - Result: offsets span about -1.0 to +2.6 ns relative to pixel 160. Master-chip pixels sit about 1 ns later than slave-chip ones even after the dwell correction - cause not understood yet.
+  - Offset vector saved to `calibration/pixel_offsets_ps_node1.txt` (in git; push to the node as `pixel_offsets_ps.txt` with `tools/push_offsets.py`). Not pushed yet.
+  - Raw data and per-pair histograms in `spad_data/crosstalk_align/` (`node{1,2}/`, `node1/analysis/`). Figures in `figs/1-10-26/` (`crosstalk_offsets_node1.png`, `crosstalk_peak_shapes_node1.png`). Code: `tools/crosstalk_offsets.py`, `tools/tile_mask.py`, `tools/stash_part.py`.
+  - The tiled masks were removed from both nodes' lSPAD directories afterwards.
