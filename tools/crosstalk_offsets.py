@@ -19,7 +19,8 @@ centroid of the whole feature (locate_peak), not the tallest bin.
 Chaining the peaks gives every pixel's offset relative to pixel --ref (160).  The file written,
 calibration\pixel_offsets_ps_node{N}.txt (tracked in git, rename to
 pixel_offsets_ps.txt when pushing to that node), follows node_backend / the temporal-align skill: line N = the value ADDED to
-pixel N's stamps = t_ref - t_pixel = minus the offset above; pixels not in the chain get 0.
+pixel N's stamps = t_ref - t_pixel = minus the offset above, plus (master-chip pixels) minus the node's static
+master-slave dwell level, which the live data still contains; pixels not in the chain get 0.
 
 Per-part results (histograms + peak positions) are stored in analysis\part{K}.npz/.json, and a pair
 that is already stored is never recomputed (--force to redo, --refit to re-locate peaks only).
@@ -112,14 +113,35 @@ def export(rows, cum, tau, out, node, ref):
     if ref not in cum:
         print(f'WARNING: reference {ref} not in the chain; no offsets file written')
         return
+    # a link with no real peak (< MIN_SIGMA over the background) ties nothing: pixels behind it are not measured
+    MIN_SIGMA = 5.0
+    weak = [r for r in rows if (r['peak_counts'] - r['baseline']) / max(r['baseline'], 1) ** .5 < MIN_SIGMA]
+    order = [rows[0]['a']] + [r['b'] for r in rows]
+    seg, cur = {}, 0
+    for r in rows:
+        seg.setdefault(r['a'], cur)
+        if r in weak:
+            cur += 1
+            print(f'WARNING: link {r["a"]}->{r["b"]} has no cross-talk peak (< {MIN_SIGMA:g} sigma); '
+                  f'pixels from {r["b"]} on are cut loose from the chain')
+        seg[r['b']] = cur
+    cum = {p: v for p, v in cum.items() if seg[p] == seg[ref]}
     rel = {p: v - cum[ref] for p, v in cum.items()}          # how LATE the pixel's stamps run vs the reference
     with open(os.path.join(out, 'offsets.csv'), 'w') as f:
         f.write(f'loc,offset_vs_{ref}_ps\n')
         f.writelines(f'{p},{v:.1f}\n' for p, v in rel.items())
+    # The peaks were measured with the master chip's dwell level taken out of its stamps, but the file is applied to
+    # RAW stamps and the live correlator removes only whole 100 ns steps -- so a master pixel's entry must also carry the
+    # node's static master-slave level (about 1 ns).  Verified on the 1-10-26 offset_test (160x160 vs 161x161).
+    lv = [((v + 50) % 100) - 50 for r in rows if r['dwell_level_ns'] for v in r['dwell_level_ns']]
+    L_ps = float(np.median(lv)) * 1000.0
+    print(f'static master-slave level, node {node}: {L_ps:.0f} ps (added to master-chip entries)')
     vec = [0] * 320
     for p, v in rel.items():
-        vec[p] = int(round(-v))                               # file value = t_ref - t_pixel, added to the pixel
-    with open(os.path.join(out, 'pixel_offsets_ps.txt'), 'w', newline='\n') as f:
+        late = v + (L_ps if chip_map.chip_of_loc(p) == 'master' else 0.0)
+        vec[p] = int(round(-late))                            # file value = t_ref - t_pixel, added to the pixel
+    os.makedirs(os.path.join(ROOT, 'calibration'), exist_ok=True)
+    with open(os.path.join(ROOT, 'calibration', f'pixel_offsets_ps_node{node}.txt'), 'w', newline='\n') as f:
         f.writelines(f'{v}\n' for v in vec)
     pk = {r['b']: r['peak_counts'] / max(r['baseline'], 1) for r in rows}
     with open(os.path.join(out, 'pixel_offsets_summary.txt'), 'w') as f:
@@ -197,6 +219,9 @@ def main():
                 key = f"{r['a']}_{r['b']}"
                 stored[key] = r
                 ph[key] = z[key]
+        if stored and not a.refit and not os.path.exists(os.path.join(ROOT, '.claude', 'masks', f'mask_sparse_part_{k}.txt')):
+            rows += json.load(open(pj))      # fully stored and the mask file is gone: nothing left to compute
+            continue
         act = mask_active(k)
         shared = set(act) & (set(mask_active(k - 1) if k > 1 else []) | set(mask_active(k + 1) if os.path.exists(
             os.path.join(ROOT, '.claude', 'masks', f'mask_sparse_part_{k + 1}.txt')) else []))
