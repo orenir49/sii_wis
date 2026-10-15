@@ -305,7 +305,8 @@ SPECIAL_KEY = {
 KEY_SETUP     = 0xFFFFFFFF   # payload: utf-8 output directory
 KEY_END       = 0xFFFFFFFE   # payload: empty — signals end of one session
 INTENSITY_ROWS = 160         # `I,<ms>` with 1 frame / 1 gate step: 320 px, two per row
-_INTENSITY_ROW_RE = re.compile(rb'^\s*\d+,\s*\d+,\s*\d+,\s*\d+\s*$')
+INTENSITY_TAIL_QUIET_S = 0.5  # silence after the last unterminated row = it is complete
+_INTENSITY_ROW_RE =re.compile(rb'^\s*\d+,\s*\d+,\s*\d+,\s*\d+\s*$')
 KEY_INTENSITY = 326          # payload: utf-8 header + raw lSPAD `I` reply (px,count,px2,count2)
 
 # ---------------------------------------------------------------------------
@@ -1372,12 +1373,25 @@ def run_intensity(sock: socket.socket, output_dir: str, duration: float,
                         f'lSPAD sent {len(rows)}/{INTENSITY_ROWS} intensity rows '
                         f'for I,{ms} within {duration + LSPAD_HANDSHAKE_S:.0f} s '
                         f'(measurement time + handshake margin) — check lSPAD is running.')
-                spad_sock.settimeout(left)
+                # lSPAD does not newline-terminate the final row. Once every
+                # other row is in and the leftover parses as a row, a short
+                # silence means it is complete (the one real wait, for the
+                # measurement itself, happens before any row arrives).
+                tail_pending = (len(rows) == INTENSITY_ROWS - 1
+                                and _INTENSITY_ROW_RE.match(buf) is not None)
+                spad_sock.settimeout(min(left, INTENSITY_TAIL_QUIET_S)
+                                     if tail_pending else left)
                 try:
                     chunk = spad_sock.recv(1 << 16)
                 except socket.timeout:
+                    if tail_pending:
+                        rows.append(buf)
+                        buf = b''
                     continue
                 if not chunk:
+                    if tail_pending:
+                        rows.append(buf)
+                        break
                     raise RuntimeError(
                         f'lSPAD closed the connection after {len(rows)}/{INTENSITY_ROWS} '
                         f'rows of I,{ms}')
