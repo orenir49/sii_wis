@@ -305,6 +305,8 @@ SPECIAL_KEY = {
 KEY_SETUP     = 0xFFFFFFFF   # payload: utf-8 output directory
 KEY_END       = 0xFFFFFFFE   # payload: empty — signals end of one session
 INTENSITY_ROWS = 160         # `I,<ms>` with 1 frame / 1 gate step: 320 px, two per row
+INTENSITY_CHUNK_S = 2.0       # lSPAD cuts an I command off near 3 s; stay well under
+INTENSITY_MAX_CALLS = 200
 INTENSITY_TAIL_QUIET_S = 0.5  # silence after the last unterminated row = it is complete
 _INTENSITY_ROW_RE =re.compile(rb'^\s*\d+,\s*\d+,\s*\d+,\s*\d+\s*$')
 KEY_INTENSITY = 326          # payload: utf-8 header + raw lSPAD `I` reply (px,count,px2,count2)
@@ -1313,6 +1315,81 @@ def run(sock: socket.socket,
     return stats
 
 
+def _intensity_once(spad_sock: socket.socket, duration: float,
+                    log_fn=print) -> tuple[list[bytes], float]:
+    """Send one `I,<ms>` and read its INTENSITY_ROWS data rows.
+
+    Returns (rows, seconds from sending to the last byte of the reply).
+    """
+    ms = int(duration * 1000)
+    spad_sock.sendall(f'I,{ms}\n'.encode('utf8'))
+
+    # lSPAD blocks silently for the whole measurement before replying
+    # at all, so drain_lspad's "read until quiet" can't wait for the
+    # first byte — it would see silence immediately (nothing has been
+    # sent yet) and return empty well before the measurement is done.
+    # Block for the reply explicitly, then mop up any trailing bytes.
+    #
+    # Only genuine data rows (`px,count,px2,count2`) count as the
+    # reply. A late answer to the pre-I STOP (or any other stray text)
+    # used to be taken as the whole reply, so the node reported "done"
+    # seconds into the measurement and closed the socket under it.
+    # Keep reading until all INTENSITY_ROWS rows have arrived.
+    t_sent = time.time()
+    t_last = t_sent
+    deadline = t_sent + duration + LSPAD_HANDSHAKE_S
+    buf = b''
+    rows: list[bytes] = []
+    stray: list[bytes] = []
+    while len(rows) < INTENSITY_ROWS:
+        left = deadline - time.time()
+        if left <= 0:
+            raise RuntimeError(
+                f'lSPAD sent {len(rows)}/{INTENSITY_ROWS} intensity rows '
+                f'for I,{ms} within {duration + LSPAD_HANDSHAKE_S:.0f} s '
+                f'(measurement time + handshake margin) — check lSPAD is running.')
+        # lSPAD does not newline-terminate the final row. Once every
+        # other row is in and the leftover parses as a row, a short
+        # silence means it is complete (the one real wait, for the
+        # measurement itself, happens before any row arrives).
+        tail_pending = (len(rows) == INTENSITY_ROWS - 1
+                        and _INTENSITY_ROW_RE.match(buf) is not None)
+        spad_sock.settimeout(min(left, INTENSITY_TAIL_QUIET_S)
+                             if tail_pending else left)
+        try:
+            chunk = spad_sock.recv(1 << 16)
+        except socket.timeout:
+            if tail_pending:
+                rows.append(buf)
+                buf = b''
+            continue
+        if not chunk:
+            if tail_pending:
+                rows.append(buf)
+                break
+            raise RuntimeError(
+                f'lSPAD closed the connection after {len(rows)}/{INTENSITY_ROWS} '
+                f'rows of I,{ms}')
+        buf += chunk
+        t_last = time.time()
+        if not is_text_reply(buf[:8192]):
+            raise RuntimeError(
+                f'lSPAD is still streaming: I,{ms} returned binary data '
+                'instead of an intensity reply. A previous acquisition '
+                'was not stopped.')
+        *lines, buf = buf.split(b'\n')
+        for ln in lines:
+            (rows if _INTENSITY_ROW_RE.match(ln) else stray).append(ln)
+    elapsed = t_last - t_sent
+    for ln in stray:
+        if ln.strip():
+            log_fn(f'Ignored non-data line before/within intensity reply: '
+                   f'{ln[:80]!r}\n')
+    # Mop up trailing bytes so none leak into the next command.
+    drain_lspad(spad_sock, quiet_for=0.3, cap=2.0, keep=0)
+    return rows, elapsed
+
+
 def run_intensity(sock: socket.socket, output_dir: str, duration: float,
                    log_fn=print) -> tuple[int, float]:
     """
@@ -1348,76 +1425,37 @@ def run_intensity(sock: socket.socket, output_dir: str, duration: float,
             drain_lspad(spad_sock, quiet_for=0.4, cap=PRESTART_DRAIN_S)
 
             ms = int(duration * 1000)
-            spad_sock.sendall(f'I,{ms}\n'.encode('utf8'))
-
-            # lSPAD blocks silently for the whole measurement before replying
-            # at all, so drain_lspad's "read until quiet" can't wait for the
-            # first byte — it would see silence immediately (nothing has been
-            # sent yet) and return empty well before the measurement is done.
-            # Block for the reply explicitly, then mop up any trailing bytes.
-            #
-            # Only genuine data rows (`px,count,px2,count2`) count as the
-            # reply. A late answer to the pre-I STOP (or any other stray text)
-            # used to be taken as the whole reply, so the node reported "done"
-            # seconds into the measurement and closed the socket under it.
-            # Keep reading until all INTENSITY_ROWS rows have arrived.
-            t_sent = time.time()
-            deadline = t_sent + duration + LSPAD_HANDSHAKE_S
-            buf = b''
-            rows: list[bytes] = []
-            stray: list[bytes] = []
-            while len(rows) < INTENSITY_ROWS:
-                left = deadline - time.time()
-                if left <= 0:
-                    raise RuntimeError(
-                        f'lSPAD sent {len(rows)}/{INTENSITY_ROWS} intensity rows '
-                        f'for I,{ms} within {duration + LSPAD_HANDSHAKE_S:.0f} s '
-                        f'(measurement time + handshake margin) — check lSPAD is running.')
-                # lSPAD does not newline-terminate the final row. Once every
-                # other row is in and the leftover parses as a row, a short
-                # silence means it is complete (the one real wait, for the
-                # measurement itself, happens before any row arrives).
-                tail_pending = (len(rows) == INTENSITY_ROWS - 1
-                                and _INTENSITY_ROW_RE.match(buf) is not None)
-                spad_sock.settimeout(min(left, INTENSITY_TAIL_QUIET_S)
-                                     if tail_pending else left)
-                try:
-                    chunk = spad_sock.recv(1 << 16)
-                except socket.timeout:
-                    if tail_pending:
-                        rows.append(buf)
-                        buf = b''
-                    continue
-                if not chunk:
-                    if tail_pending:
-                        rows.append(buf)
-                        break
-                    raise RuntimeError(
-                        f'lSPAD closed the connection after {len(rows)}/{INTENSITY_ROWS} '
-                        f'rows of I,{ms}')
-                buf += chunk
-                if not is_text_reply(buf[:8192]):
-                    raise RuntimeError(
-                        f'lSPAD is still streaming: I,{ms} returned binary data '
-                        'instead of an intensity reply. A previous acquisition '
-                        'was not stopped.')
-                *lines, buf = buf.split(b'\n')
-                for ln in lines:
-                    (rows if _INTENSITY_ROW_RE.match(ln) else stray).append(ln)
-            elapsed = time.time() - t_sent
-            for ln in stray:
-                if ln.strip():
-                    log_fn(f'Ignored non-data line before/within intensity reply: '
-                           f'{ln[:80]!r}\n')
+            # lSPAD ends an `I,<ms>` measurement after only ~3 s whatever is
+            # requested (seen 15-10-26: I,10000 replied in 2.94-2.96 s on both
+            # nodes, nothing stray in the stream). So a long request is split
+            # into INTENSITY_CHUNK_S pieces and the per-pixel counts summed;
+            # the time actually integrated is the sum of the replies' own
+            # durations, reported back so a short run is never silent.
+            totals = None
+            integrated = 0.0
+            n_calls = 0
+            while integrated < duration * 0.999 and n_calls < INTENSITY_MAX_CALLS:
+                piece = min(INTENSITY_CHUNK_S, duration - integrated)
+                rows, dt = _intensity_once(spad_sock, piece, log_fn)
+                n_calls += 1
+                got = [[int(x) for x in ln.replace(b'\t', b'').split(b',') if x.strip()]
+                       for ln in rows]
+                if totals is None:
+                    totals = got
+                else:
+                    for t_row, g_row in zip(totals, got):
+                        t_row[1] += g_row[1]
+                        t_row[3] += g_row[3]
+                integrated += dt
+            elapsed = integrated
             if elapsed < 0.9 * duration:
-                log_fn(f'WARNING: intensity reply took {elapsed:.2f} s for a requested '
-                       f'{duration:.2f} s — lSPAD returned early.\n')
-            # Mop up trailing bytes so none leak into the next command.
-            drain_lspad(spad_sock, quiet_for=0.3, cap=2.0, keep=0)
-            reply   = b'\n'.join(rows) + b'\n'
-            n_lines = len(rows)
+                log_fn(f'WARNING: only {elapsed:.2f} s of {duration:.2f} s integrated '
+                       f'after {n_calls} I command(s).\n')
+            reply   = ''.join(f'{r[0]:03d},\t{r[1]},\t\t{r[2]:03d},\t{r[3]}\n'
+                              for r in totals).encode()
+            n_lines = len(totals)
             header = (f'# Classical intensity measurement (lSPAD `I` command)\n'
-                      f'# duration_ms={ms}\n'
+                      f'# duration_ms={ms} integrated_s={integrated:.3f} ({n_calls} I command(s))\n'
                       f'# pixel,counts,pixel,counts\n').encode('utf8')
             payload = header + reply
             sock.sendall(struct.pack('>II', KEY_INTENSITY, len(payload)) + payload)
