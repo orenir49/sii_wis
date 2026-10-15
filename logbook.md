@@ -448,3 +448,9 @@ Reverting to 2:1 fiber splitter, new spectral alignment.
   - Node 2 caveat: the link 200 -> 208 shows no cross-talk peak at all, so pixels 208, 212, 214 and 216 are not tied to the rest of the chain; their entries in the node 2 file are 0 (no correction). Everything below pixel 208 is fine.
   - Offset test (`spad_data/offset_test.npz`, 160x160 vs 161x161 cross-node, offsets pushed): peaks 287 ps apart instead of 0. Cause: the master-chip entries lacked the node's static master-slave dwell level (1.03 ns node 1, 1.28 ns node 2), which the live data still contains; the node-to-node difference of those, 252 ps, matches. Files regenerated with it added to every master-chip entry (`calibration/pixel_offsets_ps_node{1,2}.txt`), pushed to both nodes. Next check: `mask_149_150.txt` (149 master, 150 slave), same cross-node pair test.
   - Offset test with the regenerated files (`spad_data/offset_test2.npz`, 149x149 master vs 150x150 slave, cross-node): peaks 17 +/- 10 ps apart (was 287 ps), so the offsets work. Master-chip peaks are ~50 ps wider (FWHM 222 vs 165 ps).
+
+## 15-10-26
+
+- Spectral alignment still excellent (node 1 vs node 2 arc intensity scans, 10 s) even though the setup has been untouched since the last alignment on 27-09-26. Full detector: a = 1.0012, b = -0.06 px, 15 lines, RMS 0.15 px; active range 118-216: a = 1.0015, b = -0.06 px, 14 lines, RMS 0.15 px. Best lines match to <0.07 px.
+  - Data: `spad_data/intensity/15-10-26/node{1,2}.txt`. Figures: `figs/15-10-26/` (`node1_vs_node2_{traces,fit}.png`, `..._active_range_matches.txt`).
+- Intensity measurements were ending before the requested duration (node log showed "done" early). Cause: a late reply to the pre-`I` STOP was read as the `I` reply. Fixed in `e9e3523`: only data rows count, all 160 are awaited, and the master log now shows integrated vs requested seconds.
