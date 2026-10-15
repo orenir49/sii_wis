@@ -451,6 +451,5 @@ Reverting to 2:1 fiber splitter, new spectral alignment.
 
 ## 15-10-26
 
-- Spectral alignment still excellent (node 1 vs node 2 arc intensity scans, 10 s) even though the setup has been untouched since the last alignment on 27-09-26. Full detector: a = 1.0012, b = -0.06 px, 15 lines, RMS 0.15 px; active range 118-216: a = 1.0015, b = -0.06 px, 14 lines, RMS 0.15 px. Best lines match to <0.07 px.
+- Spectral alignment still excellent even though the setup has been untouched since the last alignment on 27-09-26. Best lines match to <0.07 px.
   - Data: `spad_data/intensity/15-10-26/node{1,2}.txt`. Figures: `figs/15-10-26/` (`node1_vs_node2_{traces,fit}.png`, `..._active_range_matches.txt`).
-- Intensity measurements were ending before the requested duration (node log showed "done" early). Cause: a late reply to the pre-`I` STOP was read as the `I` reply. Fixed in `e9e3523`: only data rows count, all 160 are awaited, and the master log now shows integrated vs requested seconds.
