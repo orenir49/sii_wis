@@ -42,6 +42,7 @@ SPARSE_CAL_WAVEFORM_S = 4.194304  # RIGOL sparse-pulse RAF waveform: 2**23 pts @
 LAG_ALERT_S   = 2.0               # parser this far behind is worth reporting
 CAL_ARM_TIMEOUT_MS = 20_000       # give up waiting for a node's first chunk
 CAL_POLL_MS   = 250               # how often to check collected dwell span
+INTENSITY_MAX_S = 2.95            # lSPAD's `I` command ends the measurement at ~3 s whatever is asked
 CAL_MAX_WAIT_S = 30.0             # backstop if a period never accumulates
 # Free-space safety net for the lag-safe correlator's disk spill
 # (docs/lag_safe_correlator.md, "Bounding disk usage"). A node stuck lagging
@@ -1019,10 +1020,11 @@ class ReceiverGUI:
 
         ttk.Label(acq, text='Mode:').grid(row=0, column=0, sticky='w', padx=8, pady=6)
         self.mode_var = tk.StringVar(value='Timestamp')
-        ttk.Combobox(acq, textvariable=self.mode_var,
+        mode_cb = ttk.Combobox(acq, textvariable=self.mode_var,
                     values=['Timestamp', 'Intensity', 'Monitor'],
-                    state='readonly', width=10).grid(
-            row=0, column=1, columnspan=2, sticky='w', padx=(0, 16))
+                    state='readonly', width=10)
+        mode_cb.grid(row=0, column=1, columnspan=2, sticky='w', padx=(0, 16))
+        mode_cb.bind('<<ComboboxSelected>>', lambda _e: self._cap_intensity_duration())
 
         ttk.Label(acq, text=f'Sparse waveform calibration (auto {SPARSE_CAL_WAVEFORM_S:.2f} s)',
                   ).grid(row=1, column=0, columnspan=5, sticky='w', padx=8, pady=(0, 6))
@@ -1191,6 +1193,9 @@ class ReceiverGUI:
             return
 
         mode = self.mode_var.get()
+        if mode == 'Intensity':
+            self._cap_intensity_duration()
+            duration = float(self.duration_var.get())
         if mode == 'Monitor':
             self._start_monitor(duration)
             return
@@ -1325,6 +1330,19 @@ class ReceiverGUI:
     # ------------------------------------------------------------------
     # Intensity mode  (lSPAD classical intensity measurement)
     # ------------------------------------------------------------------
+
+    def _cap_intensity_duration(self) -> None:
+        """In Intensity mode, limit the duration box to INTENSITY_MAX_S."""
+        if self.mode_var.get() != 'Intensity':
+            return
+        try:
+            d = float(self.duration_var.get())
+        except ValueError:
+            return
+        if d > INTENSITY_MAX_S:
+            self.duration_var.set(f'{INTENSITY_MAX_S:g}')
+            self._enqueue_log(f'Intensity duration capped at {INTENSITY_MAX_S:g} s '
+                              f'(lSPAD ends an I measurement at ~3 s); was {d:g} s.\n')
 
     def _start_intensity(self, duration: float) -> None:
         busy = [n.node_id for n in (self.node1, self.node2)
