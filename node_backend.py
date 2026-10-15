@@ -12,6 +12,7 @@ Or run standalone:
 import argparse
 import json
 import os
+import re
 import select
 import shutil
 import socket
@@ -303,6 +304,8 @@ SPECIAL_KEY = {
 }
 KEY_SETUP     = 0xFFFFFFFF   # payload: utf-8 output directory
 KEY_END       = 0xFFFFFFFE   # payload: empty — signals end of one session
+INTENSITY_ROWS = 160         # `I,<ms>` with 1 frame / 1 gate step: 320 px, two per row
+_INTENSITY_ROW_RE = re.compile(rb'^\s*\d+,\s*\d+,\s*\d+,\s*\d+\s*$')
 KEY_INTENSITY = 326          # payload: utf-8 header + raw lSPAD `I` reply (px,count,px2,count2)
 
 # ---------------------------------------------------------------------------
@@ -1310,7 +1313,7 @@ def run(sock: socket.socket,
 
 
 def run_intensity(sock: socket.socket, output_dir: str, duration: float,
-                   log_fn=print) -> int:
+                   log_fn=print) -> tuple[int, float]:
     """
     Run one classical intensity measurement (lSPAD's `I` command) and relay
     the raw reply to the receiver as a single KEY_INTENSITY chunk.
@@ -1326,7 +1329,7 @@ def run_intensity(sock: socket.socket, output_dir: str, duration: float,
     writes the chunk to a single file, with none of run_session_loop()'s
     per-pixel bookkeeping (an intensity measurement carries no pixel stream).
 
-    Returns the number of data lines written.
+    Returns (data lines written, seconds from sending `I` to the full reply).
     """
     outdir_bytes = output_dir.encode('utf-8')
     sock.sendall(struct.pack('>II', KEY_SETUP, len(outdir_bytes)) + outdir_bytes)
@@ -1351,33 +1354,61 @@ def run_intensity(sock: socket.socket, output_dir: str, duration: float,
             # first byte — it would see silence immediately (nothing has been
             # sent yet) and return empty well before the measurement is done.
             # Block for the reply explicitly, then mop up any trailing bytes.
-            wait_s = duration + LSPAD_HANDSHAKE_S
-            spad_sock.settimeout(wait_s)
-            try:
-                first = spad_sock.recv(1 << 16)
-            except socket.timeout:
-                raise RuntimeError(
-                    f'lSPAD did not reply to I,{ms} within {wait_s:.0f} s '
-                    '(measurement time + handshake margin) — check lSPAD is running.')
-            if not first:
-                raise RuntimeError(f'lSPAD closed the connection with no reply to I,{ms}')
-            more, more_n = drain_lspad(spad_sock, quiet_for=0.3, cap=2.0, keep=1 << 16)
-            reply   = first + more
-            n_bytes = len(first) + more_n
-            if not is_text_reply(reply):
-                raise RuntimeError(
-                    f'lSPAD is still streaming: I,{ms} returned {n_bytes:,} '
-                    'bytes of binary data instead of an intensity reply. A '
-                    'previous acquisition was not stopped.')
-
-            n_lines = reply.count(b'\n')
+            #
+            # Only genuine data rows (`px,count,px2,count2`) count as the
+            # reply. A late answer to the pre-I STOP (or any other stray text)
+            # used to be taken as the whole reply, so the node reported "done"
+            # seconds into the measurement and closed the socket under it.
+            # Keep reading until all INTENSITY_ROWS rows have arrived.
+            t_sent = time.time()
+            deadline = t_sent + duration + LSPAD_HANDSHAKE_S
+            buf = b''
+            rows: list[bytes] = []
+            stray: list[bytes] = []
+            while len(rows) < INTENSITY_ROWS:
+                left = deadline - time.time()
+                if left <= 0:
+                    raise RuntimeError(
+                        f'lSPAD sent {len(rows)}/{INTENSITY_ROWS} intensity rows '
+                        f'for I,{ms} within {duration + LSPAD_HANDSHAKE_S:.0f} s '
+                        f'(measurement time + handshake margin) — check lSPAD is running.')
+                spad_sock.settimeout(left)
+                try:
+                    chunk = spad_sock.recv(1 << 16)
+                except socket.timeout:
+                    continue
+                if not chunk:
+                    raise RuntimeError(
+                        f'lSPAD closed the connection after {len(rows)}/{INTENSITY_ROWS} '
+                        f'rows of I,{ms}')
+                buf += chunk
+                if not is_text_reply(buf[:8192]):
+                    raise RuntimeError(
+                        f'lSPAD is still streaming: I,{ms} returned binary data '
+                        'instead of an intensity reply. A previous acquisition '
+                        'was not stopped.')
+                *lines, buf = buf.split(b'\n')
+                for ln in lines:
+                    (rows if _INTENSITY_ROW_RE.match(ln) else stray).append(ln)
+            elapsed = time.time() - t_sent
+            for ln in stray:
+                if ln.strip():
+                    log_fn(f'Ignored non-data line before/within intensity reply: '
+                           f'{ln[:80]!r}\n')
+            if elapsed < 0.9 * duration:
+                log_fn(f'WARNING: intensity reply took {elapsed:.2f} s for a requested '
+                       f'{duration:.2f} s — lSPAD returned early.\n')
+            # Mop up trailing bytes so none leak into the next command.
+            drain_lspad(spad_sock, quiet_for=0.3, cap=2.0, keep=0)
+            reply   = b'\n'.join(rows) + b'\n'
+            n_lines = len(rows)
             header = (f'# Classical intensity measurement (lSPAD `I` command)\n'
                       f'# duration_ms={ms}\n'
                       f'# pixel,counts,pixel,counts\n').encode('utf8')
             payload = header + reply
             sock.sendall(struct.pack('>II', KEY_INTENSITY, len(payload)) + payload)
-            log_fn(f'Intensity measurement done — {n_lines} line(s).\n')
-            return n_lines
+            log_fn(f'Intensity measurement done — {n_lines} line(s) in {elapsed:.1f} s.\n')
+            return n_lines, elapsed
         finally:
             spad_sock.close()
     finally:
@@ -1583,15 +1614,16 @@ def _run_intensity_cmd(params: dict, send_ctrl, status_fn) -> None:
         send_ctrl({'status': 'measuring'})
         status_fn({'event': 'measuring'})
 
-        n_lines = 0
+        n_lines, elapsed = 0, 0.0
         try:
-            n_lines = run_intensity(
+            n_lines, elapsed = run_intensity(
                 sock, output_dir, duration,
                 log_fn=lambda msg: send_ctrl({'status': 'log', 'msg': msg}))
         finally:
             sock.close()
 
-        send_ctrl({'status': 'intensity_done', 'lines': n_lines})
+        send_ctrl({'status': 'intensity_done', 'lines': n_lines,
+                   'elapsed_s': round(elapsed, 2), 'requested_s': duration})
     except Exception as exc:
         send_ctrl({'status': 'error', 'msg': f'{type(exc).__name__}: {exc}'})
         send_ctrl({'status': 'log',

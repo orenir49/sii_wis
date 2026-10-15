@@ -411,8 +411,13 @@ class NodePanel:
             self._session_active = False
             self._gui(lambda: self._set_data_status('idle'))
             n = msg.get('lines', 0)
+            el, req = msg.get('elapsed_s'), msg.get('requested_s')
+            timing = ('' if el is None or req is None else
+                      f', integrated {el:.2f} s of {req:.2f} s requested'
+                      + (' — SHORT' if el < 0.9 * req else ''))
             self.log_fn(f'[N{self.node_id}] Intensity measurement done — '
-                        f'{n} line(s) written to {self._output_dir}/node{self.node_id}.txt\n')
+                        f'{n} line(s){timing}, written to '
+                        f'{self._output_dir}/node{self.node_id}.txt\n')
         elif s == 'progress':
             self._gui(lambda: self._set_parse_progress(
                 msg.get('m_idx', 0), msg.get('m_total', 0),
