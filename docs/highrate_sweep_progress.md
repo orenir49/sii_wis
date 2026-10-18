@@ -1,5 +1,7 @@
 # High-rate pixel sweep — progress
 
+> Historical (23-09-26). `tools/run_pixel_sweep.py` and the no-jump / sweep_again scripts have since been folded into `tools/sweep/`; see `docs/sweep_runbook.md`. The commands below no longer exist.
+
 Automated per-pixel-pair g2 sweep, driven by `tools/run_pixel_sweep.py`. 100 ps
 bins, ±500 ns range, 20 min integration per round, full lSPAD shutdown +
 relaunch + mask + forced TDC recalibration + fresh dwell-offset calibration

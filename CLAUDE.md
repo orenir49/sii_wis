@@ -61,17 +61,19 @@ python .claude\skills\temporal-align\align_time.py --base spad_data\<session>
 .venv\Scripts\python.exe tests\test_chip_window.py     # ...through the window, real tracker
 .venv\Scripts\python.exe tools\dwell_offset.py --selftest
 .venv\Scripts\python.exe chip_map.py --selftest
-.venv\Scripts\python.exe tests\test_nojump_round.py     # no-jump sweep post-processing + uploader glue
+.venv\Scripts\python.exe tests\test_sweep.py          # sweep plan / round files / status mirror / publisher / runner control flow
+.venv\Scripts\python.exe tools\sweep\plan.py --selftest
 .venv\Scripts\python.exe correlate_kernel.py      # kernel equivalence
 .venv\Scripts\python.exe synthetic_source.py      # generator + comb
 
 # Master-chip vs slave-chip clock offset per node, from the saved dwell markers: prints the level and any jump
 python tools\dwell_offset.py [--dir spad_data\node2] [--json out.json]
 
-# No-jump px 151 reliability sweep: 50 x 20 min, live master-chip correction ON, results to the g2 Sweep artifact.
-# Procedure, outputs, poll loop and recovery: docs\nojump151_sweep_runbook.md. Close master.py first.
-python tools\run_nojump_sweep.py [--dry-run | --replay spad_data --replay-window 400 520 --rounds 1 | --first-round N]
-python tools\nojump_publish.py status|pending|build|mark|wait
+# Headless sweeps: any pixel pairs / integration times, live master-chip correction, unattended; status to a Dropbox folder and/or the
+# g2 Sweep artifact. Procedure, flags, poll loop and recovery: docs\sweep_runbook.md. Close master.py first.
+python tools\sweep\plan.py --mask .claude\masks\mask_sparse.txt --range 118 184 --order centre:151 --time 141-160:600,*:1200   # preview a plan
+python tools\sweep\run.py --name N --pixels 151,150 --time 20m --status-mirror DIR [--joint | --group 2 | --dummy 4 | --rounds 3,5 | --dry-run]
+python tools\sweep\publish.py --name N status [--from DIR] | wait --emit | mark --rounds R --status-version V --wait --emit
 
 # SII bunching-excess / integration-time calculator
 python tools\sii_calculator.py
@@ -110,9 +112,11 @@ Minimal GUI that starts a command server thread on launch. Receives JSON command
 | `correlate_multi.py` | `MultiCorrelateWindow` — **the only correlator**. Up to ~320 pairs, one plot + pair selector, `g²`/count-distribution views, `Compute R…`. `QuadCorrelateWindow` and `CorrelateWindow` were both retired into it 2026-08-26; it also owns the shared `pick_unit`/`_mark_peak_bin` display helpers |
 | `correlate_engine.py` | `ChannelGraph` — which events are safe to correlate and which must be kept, and (optionally) the master-chip time-difference correction. No Tk; 59 + 20 tests |
 | `chip_map.py` | Which chip (master/slave) a pixel *location* is on, via the inverse `PIXMAP` — **not** `loc < 170`; `--selftest` |
-| `tools/run_nojump_sweep.py` | Headless 50 × 20 min sweep of px 151 (master) + dummy slave px 0 with the live master-chip correction; same bring-up as `run_pixel_sweep.py`; `--dry-run`, hardware-free `--replay` |
-| `tools/nojump_round.py` | Per-round fit (fixed-σ amplitude), residual-copy ladder check, `151_151_nojump_{j}.txt` / `nojump151_{j}.npz` / figures, jumps-per-round summary plot, status + records |
-| `tools/nojump_publish.py` | Turns the round records into artifact documents, waits for each round (+5 min), tracks what the artifact already has |
+| `tools/sweep/plan.py` | Round plans: pairs (identity or p1:p2), grouping / joint rounds, order, dummy slave pixel, durations (fixed, per-pixel rules, or sized for an SNR from intensity scans) |
+| `tools/sweep/run.py` | Headless runner: per round full lSPAD reset + per-node masks + calibration, live correlation with the master-chip correction, 3 attempts, resume by skipping rounds that have a record; `--dry-run`, hardware-free `--replay` |
+| `tools/sweep/rounds.py` | Per-round fit (fixed-σ amplitude), residual-copy ladder check, per-pair + summed histograms (`.npz`), figures, records, `StatusBoard` (status JSON + 5-line text every 15 s, Dropbox mirror) |
+| `tools/sweep/publish.py` | Artifact documents + status for the rounds not yet uploaded; `wait --emit` / `mark --wait --emit` make a wake-up three tool calls |
+| `tools/sweep/nodes.py` | Hardware layer of the sweeps: `NodeLink`, reset/launch/masks/calibration, `LiveSource` / `ReplaySource`, AC and port guards |
 | `tools/dwell_offset.py` | `DwellOffsetTracker`: master − slave chip offset from the dwell markers, live or offline; finds the 100 ns jumps; `--selftest` |
 | `correlate_kernel.py` | `_pair_kernel` (`nogil`) + `PairPool`, and the reference `_multistart_multistop` it is proved bitwise identical to — moved here from `correlate.py` so the reference and the proof have one owner; `prewarm()` warms both; `--selftest` |
 | `synthetic_source.py` | Pulsed-laser / Poisson generator — drives the whole path with no detector attached |
