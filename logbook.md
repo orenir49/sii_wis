@@ -453,3 +453,16 @@ Reverting to 2:1 fiber splitter, new spectral alignment.
 
 - Spectral alignment still excellent even though the setup has been untouched since the last alignment on 27-09-26. Best lines match to <0.07 px.
   - Data: `spad_data/intensity/15-10-26/node{1,2}.txt`. Figures: `figs/15-10-26/` (`node1_vs_node2_{traces,fit}.png`, `..._active_range_matches.txt`).
+
+## 18-10-26
+- Completed pixel sweep with timing corrections. All pixels show a bunching signal with a similar strength, though there are some small systematics.
+- Attempted multipixel runs with attenuated count rate.
+  - Two runs using ND filters failed.
+  - A 2 hour run, 17 pixel pairs (152-168), 7-9 Mcps per node, attenuated by misaligning the telescopes, succeeded (`spad_data/g2_histograms/10-26/multipix/g2multi_success.npz`).
+  - No signal visible in any single-pair histogram, but the coadd shows a bunching peak at tau = 13.72 ns: 0.33% height, 5.3 sigma in the tallest bin, 8.3 sigma with a matched filter. **Coadding many pixels detects bunching that no single pair shows.**
+  - Peak FWHM is 0.31 +/- 0.05 ns, against 0.17 +/- 0.01 ns for the 164x164 peak (same 100 ps bins) and ~0.15-0.18 ns on earlier single-pair runs. The peak is also 2.4x lower. Likely cause: the per-pixel temporal alignment is imperfect, so the 17 peaks do not stack (a joint fit with free per-pixel centres gives 0.16 +/- 0.02 ns, centres scattered by ~0.2 ns).
+  - Individually, only pixels 166 and 168 show the peak in a blind +/-100 ns search (4.7 and 5.0 sigma, at 13.8 ns); 164 is marginal.
+  - Figures in `figs/18-10-26/`: `g2multi_success_poc.png`, `g2multi_success_peak_zoom.png`, `g2multi_success_vs_164x164_peak.png`.
+- Tested repeatability of the cross-talk TDC offsets: `mask_sparse.txt`, 30 s integrations, ~30-40 Mcps per node, 5 runs (runs 4-5 after restarting the detectors); nodes were applying the 1-10-26 offsets.
+  - Offsets measured today differ from the 1-10-26 results (leftover ~±0.3 ns on node 1, ~±1 ns on node 2, plus a ~1 ns master/slave-chip step equal to the node's static dwell level), but are consistent across all 5 runs: per-pixel sd ~4 ps (node 1), ~10 ps (node 2), also across the detector restart.
+  - Data and per-run histograms: `spad_data/crosstalk_repeat/`; code: `tools/crosstalk_offsets_run.py`. Figures in `figs/18-10-26/`: `crosstalk_160_161_node1_runs1-5.png`.
