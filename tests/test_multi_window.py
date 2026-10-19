@@ -606,6 +606,42 @@ def test_no_widgets_overlap_in_the_grid():
         root.destroy()
 
 
+def test_coadded_entry_in_pair_selector():
+    """The pair selector's first entry is a blind sum of every pair's histogram."""
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        w, tmp = masked_window(root, range(150, 152), range(150, 152))
+        w._show_preview = lambda *a, **k: None
+        w.mode_var.set('identity')
+        w._derive()
+        check('Coadded is the first selector entry',
+              w.pair_box.cget('values')[0] == 'Coadded (all pairs)')
+        rng = np.random.default_rng(3)
+        h1 = rng.poisson(20.0, 500).astype(np.int64)
+        h2 = rng.poisson(30.0, 500).astype(np.int64)
+        w._bins = np.arange(501, dtype=float)
+        w._hist[(150, 150)], w._hist[(151, 151)] = h1.copy(), h2.copy()
+        w._counts[(150, 150)], w._counts[(151, 151)] = (10, 20), (30, 40)
+        w.pair_var.set('Coadded (all pairs)')
+        h, n = w._coadd_hist()
+        check('coadd is the plain sum', np.array_equal(h, h1 + h2) and n == (40, 60))
+        w._redraw()
+        check('the g2 view titles itself coadded, 2 pairs',
+              'coadded (2 pairs)' in w.ax.get_title(), w.ax.get_title())
+        w.view_var.set('distribution')
+        w._redraw()
+        check('the distribution view works on the coadd too',
+              'coadded' in w.ax.get_title(), w.ax.get_title())
+        w.view_var.set('g2')
+        w.pair_var.set('150 × 150')
+        w._step_pair(-1)
+        check('stepping back from the first pair lands on Coadded', w._is_coadd())
+        shutil.rmtree(tmp, ignore_errors=True)
+    finally:
+        root.destroy()
+
+
 def test_count_distribution_view():
     """Stage 4 port: the count-distribution view moved here from CorrelateWindow.
 

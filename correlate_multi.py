@@ -56,6 +56,7 @@ from sii_calculator import SIICalculatorWindow
 CHIP_MARGIN_TICKS = 1.5   # extra partner data retained per side, in coarse ticks, when a chip shift can apply
 MAX_PAIRS = 320           # guard: grid mode is how you ask for 6400 by accident
 BACKLOG_WARN_S = 2.0
+COADD_LABEL = 'Coadded (all pairs)'   # first entry of the pair selector: blind sum of every pair's histogram
 POLL_MS = 5000            # how often to check the queues for a new batch --
                           # not a display-refresh throttle: T-mode delivers
                           # dwell/pixel data in one burst per completed
@@ -627,7 +628,7 @@ class MultiCorrelateWindow(tk.Toplevel):
         # FAILURE -- so a successful derive left the window telling you to do the
         # thing you had just done, with the pair count in a different label.
         self.status_var.set(f'Derived {len(pl)} pairs. Press Enable to start.')
-        self.pair_box.configure(values=[f'{p.p1} × {p.p2}' for p in pl.pairs])
+        self.pair_box.configure(values=[COADD_LABEL] + [f'{p.p1} × {p.p2}' for p in pl.pairs])
         self.pair_var.set(f'{pl.pairs[0].p1} × {pl.pairs[0].p2}')
         self._show_preview(pl, m1, m2)
 
@@ -1158,14 +1159,30 @@ class MultiCorrelateWindow(tk.Toplevel):
         except ValueError:
             return None
 
+    def _is_coadd(self) -> bool:
+        return self.pair_var.get() == COADD_LABEL
+
+    def _coadd_hist(self):
+        """Blind sum of every derived pair's histogram (no weighting, no pair
+        selection), plus total start/stop event counts, or (None, (0, 0))."""
+        keys = [k for k in self._pair_keys() if k in self._hist]
+        if not keys:
+            return None, (0, 0)
+        tot = np.zeros_like(self._hist[keys[0]], dtype=np.int64)
+        for k in keys:
+            tot += self._hist[k]
+        return tot, (sum(self._counts[k][0] for k in keys),
+                     sum(self._counts[k][1] for k in keys))
+
     def _step_pair(self, delta: int) -> None:
         keys = self._pair_keys()
         if not keys:
             return
-        cur = self._selected_key()
-        i = keys.index(cur) if cur in keys else 0
-        j = (i + delta) % len(keys)
-        self.pair_var.set(f'{keys[j][0]} × {keys[j][1]}')
+        # Cycle order: Coadded, then each pair.
+        labels = [COADD_LABEL] + [f'{a} × {b}' for a, b in keys]
+        cur = self.pair_var.get()
+        i = labels.index(cur) if cur in labels else 1
+        self.pair_var.set(labels[(i + delta) % len(labels)])
 
     def _on_display_change(self, *_) -> None:
         if self._hist:
@@ -1263,8 +1280,16 @@ class MultiCorrelateWindow(tk.Toplevel):
             tmax = float(centers[-1])
         unit, scale = pick_unit(tmax)
 
-        key = self._selected_key()
-        hist = self._hist.get(key)
+        coadd = self._is_coadd()
+        if coadd:
+            key = None
+            hist, (cn1, cn2) = self._coadd_hist()
+            npairs = len([k for k in self._pair_keys() if k in self._hist])
+            what = f'coadded ({npairs} pairs)'
+        else:
+            key = self._selected_key()
+            hist = self._hist.get(key)
+            what = f'pixel {key[0]} × {key[1]}' if key else ''
 
         dist = self.view_var.get() == 'distribution'
 
@@ -1272,15 +1297,15 @@ class MultiCorrelateWindow(tk.Toplevel):
         if hist is None:
             self.ax.set_title('selected pair has no data yet')
         elif dist:
-            n1, n2 = self._counts.get(key, (0, 0))
-            self.ax.set_title(f'Count distribution — pixel {key[0]} × {key[1]}   '
+            n1, n2 = (cn1, cn2) if coadd else self._counts.get(key, (0, 0))
+            self.ax.set_title(f'Count distribution — {what}   '
                               f'({n1:,} × {n2:,} events)')
             self._draw_distribution(hist)
         else:
             self.ax.step(centers / scale, hist.astype(float), where='mid',
                          color='steelblue', linewidth=1)
-            n1, n2 = self._counts.get(key, (0, 0))
-            self.ax.set_title(f'g² — pixel {key[0]} × {key[1]}   '
+            n1, n2 = (cn1, cn2) if coadd else self._counts.get(key, (0, 0))
+            self.ax.set_title(f'g² — {what}   '
                               f'({n1:.1e} × {n2:.1e} events)')
             _mark_peak_bin(self.ax, centers, hist, scale)
             self.ax.set_xlabel(f'τ ({unit})')
@@ -1296,8 +1321,8 @@ class MultiCorrelateWindow(tk.Toplevel):
                 pass
         self.canvas.draw_idle()
 
-        if key is not None:
-            n1, n2 = self._counts.get(key, (0, 0))
+        if key is not None or (coadd and hist is not None):
+            n1, n2 = (cn1, cn2) if coadd else self._counts.get(key, (0, 0))
             snr = self._peak_snr(hist)
             self.pairinfo_var.set(f'{n1:,} start × {n2:,} stop events'
                                   + ('' if np.isnan(snr) else f',  peak SNR {snr:.2f}'))
@@ -1426,6 +1451,9 @@ class MultiCorrelateWindow(tk.Toplevel):
         from the FILENAME, so keeping this exact shape keeps the whole existing
         figure pipeline working with zero changes.
         """
+        if self._is_coadd():
+            self.status_var.set('Select a single pair to export (the .txt name encodes the pixel pair).')
+            return
         key = self._selected_key()
         if key is None or key not in self._hist or self._bins is None:
             self.status_var.set('No histogram for the selected pair.')
