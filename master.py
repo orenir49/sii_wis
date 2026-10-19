@@ -956,7 +956,8 @@ class ReceiverGUI:
         self._multi_correlate_win = MultiCorrelateWindow(
             root,
             get_masks_fn=lambda: (self.node1.mask_source() or self.node1.mask_var.get(),
-                                  self.node2.mask_source() or self.node2.mask_var.get()))
+                                  self.node2.mask_source() or self.node2.mask_var.get()),
+            on_chip_stall=self._on_chip_stall)
         # Every correlator window, in one place. Each one needs its hooks
         # merged, its is_enabled consulted before calibration, and its
         # start_with_offset called on every path out of the cal -- four sites
@@ -1782,6 +1783,18 @@ class ReceiverGUI:
             f'acquisition to protect the disk. Likely cause: a node lagging '
             f'far enough behind to spill (see spad_data/spill/).\n')
         self._end_run('soft')
+
+    def _on_chip_stall(self, msg: str) -> None:
+        """The correlator's master-chip correction has matched no dwell markers well into the
+        run. Log it, and let the user abort now rather than integrate for hours without it."""
+        self._enqueue_log(f'⚠ {msg}\n')
+        if not any(n.is_finishing() for n in (self.node1, self.node2)):
+            return
+        if messagebox.askyesno(
+                'Master-chip correction not working',
+                f'{msg}\n\nAbort the integration now? Restarting the detectors fixed this on '
+                f'19-10-26. (Abort discards photons still buffered in lSPAD.)'):
+            self._end_run('abort')
 
     def _check_correlator_backlog(self) -> None:
         """Soft-stop a live acquisition whose correlator is falling behind.

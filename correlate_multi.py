@@ -53,7 +53,8 @@ from correlate_kernel import (PairPool, bin_edges, prewarm, rebin_diffs,
                               suggest_n_shift, tau_coverage_ps)
 from sii_calculator import SIICalculatorWindow
 
-CHIP_MARGIN_TICKS = 1.5   # extra partner data retained per side, in coarse ticks, when a chip shift can apply
+CHIP_NO_MATCH_S = 45.0    # no master/slave dwell match this long after start: the correction is dead, tell the user
+CHIP_MARGIN_TICKS = 1.5  # extra partner data retained per side, in coarse ticks, when a chip shift can apply
 MAX_PAIRS = 320           # guard: grid mode is how you ask for 6400 by accident
 BACKLOG_WARN_S = 2.0
 COADD_LABEL = 'Coadded (all pairs)'   # first entry of the pair selector: blind sum of every pair's histogram
@@ -184,15 +185,22 @@ def _peak_rss_bytes():
 
 class MultiCorrelateWindow(tk.Toplevel):
 
-    def __init__(self, parent: tk.Tk, get_masks_fn=None) -> None:
+    def __init__(self, parent: tk.Tk, get_masks_fn=None, on_chip_stall=None) -> None:
         """get_masks_fn: () -> (node1_mask, node2_mask) as the receiver has
         them, so the correlator cannot be pointed at a different mask than the
         one actually applied to the hardware. Each element is a
         pair_map.MaskSource (the mask the node is running, carried by value) or
         a path string for standalone/offline use. Optional.
+
+        on_chip_stall: (message: str) -> None, called once per run when the
+        master-chip correction is armed but no master/slave dwell pair has
+        matched CHIP_NO_MATCH_S after the run started. Optional.
         """
         super().__init__(parent)
         self._get_masks_fn = get_masks_fn
+        self._on_chip_stall = on_chip_stall
+        self._chip_t0 = 0.0                # time.monotonic() at start_with_offset
+        self._chip_stall_latched = False   # one prompt per run
         # Whatever get_masks_fn last handed over, per node: a MaskSource or a
         # path. mask1_var/mask2_var hold only the display string.
         self._mask_src: dict = {1: None, 2: None}
@@ -955,6 +963,8 @@ class MultiCorrelateWindow(tk.Toplevel):
         already delivered (the receiver calibrates for seconds before the correlator starts --
         those markers are this session's and let the level be known at once)."""
         self._jump_log = []
+        self._chip_t0 = time.monotonic()
+        self._chip_stall_latched = False
         for n in (1, 2):
             self._trackers[n] = dwell_offset.DwellOffsetTracker()
             if self._graph is not None and n in self._graph.shifters:
@@ -978,6 +988,27 @@ class MultiCorrelateWindow(tk.Toplevel):
                 for j in self._trackers[n].feed(m, s):
                     self._note_jump(n, j)
         self._update_chip_label()
+        self._check_chip_stall()
+
+    def _check_chip_stall(self) -> None:
+        """Once per run: a corrected node that has matched no dwell pair CHIP_NO_MATCH_S after
+        the start has no correction at all (seen 19-10-26: a 3 h run with n_matched = 0 on both
+        nodes), so offer the user the chance to stop and restart instead of finding out later."""
+        if (self._chip_stall_latched or self._on_chip_stall is None or self._graph is None
+                or self._graph.stream_idle
+                or time.monotonic() - self._chip_t0 < CHIP_NO_MATCH_S):
+            return
+        dead = [n for n in (1, 2) if self._corr_px[n] and self._trackers[n].n_matched == 0]
+        if not dead:
+            return
+        self._chip_stall_latched = True
+        detail = '; '.join(f'node {n}: {self._trackers[n].n_matched} matched / '
+                           f'{self._trackers[n].n_unmatched} unmatched master dwell markers'
+                           for n in dead)
+        msg = (f'No master/slave dwell marker has matched {CHIP_NO_MATCH_S:.0f} s into the run '
+               f'({detail}). The master-chip correction is not working, so pairs with a '
+               f'master-chip pixel can split by whole 100 ns ticks.')
+        self.after(0, lambda: self._on_chip_stall(msg))
 
     def _corrected_pairs(self) -> list:
         return [(p1, p2) for p1, p2 in self._chip_pairs
@@ -1001,7 +1032,8 @@ class MultiCorrelateWindow(tk.Toplevel):
                 continue
             tr = self._trackers[n]
             if tr.level_ps is None:
-                parts.append(f'node {n}: waiting for dwell markers')
+                parts.append(f'node {n}: waiting for dwell markers '
+                             f'({tr.n_matched} matched / {tr.n_unmatched} unmatched)')
             else:
                 txt = f'node {n}: master−slave {tr.level_ps / 1e3:+.2f} ns'
                 if tr.jumps:

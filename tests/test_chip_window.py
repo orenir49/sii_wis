@@ -326,6 +326,29 @@ def main():
               w._graph is prev_graph and 'except px' in w.status_var.get(), w.status_var.get())
         w.destroy()
 
+        # -- no dwell pair matches: prompt once, after CHIP_NO_MATCH_S, never when healthy -------
+        import correlate_multi as _cm
+        w = fresh(True)
+        got = []
+        w._on_chip_stall = got.append
+        w._start_trackers()
+        w._check_chip_stall(); root.update()
+        check('stall: nothing before the grace period', not got)
+        w._chip_t0 -= _cm.CHIP_NO_MATCH_S + 1
+        w._check_chip_stall(); w._check_chip_stall(); root.update()
+        check('stall: prompts once when nothing matched', len(got) == 1 and '0 matched' in got[0], str(got))
+        w.destroy()
+        w = fresh(True)
+        got = []
+        w._on_chip_stall = got.append
+        w._start_trackers()
+        for n in (1, 2):
+            w._trackers[n].n_matched = 5
+        w._chip_t0 -= _cm.CHIP_NO_MATCH_S + 1
+        w._check_chip_stall(); root.update()
+        check('stall: no prompt when dwell pairs matched', not got)
+        w.destroy()
+
         # -- meta for the saved file -------------------------------------------------------------
         w = fresh(True)
         drive_window(w, a160, a161, b160, b161, mk_m, mk_s, n_chunks=10, preload_markers=30)
