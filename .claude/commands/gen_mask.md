@@ -2,7 +2,9 @@
 
 Generate a non-redundant sparse pixel mask file for lSPAD: one active pixel per TDC channel. Each TDC digitizes a fixed quartet of consecutive pix IDs, so activating more than one pixel per quartet just gets you redundant readings off the same TDC — the mask picks exactly one pixel per quartet (per detector half: master = pix IDs 170–319, slave = pix IDs 0–169), the one whose PIXMAP value is closest to the physical center (160).
 
-**Numbering:** a pixel has two identities — its *pix ID* (index into `PIXMAP`) and its *physical sensor location* (the value at that index). Grouping into quartets is done by pix ID; "closest to center" is measured in physical location. The mask file itself lists **physical locations** to be deactivated — the same units as lSPAD's `M,<path>` command, `ssh_launcher.py:generate_mask_content`, and the correlator's "Pixel (loc)" fields. Writing pix IDs there instead is a silent corruption: it produces a valid-looking 239-line file that masks entirely the wrong pixels.
+**Numbering:** a pixel has two identities — its *pix ID* (index into `PIXMAP`) and its *physical sensor location* (the value at that index). Grouping into quartets is done by pix ID; "closest to center" is measured in physical location. The mask file itself lists **physical locations** to be deactivated — the same units as lSPAD's `M,<path>` command, `ssh_launcher.py:generate_mask_content`, and the correlator's "Pixel (loc)" fields. Writing pix IDs there instead is a silent corruption: it produces a valid-looking file that masks entirely the wrong pixels.
+
+**Pixel 28 is always masked.** It is a stray location, far from the illuminated 118-216 band, and only adds a spurious link to the cross-talk chain. `gen_mask.py` (`ALWAYS_MASKED`) drops it from every generated mask, so the quartet that would have picked it has no active pixel and the counts are one lower than the quartet rule alone gives. Any mask built by hand or by another tool should leave it masked as well.
 
 ## Usage
 
@@ -19,7 +21,7 @@ Generate a non-redundant sparse pixel mask file for lSPAD: one active pixel per 
 When this skill is invoked, run `gen_mask.py` in the project root (passing `--no-adjacent` / `--out-dir` if given). Report the output file path and counts. The script is version-controlled — edit it in place rather than regenerating it from this document.
 
 Expected output (default):
-`Active: 81  Masked: 239  -> C:\Program Files (x86)\SPADlambda\lSPAD_standalone_win64\mask_sparse.txt`
+`Active: 80  Masked: 240  -> C:\Program Files (x86)\SPADlambda\lSPAD_standalone_win64\mask_sparse.txt`
 
 To sanity-check a generated mask, confirm that every quartet has exactly one active location and that it is the one closest to 160 — e.g. slave pix IDs 0–3 are locations {190, 230, 138, 62}, so only 138 should be active.
 

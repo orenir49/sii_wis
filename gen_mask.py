@@ -17,6 +17,10 @@ args = parser.parse_args()
 
 CENTER = 160
 
+# Physical locations that are never active, whatever the selection picks: pixel 28 is a stray (far from the
+# illuminated 118-216 band, no real signal) that only adds a spurious chain link to the cross-talk calibration.
+ALWAYS_MASKED = {28}
+
 def dist(i):
     return abs(PIXMAP[i] - CENTER)
 
@@ -40,7 +44,9 @@ for section in (master_idxs, slave_idxs):
 # `active` holds pix IDs (PIXMAP indices); the mask file speaks physical
 # sensor locations (PIXMAP values), same as lSPAD's M,<path> and the
 # correlator's "Pixel (loc)" fields.
-masked = sorted(int(PIXMAP[i]) for i in range(320) if i not in active)
+masked = sorted(int(PIXMAP[i]) for i in range(320)
+                if i not in active or int(PIXMAP[i]) in ALWAYS_MASKED)
+active = {i for i in active if int(PIXMAP[i]) not in ALWAYS_MASKED}
 
 suffix = '_no_adj' if args.no_adjacent else ''
 out = os.path.join(args.out_dir, f'mask_sparse{suffix}.txt')

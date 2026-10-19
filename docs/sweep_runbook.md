@@ -22,7 +22,7 @@ not touch anything).
 
 ```powershell
 # every mask_sparse pixel in 118-184 alone, centre-out, 10 min for 141-160 and 20 min elsewhere  (= the 16-10-26 sweep_again plan)
-python tools\sweep\plan.py --mask .claude\masks\mask_sparse.txt --range 118 184 --exclude 28 --order centre:151 --time 141-160:600,*:1200
+python tools\sweep\plan.py --mask .claude\masks\mask_sparse.txt --range 118 184 --order centre:151 --time 141-160:600,*:1200
 # the same pixels sized for SNR 10 from intensity scans (counts/duration_ms header), 0.7 % excess, 100 ps bins, floor 1 min, cap 2 h
 python tools\sweep\plan.py --mask .claude\masks\mask_sparse.txt --time snr:10 --intensity node1.txt node2.txt --max-time 2h
 # ONE joint round: all pairs share an acquisition, their histograms are also summed (what an attenuated all-pixel run needs)
@@ -37,7 +37,7 @@ python tools\sweep\plan.py --pairs 151:152,150,148:154,147 --group 2 --time 20m
   pixel, because the jump tracker needs slave dwell markers. `--dummy 4` forces it on every round: **px 166, 178 and 180 only gave
   node-2 data with it** (no data otherwise, "empty CSV"); `--dummy none` never.
 * Masks are per node, so `p1 != p2` pairs work. The correction runs for every master-chip pixel on a node.
-* Rates: node limit is about 8 Mcps per node (7.5 worked, ~11 crashed a node-2 lSPAD). 81 `mask_sparse` pixels at the 15-10-26 1 s scan sum
+* Rates: node limit is about 8 Mcps per node (7.5 worked, ~11 crashed a node-2 lSPAD). 80 `mask_sparse` pixels (pixel 28 is now masked; the sum below was for the earlier 81) at the 15-10-26 1 s scan sum
   to ~363 / 378 Mcps, so a joint run needs ~45-50x attenuation (OD ~1.7); the plan does not check this.
 
 ## 2. Run
