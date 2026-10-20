@@ -15,6 +15,39 @@ PASS / FAIL / WARN, so the first FAIL is where to look.
 
 Set $NodeIp (and $MasterIp) at the top of each part first.
 
+(The report function is 'Rep', not 'R': in Windows PowerShell 5.1 'R' is a
+built-in alias of Invoke-History, and an alias beats a function of the same
+name, so every check used to error out instead of printing.)
+
+
+=====================================================================
+RESULTS -- node 2 (192.168.2.11), 20-10-26
+=====================================================================
+PART A, Administrator PowerShell on node 2: every check PASSES.
+
+  A1  PASS  Administrator
+  A2  PASS  192.168.2.11 on 'Ethernet 3' /24, Up, 2.5 Gbps, mac 00-0A-CD-47-EF-86
+  A2c WARN  category Private (informational)
+  A3  PASS  node -> master ping 192.168.2.10
+  A4  PASS  sshd Running, startup Automatic
+  A5  PASS  TCP 22 listening on 0.0.0.0 and ::
+  A6  PASS  node -> itself 192.168.2.11:22
+  A7  PASS  OpenSSH-Server-In-TCP (22) and SII-WIS-Node-Command-Server (50010):
+            enabled, Allow, Inbound, Domain+Private+Public
+  A8  PASS  ICMPv4 echo-request allow rules enabled (File and Printer Sharing)
+  A9  PASS  no enabled inbound BLOCK rules at all
+  A10 WARN  firewall on for Domain/Private/Public, defaultInbound NotConfigured
+  A11 PASS  no third-party AV / firewall
+  A12 PASS  no virtual / VPN adapter Up
+  (node 2 also has Wi-Fi on 192.168.137.206 and several 169.254.x adapters;
+   none share the 192.168.2.0/24 subnet)
+
+Nothing on the node explains the timeout. NEXT, on the MASTER: run PART B
+with $NodeIp = '192.168.2.11'. Check that B1's source is 192.168.2.10 (else
+the master routes node 2 out the wrong NIC) and that B2's mac is
+00-0A-CD-47-EF-86 (else stale ARP / wrong device). If B3/B4 still fail, run
+PART C on node 2 while testing from the master.
+
 
 =====================================================================
 PART A -- run on the NODE (Administrator PowerShell)
@@ -23,54 +56,54 @@ PART A -- run on the NODE (Administrator PowerShell)
 $NodeIp   = '192.168.2.11'     # node 1: 192.168.1.11   node 2: 192.168.2.11
 $MasterIp = '192.168.2.10'     # node 1: 192.168.1.10   node 2: 192.168.2.10
 $CmdPort  = 50010
-function R($ok, $name, $detail = '') {
-    $tag = if ($ok -eq 'warn') { 'WARN' } elseif ($ok) { 'PASS' } else { 'FAIL' }
+function Rep($ok, $name, $detail = '') {
+    $tag = if ($ok -is [string] -and $ok -eq 'warn') { 'WARN' } elseif ($ok) { 'PASS' } else { 'FAIL' }
     $col = @{PASS='Green'; FAIL='Red'; WARN='Yellow'}[$tag]
     Write-Host ("[{0}] {1}  {2}" -f $tag, $name, $detail) -ForegroundColor $col
 }
 
 # A1  elevated?
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-R $isAdmin 'A1 running as Administrator' '(firewall queries below need it)'
+Rep $isAdmin 'A1 running as Administrator' '(firewall queries below need it)'
 
 # A2  this PC really owns the node IP, on an adapter that is Up
 $ip = Get-NetIPAddress -AddressFamily IPv4 -IPAddress $NodeIp -ErrorAction SilentlyContinue
-R ([bool]$ip) "A2 $NodeIp is assigned to this PC" ($ip | ForEach-Object { "$($_.InterfaceAlias) /$($_.PrefixLength)" })
+Rep ([bool]$ip) "A2 $NodeIp is assigned to this PC" ($ip | ForEach-Object { "$($_.InterfaceAlias) /$($_.PrefixLength)" })
 if ($ip) {
     $nic = Get-NetAdapter -InterfaceIndex $ip.InterfaceIndex
-    R ($nic.Status -eq 'Up') "A2b adapter '$($nic.Name)' is Up" "status=$($nic.Status) mac=$($nic.MacAddress) speed=$($nic.LinkSpeed)"
+    Rep ($nic.Status -eq 'Up') "A2b adapter '$($nic.Name)' is Up" "status=$($nic.Status) mac=$($nic.MacAddress) speed=$($nic.LinkSpeed)"
     $cat = (Get-NetConnectionProfile -InterfaceIndex $ip.InterfaceIndex -ErrorAction SilentlyContinue).NetworkCategory
-    R 'warn' "A2c network category on that adapter" "$cat   (informational: the rules should cover every profile)"
+    Rep 'warn' "A2c network category on that adapter" "$cat   (informational: the rules should cover every profile)"
 }
 
 # A3  can the node reach the master (the direction that already worked)
 $p = Test-Connection $MasterIp -Count 2 -Quiet
-R $p "A3 node -> master ping $MasterIp"
+Rep $p "A3 node -> master ping $MasterIp"
 
 # A4  sshd service
 $svc = Get-Service sshd -ErrorAction SilentlyContinue
-R ($svc -and $svc.Status -eq 'Running') 'A4 sshd service running' "status=$($svc.Status) startup=$($svc.StartType)"
+Rep ($svc -and $svc.Status -eq 'Running') 'A4 sshd service running' "status=$($svc.Status) startup=$($svc.StartType)"
 
 # A5  something is LISTENING on 22, and on which address
 $ls = Get-NetTCPConnection -LocalPort 22 -State Listen -ErrorAction SilentlyContinue
-R ([bool]$ls) 'A5 TCP 22 is listening' (($ls | ForEach-Object { $_.LocalAddress }) -join ', ')
+Rep ([bool]$ls) 'A5 TCP 22 is listening' (($ls | ForEach-Object { $_.LocalAddress }) -join ', ')
 if ($ls -and -not ($ls | Where-Object { $_.LocalAddress -in '0.0.0.0','::',$NodeIp })) {
-    R $false 'A5b listening address covers the node IP' '(sshd_config ListenAddress may be restricting it)'
+    Rep $false 'A5b listening address covers the node IP' '(sshd_config ListenAddress may be restricting it)'
 }
 
 # A6  node can connect to ITSELF on its own IP. This goes through the local
 #     stack, so it proves sshd is bound to $NodeIp -- if A6 passes but the
 #     master still times out, the packets are being dropped on the way IN.
 $self = Test-NetConnection $NodeIp -Port 22 -WarningAction SilentlyContinue
-R $self.TcpTestSucceeded "A6 node -> itself $NodeIp`:22"
+Rep $self.TcpTestSucceeded "A6 node -> itself $NodeIp`:22"
 
 # A7  the allow rules that setup_node.ps1 creates
 foreach ($n in 'OpenSSH-Server-In-TCP', 'SII-WIS-Node-Command-Server') {
     $r = Get-NetFirewallRule -Name $n -ErrorAction SilentlyContinue
-    if (-not $r) { R $false "A7 firewall rule $n exists"; continue }
+    if (-not $r) { Rep $false "A7 firewall rule $n exists"; continue }
     $port = ($r | Get-NetFirewallPortFilter).LocalPort
     $ok = ($r.Enabled -eq 'True') -and ($r.Action -eq 'Allow') -and ($r.Direction -eq 'Inbound')
-    R $ok "A7 rule $n" "enabled=$($r.Enabled) action=$($r.Action) profile=$($r.Profile) port=$port"
+    Rep $ok "A7 rule $n" "enabled=$($r.Enabled) action=$($r.Action) profile=$($r.Profile) port=$port"
 }
 
 # A8  the ICMP echo rule. setup_node.ps1 flips it by its ENGLISH display
@@ -78,27 +111,27 @@ foreach ($n in 'OpenSSH-Server-In-TCP', 'SII-WIS-Node-Command-Server') {
 $icmp = Get-NetFirewallRule -Direction Inbound -Action Allow -Enabled True -ErrorAction SilentlyContinue |
     Where-Object { (($_ | Get-NetFirewallPortFilter).Protocol -in 'ICMPv4','1') -and
                    (($_ | Get-NetFirewallPortFilter).IcmpType -match '8|Any') }
-R ([bool]$icmp) 'A8 an enabled inbound ICMPv4 echo-request ALLOW rule exists' (($icmp | Select-Object -First 3 -ExpandProperty DisplayName) -join ' | ')
+Rep ([bool]$icmp) 'A8 an enabled inbound ICMPv4 echo-request ALLOW rule exists' (($icmp | Select-Object -First 3 -ExpandProperty DisplayName) -join ' | ')
 
 # A9  anything that BLOCKS port 22 / ICMP -- a block beats every allow
 $blocks = Get-NetFirewallRule -Direction Inbound -Action Block -Enabled True -ErrorAction SilentlyContinue |
     Where-Object { $pf = $_ | Get-NetFirewallPortFilter; ($pf.LocalPort -contains '22') -or ($pf.LocalPort -eq 'Any' -and $pf.Protocol -eq 'Any') -or ($pf.Protocol -in 'ICMPv4','1') }
-R (-not $blocks) 'A9 no enabled inbound BLOCK rule hits port 22 / ICMP' (($blocks | Select-Object -ExpandProperty DisplayName) -join ' | ')
+Rep (-not $blocks) 'A9 no enabled inbound BLOCK rule hits port 22 / ICMP' (($blocks | Select-Object -ExpandProperty DisplayName) -join ' | ')
 
 # A10 profile-level state
 Get-NetFirewallProfile | ForEach-Object {
-    R 'warn' "A10 profile $($_.Name)" "enabled=$($_.Enabled) defaultInbound=$($_.DefaultInboundAction)   (informational)"
+    Rep 'warn' "A10 profile $($_.Name)" "enabled=$($_.Enabled) defaultInbound=$($_.DefaultInboundAction)   (informational)"
 }
 
 # A11 third-party AV / firewall (these can drop traffic with Windows rules untouched)
 $av = Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct -ErrorAction SilentlyContinue
 $fw = Get-CimInstance -Namespace root/SecurityCenter2 -ClassName FirewallProduct -ErrorAction SilentlyContinue
 $other = @($av) + @($fw) | Where-Object { $_ -and $_.displayName -notmatch 'Windows Defender|Microsoft Defender|Windows Firewall' }
-R (-not $other) 'A11 no third-party AV / firewall product' (($other | Select-Object -ExpandProperty displayName -Unique) -join ', ')
+Rep (-not $other) 'A11 no third-party AV / firewall product' (($other | Select-Object -ExpandProperty displayName -Unique) -join ', ')
 
 # A12 is the NIC bridged / on a VPN / virtual switch that might eat the traffic
 $virt = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and $_.InterfaceDescription -match 'Hyper-V|VPN|TAP|Virtual|VMware|Bridge' }
-R (-not $virt) 'A12 no virtual / VPN adapter Up' (($virt | Select-Object -ExpandProperty Name) -join ', ')
+Rep (-not $virt) 'A12 no virtual / VPN adapter Up' (($virt | Select-Object -ExpandProperty Name) -join ', ')
 
 Interpreting A:
   A6 FAIL                   sshd is not bound to the node IP (A4/A5 say why).
@@ -116,28 +149,28 @@ PART B -- run on the MASTER (any PowerShell)
 =====================================================================
 
 $NodeIp = '192.168.2.11'
-function R($ok, $name, $detail = '') {
-    $tag = if ($ok -eq 'warn') { 'WARN' } elseif ($ok) { 'PASS' } else { 'FAIL' }
+function Rep($ok, $name, $detail = '') {
+    $tag = if ($ok -is [string] -and $ok -eq 'warn') { 'WARN' } elseif ($ok) { 'PASS' } else { 'FAIL' }
     $col = @{PASS='Green'; FAIL='Red'; WARN='Yellow'}[$tag]
     Write-Host ("[{0}] {1}  {2}" -f $tag, $name, $detail) -ForegroundColor $col
 }
 
 # B1  which local adapter / source address would be used
 $route = Find-NetRoute -RemoteIPAddress $NodeIp | Select-Object -First 1
-R ([bool]$route) "B1 route to $NodeIp" "via $($route.InterfaceAlias) src $($route.IPAddress)"
+Rep ([bool]$route) "B1 route to $NodeIp" "via $($route.InterfaceAlias) src $($route.IPAddress)"
 
 # B2  link level: does the node answer ARP, and with which MAC
 Test-Connection $NodeIp -Count 1 -Quiet | Out-Null
 $nb = Get-NetNeighbor -IPAddress $NodeIp -ErrorAction SilentlyContinue | Select-Object -First 1
-R ($nb -and $nb.State -in 'Reachable','Stale','Delay','Probe') "B2 ARP entry for $NodeIp" "mac=$($nb.LinkLayerAddress) state=$($nb.State)   (compare mac with Get-NetAdapter on the node)"
+Rep ($nb -and $nb.State -in 'Reachable','Stale','Delay','Probe') "B2 ARP entry for $NodeIp" "mac=$($nb.LinkLayerAddress) state=$($nb.State)   (compare mac with Get-NetAdapter on the node)"
 
 # B3  ping
-R (Test-Connection $NodeIp -Count 3 -Quiet) "B3 ping $NodeIp"
+Rep (Test-Connection $NodeIp -Count 3 -Quiet) "B3 ping $NodeIp"
 
 # B4  the actual ports
 foreach ($port in 22, 50010) {
     $t = Test-NetConnection $NodeIp -Port $port -WarningAction SilentlyContinue
-    R $t.TcpTestSucceeded "B4 TCP $port" "source $($t.SourceAddress.IPAddress)"
+    Rep $t.TcpTestSucceeded "B4 TCP $port" "source $($t.SourceAddress.IPAddress)"
 }
 
 # B5  ssh banner (proves sshd, not just a listening socket)
@@ -148,10 +181,10 @@ try {
         $s = $c.GetStream(); $s.ReadTimeout = 4000
         $buf = New-Object byte[] 64; $n = $s.Read($buf, 0, 64)
         $banner = [Text.Encoding]::ASCII.GetString($buf, 0, $n).Trim()
-        R ($banner -like 'SSH-*') 'B5 ssh banner' $banner
-    } else { R $false 'B5 ssh banner' 'no connection within 4 s' }
+        Rep ($banner -like 'SSH-*') 'B5 ssh banner' $banner
+    } else { Rep $false 'B5 ssh banner' 'no connection within 4 s' }
     $c.Close()
-} catch { R $false 'B5 ssh banner' $_.Exception.Message }
+} catch { Rep $false 'B5 ssh banner' $_.Exception.Message }
 
 Interpreting B:
   B2 PASS, B3 FAIL, B4 FAIL   L2 is fine, node drops it -> run PART A on the node.
