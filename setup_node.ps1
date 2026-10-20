@@ -180,12 +180,85 @@ Write-Ok 'ICMPv4 ping enabled for all network profiles'
 # ---------------------------------------------------------------------------
 Write-Step 'Step 4: Python'
 
-$pythonCmd = Get-Command python -ErrorAction SilentlyContinue
+$PYTHON_VERSION = '3.12.8'   # numba/numpy wheels exist for 3.12; newer majors lag
+$PYTHON_URL     = "https://www.python.org/ftp/python/$PYTHON_VERSION/python-$PYTHON_VERSION-amd64.exe"
+
+function Update-SessionPath {
+    # Installers edit the registry PATH; this shell keeps its old copy.
+    $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' +
+                [Environment]::GetEnvironmentVariable('Path', 'User')
+}
+
+function Get-RealPython {
+    # The Microsoft Store alias in WindowsApps is a stub that opens the Store
+    # instead of running Python, so check that it actually answers.
+    $cmd = Get-Command python -ErrorAction SilentlyContinue
+    if (-not $cmd -or $cmd.Source -like '*\WindowsApps\*') { return $null }
+    & python --version *> $null
+    if ($LASTEXITCODE -ne 0) { return $null }
+    return $cmd
+}
+
+function Install-FromUrl($Url, $Args_, $Label) {
+    $tmp = Join-Path $env:TEMP ([IO.Path]::GetFileName($Url))
+    Write-Info "Downloading $Label from $Url ..."
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    Invoke-WebRequest -Uri $Url -OutFile $tmp -UseBasicParsing
+    Write-Info "Running $Label installer (silent)..."
+    $p = Start-Process -FilePath $tmp -ArgumentList $Args_ -Wait -PassThru
+    Remove-Item $tmp -ErrorAction SilentlyContinue
+    if ($p.ExitCode -ne 0) { throw "$Label installer exited with code $($p.ExitCode)" }
+}
+
+function Add-MachinePath($Dir) {
+    # Persist $Dir in the machine PATH (idempotent), and in this session.
+    $machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+    $parts   = $machine -split ';' | Where-Object { $_ }
+    if ($parts -notcontains $Dir) {
+        [Environment]::SetEnvironmentVariable('Path', ($parts + $Dir) -join ';', 'Machine')
+        Write-Ok "Added $Dir to the machine PATH"
+    }
+    Update-SessionPath
+}
+
+function Repair-PathFor($Exe, $Candidates, $AlsoDirs = @()) {
+    # Tool is installed but not on PATH: find it and add its directory.
+    $found = $Candidates | ForEach-Object { Get-ChildItem $_ -ErrorAction SilentlyContinue } |
+             Select-Object -First 1
+    if (-not $found) { return $false }
+    Add-MachinePath $found.DirectoryName
+    foreach ($d in $AlsoDirs) {
+        $dir = Join-Path $found.DirectoryName $d
+        if (Test-Path $dir) { Add-MachinePath $dir }
+    }
+    return $true
+}
+
+$hasWinget = [bool](Get-Command winget -ErrorAction SilentlyContinue)
+
+$pythonCmd = Get-RealPython
+if (-not $pythonCmd) {
+    # Installed but not on PATH (or only the Store stub is)?
+    $pyGlobs = @("$env:ProgramFiles\Python3*\python.exe",
+                 "$env:LOCALAPPDATA\Programs\Python\Python3*\python.exe")
+    if (Repair-PathFor 'python.exe' $pyGlobs @('Scripts')) { $pythonCmd = Get-RealPython }
+}
+if (-not $pythonCmd) {
+    try {
+        Write-Info 'Python not found — installing...'
+        Install-FromUrl $PYTHON_URL '/quiet InstallAllUsers=1 PrependPath=1 Include_test=0' "Python $PYTHON_VERSION"
+        Update-SessionPath
+        $pythonCmd = Get-RealPython
+        if (-not $pythonCmd -and (Repair-PathFor 'python.exe' $pyGlobs @('Scripts'))) {
+            $pythonCmd = Get-RealPython
+        }
+    } catch {
+        Write-Warn "Automatic Python install failed ($($_.Exception.Message)). Install from https://python.org (add to PATH), then re-run."
+    }
+}
 if ($pythonCmd) {
     $ver = & python --version 2>&1
     Write-Ok "$ver at $($pythonCmd.Source)"
-} else {
-    Write-Warn 'Python not found. Install from https://python.org (add to PATH), then re-run.'
 }
 
 # ---------------------------------------------------------------------------
@@ -194,11 +267,75 @@ if ($pythonCmd) {
 Write-Step 'Step 5: Git'
 
 $gitCmd = Get-Command git -ErrorAction SilentlyContinue
+if (-not $gitCmd) {
+    if (Repair-PathFor 'git.exe' @("$env:ProgramFiles\Git\cmd\git.exe")) {
+        $gitCmd = Get-Command git -ErrorAction SilentlyContinue
+    }
+}
+if (-not $gitCmd) {
+    try {
+        Write-Info 'Git not found — installing...'
+        if ($hasWinget) {
+            winget install --id Git.Git -e --silent --accept-package-agreements --accept-source-agreements
+            if ($LASTEXITCODE -ne 0) { throw "winget exited with code $LASTEXITCODE" }
+        } else {
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            $rel   = Invoke-RestMethod 'https://api.github.com/repos/git-for-windows/git/releases/latest' -UseBasicParsing
+            $asset = $rel.assets | Where-Object { $_.name -match '^Git-.*-64-bit\.exe$' } | Select-Object -First 1
+            if (-not $asset) { throw 'no 64-bit installer in the latest Git for Windows release' }
+            Install-FromUrl $asset.browser_download_url '/VERYSILENT /NORESTART' 'Git'
+        }
+        Update-SessionPath
+        $gitCmd = Get-Command git -ErrorAction SilentlyContinue
+        if (-not $gitCmd -and (Repair-PathFor 'git.exe' @("$env:ProgramFiles\Git\cmd\git.exe"))) {
+            $gitCmd = Get-Command git -ErrorAction SilentlyContinue
+        }
+    } catch {
+        Write-Warn "Automatic Git install failed ($($_.Exception.Message)). Install from https://git-scm.com, then re-run."
+    }
+}
 if ($gitCmd) {
     $ver = & git --version 2>&1
     Write-Ok "$ver"
+}
+
+# ---------------------------------------------------------------------------
+# Step 5b — lSPAD standalone driver
+# ---------------------------------------------------------------------------
+# Must land in SPADlambda\lSPAD_standalone_win64: that is the only place
+# node_backend.find_lspad_dir_local and ssh_launcher.find_lspad_dir look
+# (outdated installs live in sibling directories and must not be picked up).
+# Skipped when lSPAD.exe is already there, so a re-run never overwrites the
+# node's masks or pixel_offsets_ps.txt.
+Write-Step 'Step 5b: lSPAD'
+
+$LSPAD_URL  = 'https://piimaging.com/software/lSPAD_standalone_win64.zip'
+$LSPAD_DEST = Join-Path ${env:ProgramFiles(x86)} 'SPADlambda\lSPAD_standalone_win64'
+
+$lspadExe = Get-ChildItem $LSPAD_DEST -Filter 'lSPAD.exe' -Recurse -Force -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+if ($lspadExe) {
+    Write-Ok "lSPAD already installed at $($lspadExe.DirectoryName)"
 } else {
-    Write-Warn 'Git not found. Install from https://git-scm.com, then re-run.'
+    $zip = Join-Path $env:TEMP 'lSPAD_standalone_win64.zip'
+    try {
+        Write-Info "Downloading lSPAD from $LSPAD_URL ..."
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri $LSPAD_URL -OutFile $zip -UseBasicParsing
+        New-Item -ItemType Directory -Force -Path $LSPAD_DEST | Out-Null
+        Expand-Archive -Path $zip -DestinationPath $LSPAD_DEST -Force
+        $lspadExe = Get-ChildItem $LSPAD_DEST -Filter 'lSPAD.exe' -Recurse -Force |
+                    Select-Object -First 1
+        if ($lspadExe) {
+            Write-Ok "lSPAD installed at $($lspadExe.DirectoryName)"
+        } else {
+            Write-Warn "lSPAD zip extracted to $LSPAD_DEST but lSPAD.exe was not found in it."
+        }
+    } catch {
+        Write-Warn "Automatic lSPAD install failed ($($_.Exception.Message)). Download $LSPAD_URL and unzip it into $LSPAD_DEST."
+    } finally {
+        Remove-Item $zip -ErrorAction SilentlyContinue
+    }
 }
 
 # ---------------------------------------------------------------------------
