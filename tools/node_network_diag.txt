@@ -63,7 +63,41 @@ so a firewall rule cannot explain this and PART C is unlikely to help.
 Suspects: the node NIC / driver dropping frames addressed to its own mac, or
 the cable / switch port / speed negotiation (both ends are 2.5 Gbps).
 
-NEXT: run PART D on node 2 while pinging from the master.
+PART D + pktmon, node 2, 20-10-26 (master running ping -t) -- CAUSE FOUND:
+
+  Unicast=4  Broadcast=2  SentUni=0  Discarded=0  Errors=0   over 20 s
+  (4 is about right: a timing-out ping -t sends one request per ~5 s. The
+   counters are fine -- node -> master ping moved SentUni +4 / RecvUni +5.)
+
+  pktmon capture, filter 192.168.2.10: the echo requests (seq 44-47) arrive
+  with the right macs and go  NIC 139 (Realtek USB 2.5GbE, rtucx21x64.sys)
+  -> NDIS 4 -> WFP Native Filter 35 -> vsdatant.sys 34 "Zone Alarm Firewall
+  Driver" ... and are never seen again: not at QoS 33, WFP 802.3 32 or
+  TCPIP 73, no pktmon drop counter, no WFP 5152 drop event, 0 replies.
+
+  vsdatant.sys is the CHECK POINT ENDPOINT SECURITY firewall (the laptop also
+  has the Check Point Endpoint VPN client). Its NDIS filter is bound to every
+  adapter, Ethernet 3 included, BELOW the Windows firewall -- so the Windows
+  allow rules (A7, A8) never see the packets, and turning the Windows firewall
+  off (PART C) would not help. Driver state: RUNNING, start=SYSTEM_START; the
+  Check Point services 'EPWD' (Endpoint Client Watchdog) and 'TracSrvWrapper'
+  (Endpoint Security VPN) are both STOPPED, i.e. the driver is enforcing with
+  no client managing it. Outbound-initiated traffic passes (the node can ping
+  the master and gets replies), unsolicited inbound (ping, ssh 22, 50010) is
+  dropped.
+
+  A11 missed it: Check Point did not register in SecurityCenter2, and its
+  binding's ComponentID is 'MS_NdisLwf', so it even looks like a Microsoft
+  component. A13 below now checks the adapter's filter bindings directly.
+
+FIX (needs a decision -- this is the institute's managed endpoint security):
+  (a) ask IT to allow inbound from 192.168.2.0/24 (ICMP, TCP 22, TCP 50010)
+      on this laptop's Check Point policy, or to exempt the lab adapter;
+  (b) unbind the Check Point filter from the lab adapter only, as Administrator
+      on the node (reversible; Enable-NetAdapterBinding undoes it):
+          Disable-NetAdapterBinding -Name 'Ethernet 3' -ComponentID MS_NdisLwf
+      then from the master:  Test-NetConnection 192.168.2.11 -Port 22
+      Check Point may re-bind it on update / reboot -- re-check with A13.
 
 
 =====================================================================
@@ -150,6 +184,16 @@ Rep (-not $other) 'A11 no third-party AV / firewall product' (($other | Select-O
 $virt = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and $_.InterfaceDescription -match 'Hyper-V|VPN|TAP|Virtual|VMware|Bridge' }
 Rep (-not $virt) 'A12 no virtual / VPN adapter Up' (($virt | Select-Object -ExpandProperty Name) -join ', ')
 
+# A13 third-party NDIS filter bound to the node adapter. These sit BELOW the
+#     Windows firewall and can drop inbound with every Windows rule correct.
+#     Matched by display name: Check Point's vsdatant.sys registers as
+#     ComponentID 'MS_NdisLwf', so the ID alone looks like Microsoft.
+if ($ip) {
+    $flt = Get-NetAdapterBinding -Name $nic.Name -AllBindings |
+        Where-Object { $_.Enabled -and $_.DisplayName -match 'Firewall|Zone ?Alarm|Check ?Point|Sophos|Symantec|McAfee|Kaspersky|ESET|Fortinet|Cisco|VPN' }
+    Rep (-not $flt) "A13 no third-party filter bound to '$($nic.Name)'" (($flt | ForEach-Object { "$($_.DisplayName) [$($_.ComponentID)]" }) -join ' | ')
+}
+
 Interpreting A:
   A6 FAIL                   sshd is not bound to the node IP (A4/A5 say why).
   A6 PASS, master times out the packets are dropped INBOUND -> read A7, A8, A9, A11.
@@ -159,6 +203,8 @@ Interpreting A:
       New-NetFirewallRule -DisplayName 'ICMPv4 echo in' -Protocol ICMPv4 -IcmpType 8 -Direction Inbound -Action Allow -Profile Any
   A9 FAIL                   a block rule wins; disable or delete the named rule.
   A11 FAIL                  the third-party firewall needs its own allow rule for TCP 22.
+  A13 FAIL                  a filter below the Windows firewall (node 2: Check Point
+                            vsdatant.sys) -- see RESULTS at the top for the fix.
 
 
 =====================================================================
@@ -284,5 +330,8 @@ Interpreting D (the ping must really be running on the master during the 20 s):
         192.168.2.10 on the node (must be the 192.168.2.0/24 adapter, not the
         192.168.137.x Wi-Fi).
 
-RESULTS (fill in after running):
-  node 2, 20-10-26:   Unicast=?  Broadcast=?  SentUni=?  Discarded=?  Errors=?
+RESULTS:
+  node 2, 20-10-26:   Unicast=4  Broadcast=2  SentUni=0  Discarded=0  Errors=0
+  (ping -t times out, so ~1 request / 5 s: Unicast 4 means the frames DO
+   arrive. The threshold above assumes ~20; read SentUni. Cause: Check Point
+   vsdatant.sys -- see RESULTS at the top.)
