@@ -1,0 +1,184 @@
+NODE NETWORK DIAGNOSTIC  --  "master cannot ping / ssh to a node"
+=====================================================================
+
+Symptom this was written for: the node can ping the master, but the master gets
+100% loss on ping and a timeout on port 22 (ssh), even though setup_node.ps1
+ran and sshd is running. That means the link and IP are fine and something on
+the NODE is dropping *inbound* traffic.
+
+How to use: copy a PART into a PowerShell window and paste. Every check prints
+PASS / FAIL / WARN, so the first FAIL is where to look.
+
+  PART A -- on the NODE, in an ADMINISTRATOR PowerShell
+  PART B -- on the MASTER, any PowerShell
+  PART C -- (optional) on the NODE: firewall on/off bisect, restores itself
+
+Set $NodeIp (and $MasterIp) at the top of each part first.
+
+
+=====================================================================
+PART A -- run on the NODE (Administrator PowerShell)
+=====================================================================
+
+$NodeIp   = '192.168.2.11'     # node 1: 192.168.1.11   node 2: 192.168.2.11
+$MasterIp = '192.168.2.10'     # node 1: 192.168.1.10   node 2: 192.168.2.10
+$CmdPort  = 50010
+function R($ok, $name, $detail = '') {
+    $tag = if ($ok -eq 'warn') { 'WARN' } elseif ($ok) { 'PASS' } else { 'FAIL' }
+    $col = @{PASS='Green'; FAIL='Red'; WARN='Yellow'}[$tag]
+    Write-Host ("[{0}] {1}  {2}" -f $tag, $name, $detail) -ForegroundColor $col
+}
+
+# A1  elevated?
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+R $isAdmin 'A1 running as Administrator' '(firewall queries below need it)'
+
+# A2  this PC really owns the node IP, on an adapter that is Up
+$ip = Get-NetIPAddress -AddressFamily IPv4 -IPAddress $NodeIp -ErrorAction SilentlyContinue
+R ([bool]$ip) "A2 $NodeIp is assigned to this PC" ($ip | ForEach-Object { "$($_.InterfaceAlias) /$($_.PrefixLength)" })
+if ($ip) {
+    $nic = Get-NetAdapter -InterfaceIndex $ip.InterfaceIndex
+    R ($nic.Status -eq 'Up') "A2b adapter '$($nic.Name)' is Up" "status=$($nic.Status) mac=$($nic.MacAddress) speed=$($nic.LinkSpeed)"
+    $cat = (Get-NetConnectionProfile -InterfaceIndex $ip.InterfaceIndex -ErrorAction SilentlyContinue).NetworkCategory
+    R 'warn' "A2c network category on that adapter" "$cat   (informational: the rules should cover every profile)"
+}
+
+# A3  can the node reach the master (the direction that already worked)
+$p = Test-Connection $MasterIp -Count 2 -Quiet
+R $p "A3 node -> master ping $MasterIp"
+
+# A4  sshd service
+$svc = Get-Service sshd -ErrorAction SilentlyContinue
+R ($svc -and $svc.Status -eq 'Running') 'A4 sshd service running' "status=$($svc.Status) startup=$($svc.StartType)"
+
+# A5  something is LISTENING on 22, and on which address
+$ls = Get-NetTCPConnection -LocalPort 22 -State Listen -ErrorAction SilentlyContinue
+R ([bool]$ls) 'A5 TCP 22 is listening' (($ls | ForEach-Object { $_.LocalAddress }) -join ', ')
+if ($ls -and -not ($ls | Where-Object { $_.LocalAddress -in '0.0.0.0','::',$NodeIp })) {
+    R $false 'A5b listening address covers the node IP' '(sshd_config ListenAddress may be restricting it)'
+}
+
+# A6  node can connect to ITSELF on its own IP. This goes through the local
+#     stack, so it proves sshd is bound to $NodeIp -- if A6 passes but the
+#     master still times out, the packets are being dropped on the way IN.
+$self = Test-NetConnection $NodeIp -Port 22 -WarningAction SilentlyContinue
+R $self.TcpTestSucceeded "A6 node -> itself $NodeIp`:22"
+
+# A7  the allow rules that setup_node.ps1 creates
+foreach ($n in 'OpenSSH-Server-In-TCP', 'SII-WIS-Node-Command-Server') {
+    $r = Get-NetFirewallRule -Name $n -ErrorAction SilentlyContinue
+    if (-not $r) { R $false "A7 firewall rule $n exists"; continue }
+    $port = ($r | Get-NetFirewallPortFilter).LocalPort
+    $ok = ($r.Enabled -eq 'True') -and ($r.Action -eq 'Allow') -and ($r.Direction -eq 'Inbound')
+    R $ok "A7 rule $n" "enabled=$($r.Enabled) action=$($r.Action) profile=$($r.Profile) port=$port"
+}
+
+# A8  the ICMP echo rule. setup_node.ps1 flips it by its ENGLISH display
+#     name and hides any error, so check it directly.
+$icmp = Get-NetFirewallRule -Direction Inbound -Action Allow -Enabled True -ErrorAction SilentlyContinue |
+    Where-Object { (($_ | Get-NetFirewallPortFilter).Protocol -in 'ICMPv4','1') -and
+                   (($_ | Get-NetFirewallPortFilter).IcmpType -match '8|Any') }
+R ([bool]$icmp) 'A8 an enabled inbound ICMPv4 echo-request ALLOW rule exists' (($icmp | Select-Object -First 3 -ExpandProperty DisplayName) -join ' | ')
+
+# A9  anything that BLOCKS port 22 / ICMP -- a block beats every allow
+$blocks = Get-NetFirewallRule -Direction Inbound -Action Block -Enabled True -ErrorAction SilentlyContinue |
+    Where-Object { $pf = $_ | Get-NetFirewallPortFilter; ($pf.LocalPort -contains '22') -or ($pf.LocalPort -eq 'Any' -and $pf.Protocol -eq 'Any') -or ($pf.Protocol -in 'ICMPv4','1') }
+R (-not $blocks) 'A9 no enabled inbound BLOCK rule hits port 22 / ICMP' (($blocks | Select-Object -ExpandProperty DisplayName) -join ' | ')
+
+# A10 profile-level state
+Get-NetFirewallProfile | ForEach-Object {
+    R 'warn' "A10 profile $($_.Name)" "enabled=$($_.Enabled) defaultInbound=$($_.DefaultInboundAction)   (informational)"
+}
+
+# A11 third-party AV / firewall (these can drop traffic with Windows rules untouched)
+$av = Get-CimInstance -Namespace root/SecurityCenter2 -ClassName AntiVirusProduct -ErrorAction SilentlyContinue
+$fw = Get-CimInstance -Namespace root/SecurityCenter2 -ClassName FirewallProduct -ErrorAction SilentlyContinue
+$other = @($av) + @($fw) | Where-Object { $_ -and $_.displayName -notmatch 'Windows Defender|Microsoft Defender|Windows Firewall' }
+R (-not $other) 'A11 no third-party AV / firewall product' (($other | Select-Object -ExpandProperty displayName -Unique) -join ', ')
+
+# A12 is the NIC bridged / on a VPN / virtual switch that might eat the traffic
+$virt = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and $_.InterfaceDescription -match 'Hyper-V|VPN|TAP|Virtual|VMware|Bridge' }
+R (-not $virt) 'A12 no virtual / VPN adapter Up' (($virt | Select-Object -ExpandProperty Name) -join ', ')
+
+Interpreting A:
+  A6 FAIL                   sshd is not bound to the node IP (A4/A5 say why).
+  A6 PASS, master times out the packets are dropped INBOUND -> read A7, A8, A9, A11.
+  A7 FAIL                   re-run setup_node.ps1 as Administrator, read its warnings.
+  A8 FAIL                   ping is blocked; not the cause of the ssh timeout but fix:
+      Enable-NetFirewallRule -DisplayGroup 'File and Printer Sharing'   (or)
+      New-NetFirewallRule -DisplayName 'ICMPv4 echo in' -Protocol ICMPv4 -IcmpType 8 -Direction Inbound -Action Allow -Profile Any
+  A9 FAIL                   a block rule wins; disable or delete the named rule.
+  A11 FAIL                  the third-party firewall needs its own allow rule for TCP 22.
+
+
+=====================================================================
+PART B -- run on the MASTER (any PowerShell)
+=====================================================================
+
+$NodeIp = '192.168.2.11'
+function R($ok, $name, $detail = '') {
+    $tag = if ($ok -eq 'warn') { 'WARN' } elseif ($ok) { 'PASS' } else { 'FAIL' }
+    $col = @{PASS='Green'; FAIL='Red'; WARN='Yellow'}[$tag]
+    Write-Host ("[{0}] {1}  {2}" -f $tag, $name, $detail) -ForegroundColor $col
+}
+
+# B1  which local adapter / source address would be used
+$route = Find-NetRoute -RemoteIPAddress $NodeIp | Select-Object -First 1
+R ([bool]$route) "B1 route to $NodeIp" "via $($route.InterfaceAlias) src $($route.IPAddress)"
+
+# B2  link level: does the node answer ARP, and with which MAC
+Test-Connection $NodeIp -Count 1 -Quiet | Out-Null
+$nb = Get-NetNeighbor -IPAddress $NodeIp -ErrorAction SilentlyContinue | Select-Object -First 1
+R ($nb -and $nb.State -in 'Reachable','Stale','Delay','Probe') "B2 ARP entry for $NodeIp" "mac=$($nb.LinkLayerAddress) state=$($nb.State)   (compare mac with Get-NetAdapter on the node)"
+
+# B3  ping
+R (Test-Connection $NodeIp -Count 3 -Quiet) "B3 ping $NodeIp"
+
+# B4  the actual ports
+foreach ($port in 22, 50010) {
+    $t = Test-NetConnection $NodeIp -Port $port -WarningAction SilentlyContinue
+    R $t.TcpTestSucceeded "B4 TCP $port" "source $($t.SourceAddress.IPAddress)"
+}
+
+# B5  ssh banner (proves sshd, not just a listening socket)
+try {
+    $c = New-Object Net.Sockets.TcpClient
+    $ar = $c.BeginConnect($NodeIp, 22, $null, $null)
+    if ($ar.AsyncWaitHandle.WaitOne(4000) -and $c.Connected) {
+        $s = $c.GetStream(); $s.ReadTimeout = 4000
+        $buf = New-Object byte[] 64; $n = $s.Read($buf, 0, 64)
+        $banner = [Text.Encoding]::ASCII.GetString($buf, 0, $n).Trim()
+        R ($banner -like 'SSH-*') 'B5 ssh banner' $banner
+    } else { R $false 'B5 ssh banner' 'no connection within 4 s' }
+    $c.Close()
+} catch { R $false 'B5 ssh banner' $_.Exception.Message }
+
+Interpreting B:
+  B2 PASS, B3 FAIL, B4 FAIL   L2 is fine, node drops it -> run PART A on the node.
+  B2 FAIL                     cable / IP / subnet / wrong NIC on the node.
+  B2 mac differs from the node's real MAC   stale ARP:
+      Remove-NetNeighbor -IPAddress $NodeIp -Confirm:$false     (Administrator)
+  B4 PASS, B5 FAIL            something answers on 22 that is not sshd.
+
+
+=====================================================================
+PART C -- OPTIONAL bisect on the NODE (Administrator PowerShell)
+=====================================================================
+Turns the Windows firewall OFF on all profiles for 45 s, then restores each
+profile to exactly the state it had. Ping / test from the master DURING the
+window (e.g.  Test-NetConnection 192.168.2.11 -Port 22  on the master).
+
+  Works with firewall off  -> a Windows firewall rule / profile is the cause (A7-A10).
+  Still fails with it off  -> not the Windows firewall: A11 (third-party), A12
+                              (virtual adapter), or sshd binding (A5/A6).
+
+$before = Get-NetFirewallProfile | Select-Object Name, Enabled
+try {
+    Set-NetFirewallProfile -Profile Domain,Private,Public -Enabled False
+    Write-Host 'Windows firewall OFF for 45 s -- test from the master NOW' -ForegroundColor Yellow
+    Start-Sleep -Seconds 45
+} finally {
+    foreach ($b in $before) { Set-NetFirewallProfile -Profile $b.Name -Enabled $b.Enabled }
+    Get-NetFirewallProfile | Select-Object Name, Enabled
+    Write-Host 'Firewall restored.' -ForegroundColor Green
+}
