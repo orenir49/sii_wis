@@ -99,6 +99,17 @@ FIX (needs a decision -- this is the institute's managed endpoint security):
       then from the master:  Test-NetConnection 192.168.2.11 -Port 22
       Check Point may re-bind it on update / reboot -- re-check with A13.
 
+APPLIED on node 2, 20-10-26: option (b). The binding is hidden, so it needs
+-AllBindings (without it: "No matching MSFT_NetAdapterBindingSettingData"):
+    Disable-NetAdapterBinding -Name 'Ethernet 3' -ComponentID MS_NdisLwf -AllBindings
+Checked on the node afterwards: Zone Alarm Firewall Driver [MS_NdisLwf]
+Enabled=False on 'Ethernet 3' (still bound on Wi-Fi and the other adapters),
+link Up 2.5 Gbps, node -> master ping OK.
+Undo:  Enable-NetAdapterBinding -Name 'Ethernet 3' -ComponentID MS_NdisLwf -AllBindings
+
+NEXT, on the MASTER: ping 192.168.2.11 ; Test-NetConnection 192.168.2.11 -Port 22
+(and -Port 50010 once node.py is running). Record the result here.
+
 
 =====================================================================
 PART A -- run on the NODE (Administrator PowerShell)
