@@ -42,11 +42,28 @@ PART A, Administrator PowerShell on node 2: every check PASSES.
   (node 2 also has Wi-Fi on 192.168.137.206 and several 169.254.x adapters;
    none share the 192.168.2.0/24 subnet)
 
-Nothing on the node explains the timeout. NEXT, on the MASTER: run PART B
-with $NodeIp = '192.168.2.11'. Check that B1's source is 192.168.2.10 (else
-the master routes node 2 out the wrong NIC) and that B2's mac is
-00-0A-CD-47-EF-86 (else stale ARP / wrong device). If B3/B4 still fail, run
-PART C on node 2 while testing from the master.
+Nothing on the node explains the timeout.
+
+PART B, master, 20-10-26 (against 192.168.2.11):
+
+  B1  route via 'Ethernet 2', source 192.168.2.10          (correct NIC)
+  B2  ARP mac 00-0A-CD-47-EF-86, state PROBE               (mac = node's own NIC)
+  B3  ping            FAIL (0/3)
+  B4  TCP 22          FAIL
+  B4  TCP 50010       FAIL
+  master NICs: Ethernet 2 = Intel I226-V 2.5 Gbps (192.168.2.10, to node 2),
+               Ethernet 5 = Intel I226-LM #2 2.5 Gbps (192.168.1.10, node 1),
+               Wi-Fi 2 192.168.137.96
+
+Reading: the node answers the broadcast ARP request (after Remove-NetNeighbor
+the entry came back Reachable with the right mac), but the master's unicast
+traffic gets no reply -- the entry falls to Probe, which is unicast
+reachability confirmation failing. ARP is answered below the Windows firewall,
+so a firewall rule cannot explain this and PART C is unlikely to help.
+Suspects: the node NIC / driver dropping frames addressed to its own mac, or
+the cable / switch port / speed negotiation (both ends are 2.5 Gbps).
+
+NEXT: run PART D on node 2 while pinging from the master.
 
 
 =====================================================================
@@ -215,3 +232,57 @@ try {
     Get-NetFirewallProfile | Select-Object Name, Enabled
     Write-Host 'Firewall restored.' -ForegroundColor Green
 }
+
+
+=====================================================================
+PART D -- NODE NIC receive counters while the master pings
+=====================================================================
+Separates "frames never reach the NIC" from "Windows drops them". Run on the
+NODE (Administrator PowerShell). It samples the NIC's own counters for 20 s;
+START THE PING ON THE MASTER AS SOON AS IT SAYS GO:
+
+    ping 192.168.2.11 -n 20          (on the master)
+
+$NodeIp = '192.168.2.11'
+$ip  = Get-NetIPAddress -AddressFamily IPv4 -IPAddress $NodeIp
+$nic = Get-NetAdapter -InterfaceIndex $ip.InterfaceIndex
+$a = Get-NetAdapterStatistics -Name $nic.Name
+Write-Host "adapter '$($nic.Name)'  $($nic.InterfaceDescription)  $($nic.LinkSpeed)" -ForegroundColor Cyan
+Write-Host 'GO -- start the ping on the master now (sampling 20 s)' -ForegroundColor Yellow
+Start-Sleep -Seconds 20
+$b = Get-NetAdapterStatistics -Name $nic.Name
+$d = [pscustomobject]@{
+    Unicast   = $b.ReceivedUnicastPackets   - $a.ReceivedUnicastPackets
+    Multicast = $b.ReceivedMulticastPackets - $a.ReceivedMulticastPackets
+    Broadcast = $b.ReceivedBroadcastPackets - $a.ReceivedBroadcastPackets
+    Discarded = $b.ReceivedDiscardedPackets - $a.ReceivedDiscardedPackets
+    Errors    = $b.ReceivedPacketErrors     - $a.ReceivedPacketErrors
+    SentUni   = $b.SentUnicastPackets       - $a.SentUnicastPackets
+}
+$d | Format-List
+if     ($d.Unicast -lt 10) { Write-Host 'FRAMES DO NOT REACH THE NIC -> cable / switch port / speed negotiation / NIC hardware (see below)' -ForegroundColor Red }
+elseif ($d.SentUni -lt 10) { Write-Host 'FRAMES ARRIVE BUT NOTHING IS SENT BACK -> Windows / driver filter drops them (not the cable)' -ForegroundColor Red }
+else                       { Write-Host 'Frames arrive and replies are sent -- the fault is on the return path to the master' -ForegroundColor Yellow }
+
+Get-NetAdapterAdvancedProperty -Name $nic.Name |
+    Where-Object { $_.DisplayName -match 'Speed|Energy|Green|Flow|Jumbo|Offload|Interrupt' } |
+    Format-Table DisplayName, DisplayValue -AutoSize
+
+Interpreting D (the ping must really be running on the master during the 20 s):
+  Unicast ~0, Broadcast > 0   The NIC hears broadcasts but not frames addressed
+        to it. Try, in order: another cable; another port on the node (or the
+        master's Ethernet 2 vs 5 swapped); force the NODE NIC to 1 Gbps
+        (Set-NetAdapterAdvancedProperty -Name <nic> -DisplayName 'Speed & Duplex'
+        -DisplayValue '1.0 Gbps Full Duplex'); disable Energy-Efficient Ethernet /
+        Green Ethernet; update or roll back the NIC driver.
+  Unicast ~20, SentUni ~0     Windows drops them after the NIC: look for a
+        filter driver on the adapter (Get-NetAdapterBinding -Name <nic>) --
+        VPN, antivirus network filter, Hyper-V extensible switch -- and run
+        PART C to be sure.
+  Unicast ~20, SentUni ~20    The node does reply; the replies are lost on the
+        way back. Compare the node's reply route: Find-NetRoute -RemoteIPAddress
+        192.168.2.10 on the node (must be the 192.168.2.0/24 adapter, not the
+        192.168.137.x Wi-Fi).
+
+RESULTS (fill in after running):
+  node 2, 20-10-26:   Unicast=?  Broadcast=?  SentUni=?  Discarded=?  Errors=?
