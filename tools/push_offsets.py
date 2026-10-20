@@ -34,7 +34,7 @@ import ssh_launcher
 from node_backend import N_PIXEL_LOCATIONS, PIXEL_OFFSET_FILENAME
 
 NODES = ((1, '192.168.1.11', 'labcomp1'),
-         (2, '192.168.2.11', 'oreni'))
+         (2, '192.168.2.11', 'complab3'))
 
 
 def validate_offsets_file(local_path):

@@ -46,7 +46,7 @@ DEFAULT_MASKS = ['mask_sweep_1', 'mask_sweep_9', 'mask_sweep_15',
                  'mask_sweep_22', 'mask_sweep_30']
 NODES = {
     1: {'host': '192.168.1.11', 'user': 'labcomp1'},
-    2: {'host': '192.168.2.11', 'user': 'oreni'},
+    2: {'host': '192.168.2.11', 'user': 'complab3'},
 }
 POLL_S = 0.3               # SFTP snapshot cadence during the T, wait
 RUN_DIR_WAIT_S = 60.0       # generous: node2 needed >20s live 2026-09-07 even for a real, successful single-pixel run

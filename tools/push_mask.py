@@ -23,7 +23,7 @@ sys.path.insert(0, ROOT)
 import ssh_launcher
 
 NODES = ((1, '192.168.1.11', 'labcomp1'),
-         (2, '192.168.2.11', 'oreni'))
+         (2, '192.168.2.11', 'complab3'))
 
 
 def push(node_id, host, user, local_path, log=print):

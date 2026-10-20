@@ -39,7 +39,7 @@ import ssh_launcher
 
 NODES = {
     1: {'host': '192.168.1.11', 'user': 'labcomp1'},
-    2: {'host': '192.168.2.11', 'user': 'oreni'},
+    2: {'host': '192.168.2.11', 'user': 'complab3'},
 }
 
 DEFAULT_INTERVAL_S = 15.0     # matches the 10-9-26 T-mode crash measurement

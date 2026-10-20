@@ -33,7 +33,7 @@ import monitor_node_resources as mnr
 
 NODES = {
     1: {'host': '192.168.1.11', 'user': 'labcomp1', 'cmd_port': 50010, 'data_port': 50007},
-    2: {'host': '192.168.2.11', 'user': 'oreni',    'cmd_port': 50010, 'data_port': 50008},
+    2: {'host': '192.168.2.11', 'user': 'complab3',    'cmd_port': 50010, 'data_port': 50008},
 }
 BASELINE_S = 15.0          # resource-monitor lead-in before the acquisition starts
 CTRL_CONNECT_RETRIES = 10  # node.py's command server needs a moment to bind after launch

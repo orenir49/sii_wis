@@ -1008,7 +1008,7 @@ class ReceiverGUI:
                                default_sender_ip='192.168.2.11',
                                default_cmd_port=50010,
                                default_data_port=50008,
-                               default_ssh_user='oreni',
+                               default_ssh_user='complab3',
                                log_fn=self._enqueue_log,
                                get_hooks_fn=lambda: merge_hooks(
                                    *(c.hooks_node2 for c in self._correlators)),

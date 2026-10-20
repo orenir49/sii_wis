@@ -34,7 +34,7 @@ from tools.pair_map import PairList, Pair
 
 NODES = {
     1: {'host': '192.168.1.11', 'user': 'labcomp1', 'data_port': 50007},
-    2: {'host': '192.168.2.11', 'user': 'oreni',    'data_port': 50008},
+    2: {'host': '192.168.2.11', 'user': 'complab3',    'data_port': 50008},
 }
 CMD_PORT = 50010
 

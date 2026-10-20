@@ -6,7 +6,7 @@ Run this in YOUR OWN terminal so the password never leaves your machine:
 
     cd C:\\Users\\npk\\Documents\\code\\sii_wis
     .venv\\Scripts\\python.exe <this script> 192.168.1.11 labcomp1
-    .venv\\Scripts\\python.exe <this script> 192.168.2.11 oreni
+    .venv\\Scripts\\python.exe <this script> 192.168.2.11 complab3
 
 It authenticates once with the password, appends the public key to the right
 authorized_keys file for that account, fixes the ACLs, then reconnects using
@@ -25,7 +25,7 @@ import sys
 
 sys.path.insert(0, r'C:\Users\npk\Documents\code\sii_wis')
 import paramiko
-from ssh_launcher import ssh_connect, run_ps
+from ssh_launcher import run_ps
 
 KEY_PATH = os.path.expanduser(r'~\.ssh\sii_wis_nodes')
 
@@ -42,7 +42,11 @@ def main() -> None:
 
     pw = os.environ.get('SPAD_SSH_PW') or getpass.getpass(f'password for {user}@{host}: ')
 
-    client = ssh_connect(host, user, pw)
+    # ssh_connect is key-only now; enrolling is the one place that needs the password.
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.connect(host, username=user, password=pw,
+                   look_for_keys=False, allow_agent=False, timeout=10)
     try:
         is_admin, _ = run_ps(client,
             "if ((whoami /groups) -match 'S-1-5-32-544') { 'yes' } else { 'no' }")

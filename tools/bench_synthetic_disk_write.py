@@ -36,7 +36,7 @@ import ssh_launcher
 
 NODES = {
     1: {'host': '192.168.1.11', 'user': 'labcomp1'},
-    2: {'host': '192.168.2.11', 'user': 'oreni'},
+    2: {'host': '192.168.2.11', 'user': 'complab3'},
 }
 DEFAULT_N_FILES = 20
 DEFAULT_FILE_SIZE_MB = 52.4   # matches the real data_{master,slave}NNN.txt size
