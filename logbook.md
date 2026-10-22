@@ -488,3 +488,31 @@ Reverting to 2:1 fiber splitter, new spectral alignment.
   - The run was terminated prematurely by node 2 disconnecting. Histogram `spad_data/40pix_ND_success.npz`; log `spad_data/log/2026-10-19_155143.log`. Figures in `figs/19-10-26/`: `coadd_40pairs_40pix_ND_success_histogram.png`, `..._peak_zoom.png`, `..._peak_zoom_freesigma.png`.
   - Slave coadd (20 pairs) behaves perfectly: peak at 13.4 ns, 0.58 %, SNR 6.0. Master coadd (20 pairs) seems to destroy the signal slightly: peak at 13.5 ns, 0.40 %, SNR 4.0, which dilutes the all-pairs coadd to 0.47 %. Figures `coadd_{slave,master}_20pairs_40pix_ND_success_histogram.png`.
   - Likely cause, documented in the npz (`meta['chip_correction']`): node 2's master chip jumped 9 times (t = 152, 219, 770, 4804, 5092, 5407, 5801, 5974 s: exactly +100 ns each; 6896 s: +85.2 ns, not a whole tick, so the 100 ns quantised correction was left ~15 ns off from there on). Node 2 also had 64,316 unmatched dwell markers against 85,007 matched, 3,882 off-level. Node 1 had no jumps. Not verified that this is what weakens the master coadd.
+
+## 21-10-26
+
+- New intensity scans (`spad_data/intensity/node{1,2}.txt`, 1 s), with ND attenuation:
+  - node 1: OD 0.5, count rate 191.6 Mcps global, 41.7 Mcps for mask_20.
+  - node 2: OD 0.6, count rate 173.7 Mcps global, 41.4 Mcps for mask_20.
+- Made `.claude/masks/mask_20.txt` (20 pixels, 150-169, the 20 `mask_sparse` pixels closest to 160) and pushed it to both nodes (not applied yet).
+- For 0.5% bunching excess, 100 ps bins, identity pairs 150-169: ~40 min to SNR 5 per pixel (34-50 min), ~2 min for the coadded peak (assumes the 20 peaks align within a bin).
+- Took 10 rounds of 2 min integrations on mask_20; for all, peak isn't detectable per pixel but only in coadded frames.
+- The bunching amplitude is clearly not consistent between the 10 measurements.
+- To diagnose this inconsistency, dropped the ND filters and used mask_5 (~30 Mcps per node).
+- With 2-3 minute measurements of mask_5, peaks are detectable in both the individual and coadded frames.
+- Tested frame clock on node2 (trying to eliminate master - slave satellites). This moves the bunching peak from ~13 ns to ~7 ns.
+- Took 4 rounds of 2-5 min integrations on mask_5; wait-for-file overhead was very large, so I abandoned this for mask_4.
+- Automated sweep- 10 rounds of 180 sec, mask_4 (called g0 in figs and spad_data); 
+- Automated sweep- 5 rounds of 180 sec, offline analysis, for 9 different campaigns g1,g2,...,g9;
+  - each campaign has 4 pixels just like mask_4.
+  - together the campaigns tile mask_40.
+  - the sweep should help us understand the reliability of blind coadding: are individual peaks always aligned?
+
+## 22-10-26
+
+- The mask4 sweep (g0-g9, 40 pixels 141-180, 4 per campaign, 5 x 180 s rounds each, g0 10 rounds) gives good statistics on cross-pixel peak alignment and on the stability of the coadded amplitude. Data: `spad_data/record/g{0-9}/`; figures: `figs/21-10-26/mask4_sweep/`.
+  - Within one round, the centroids of the 4 pixels scatter with a typical rms of 19 ps (median over the 55 rounds; mean 22, range 2-51) and a typical peak-to-valley of 50 ps (median; mean 55, range 6-140, 90 % of rounds below 102).
+  - Amplitude: coadd fixed-sigma height 0.72 % weighted mean, per-pixel 0.58-0.85 %. The 55 round coadds scatter exactly as Poisson about their campaign means (chi2/dof 1.03). Free-fit widths of the per-pixel aligned sums: slave 66-95 ps (mean 78), master 72-127 ps (mean 91).
+- Based on these statistics, a Monte Carlo test of the mask20 result (21-10-26: 10 rounds of 2 min, 20 pixels, coadd amplitudes that looked inconsistent). `tools/sweep/coadd_sim.py`, figures and json in `figs/22-10-26/mask20_sim/`. Each simulated round uses a real round's own per-pixel baselines (its count rate x duration), per-pixel amplitude and width bootstrapped from the 40 mask4 free fits, centroid offsets of 17 ps rms, Poisson counts, and the same tallest-bin + fixed-sigma fit as the real rounds.
+  - Real: mean 0.70 %, sd over the 10 rounds 0.120 %. Simulated: mean 0.68 %, sd 0.094 % -- Poisson alone gives 0.093 %; the per-pixel amplitude scatter and the 17 ps offsets add nothing. Every real round lies inside the simulated ±2 sigma band (`mask20_sim_vs_real.png`, pulls -2.0 to +1.9); the excess scatter is chi2/dof 1.8 for 9 dof, p = 0.08, i.e. a 1.2 sigma fluctuation. The 10 rounds are consistent with Poisson noise at mask20's count rate.
+  - Misalignment is ruled out as a cause on separate grounds: centroid offsets lower the mean height (0.63 % at 50 ps rms, 0.54 % at 100 ps) without widening the scatter, and the real mean equals the aligned prediction, so the mask20 pixels were aligned to better than ~30 ps rms. If a real excess exists it is specific to that session (ND attenuation, dwell input on node 2) and needs more rounds to show.

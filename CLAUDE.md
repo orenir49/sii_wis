@@ -59,6 +59,18 @@ python .claude\skills\temporal-align\align_time.py --base spad_data\<session>
 .venv\Scripts\python.exe tests\test_write_lock.py
 .venv\Scripts\python.exe tests\test_chip_shift.py      # master-chip correction in ChannelGraph
 .venv\Scripts\python.exe tests\test_chip_window.py     # ...through the window, real tracker
+.venv\Scripts\python.exe tests\test_marker_source.py   # dwell / line / frame reference-input selection, live and offline
+.venv\Scripts\python.exe marker_source.py --selftest
+.venv\Scripts\python.exe tests\test_offline_round.py   # record-and-analyse: offline per-round pipeline + cross-round combine, synthetic rounds
+.venv\Scripts\python.exe tests\test_record.py          # ...the unattended runner with fake nodes (archive, retry, resume, mirror, status)
+
+# Record-and-analyse campaign: N rounds of one mask, RAW stamps saved (nothing correlated live), analysed offline between rounds,
+# status + results pushed to a Dropbox folder. Procedure and limits: docs\record_runbook.md. Close master.py first.
+python tools\sweep\record.py --name mask4_180s --mask .claude\masks\mask_4.txt --rounds 10 --duration 180 --mirror "<dropbox folder>"
+python tools\sweep\offline.py round --dir spad_data\record\NAME\rounds\r01 --pixels 158,159,161,162   # one round again, by hand
+python tools\sweep\offline.py combine --campaign spad_data\record\NAME
+python tools\sweep\sweep_plots.py --campaigns g0,g1,g2,g3,g4,g5,g6,g7,g8,g9 --outdir figs\<DD-M-YY>\mask4_sweep [--copy-to "<dropbox folder>"]   # all campaigns on one axis, one point per pixel (round-averaged)
+python tools\sweep\coadd_sim.py --outdir figs\<DD-M-YY>\mask20_sim   # simulated mask20 rounds (mask4 per-pixel statistics + Poisson at mask20's own baselines) vs the 10 real rounds' coadd-height scatter
 .venv\Scripts\python.exe tools\dwell_offset.py --selftest
 .venv\Scripts\python.exe chip_map.py --selftest
 .venv\Scripts\python.exe tests\test_sweep.py          # sweep plan / round files / status mirror / publisher / runner control flow
@@ -117,7 +129,12 @@ Minimal GUI that starts a command server thread on launch. Receives JSON command
 | `tools/sweep/rounds.py` | Per-round fit (fixed-σ amplitude), residual-copy ladder check, per-pair + summed histograms (`.npz`), figures, records, `StatusBoard` (status JSON + 5-line text every 15 s, Dropbox mirror) |
 | `tools/sweep/publish.py` | Artifact documents + status for the rounds not yet uploaded; `wait --emit` / `mark --wait --emit` make a wake-up three tool calls |
 | `tools/sweep/nodes.py` | Hardware layer of the sweeps: `NodeLink`, reset/launch/masks/calibration, `LiveSource` / `ReplaySource`, AC and port guards |
-| `tools/dwell_offset.py` | `DwellOffsetTracker`: master − slave chip offset from the dwell markers, live or offline; finds the 100 ns jumps; `--selftest` |
+| `tools/dwell_offset.py` | `DwellOffsetTracker`: master − slave chip offset from the dwell markers, live or offline; finds the 100 ns jumps; `--selftest`. Offline it reads whichever marker input the node was wired to (see `marker_source.py`) |
+| `tools/sweep/record.py` | Record-and-analyse runner: per round full lSPAD restart + mask + TDC calibration, timed acquisition with the receiver WRITING raw stamps, wait for the drain, sanity checks, archive the raw directories to `spad_data/record/<name>/rounds/rNN/`, offline analysis between rounds, status board + Dropbox mirror, resume |
+| `tools/sweep/offline.py` | Per-round offline pipeline (no hardware): marker-derived cross-node offset, master-chip tick states and jumps per node, stray-epoch stamps dropped, chunked correlation at 100 and 20 ps (±200 ns, n_shift 10), fits; `combine()` aligns rounds on their centroids and sums them |
+| `tools/sweep/record_plots.py` | Per campaign, all in `combined/figs/`: `centroid_alignment_20ps` (every round's per-pixel centroid minus that round's own mean, all rounds on one axis), `round_trend_20ps` (coadd fixed-σ height and free-fit σ against round), and the two per-round grids `rounds_stacked_100ps` / `rounds_zoom_100ps` (one panel per round: stacked per-pixel peaks with the centroid p2v; coadd zoom in % over the mean), plus the combined result files. The combined zoom / stacked figures and the four figures per round in `figs/round<N>/` were dropped 22-10-26; `round_figures` remains for one round by hand |
+| `tools/sweep/synthetic_round.py` | A synthetic raw round with known truth (offset, dwell on node 1 / frame on node 2, jump, tick states, stray stamp) for the tests |
+| `marker_source.py` | Which of dwell / line / frame carries the reference signal on a node: `MarkerSelector` (live, used by `run_session_loop`) and `load_markers()` (offline); pure, `--selftest` |
 | `correlate_kernel.py` | `_pair_kernel` (`nogil`) + `PairPool`, and the reference `_multistart_multistop` it is proved bitwise identical to — moved here from `correlate.py` so the reference and the proof have one owner; `prewarm()` warms both; `--selftest` |
 | `synthetic_source.py` | Pulsed-laser / Poisson generator — drives the whole path with no detector attached |
 | `tools/sii_calculator_backend.py` | Pure formulas: `<\|V\|^2>`, coherence time, bunching-excess `R`, required integration time |
@@ -142,6 +159,8 @@ Frames: 8-byte header `(key_id: uint32 big-endian, n_bytes: uint32 big-endian)` 
 - `0xFFFFFFFE` (KEY_END): empty payload — closes the session; `run_session_loop()` loops back for the next
 
 Pixel mapping: `PIXMAP` in `node_backend.py` maps lSPAD pixel indices to output keys. Slave pixels occupy indices 0–169, master pixels 170–319.
+
+**Reference-signal input (dwell / line / frame).** On each node the reference signal is wired to one of the detector's dwell, line or frame inputs, and only one can carry it at a time; the other two marker files stay empty. `marker_source.py` takes the first of dwell → line → frame that has delivered a non-empty chunk, per node and per session. `run_session_loop()` then hands the chosen stream to the hook queues under the **dwell keys** (320 master chip, 323 slave chip) whatever input it came from, so the sparse calibration, its first-chunk gate (`on_first_dwell_chunk`), the master-chip jump tracker and the sweep runner are unchanged. The raw record on disk keeps the true names (`slave_frame.bin` …), and the choice is logged (`marker source: frame …`) in the run log; a second input appearing later is warned about and never mixed into the active stream. Mixing is fine (dwell on one node against frame on the other measure the same physical pulses); the only cost is a constant input-to-input delay that moves every peak's absolute τ together. Offline tools (`dwell_offset.py`, `analyze_g2_pairs_offline.py`, `crosstalk_offsets_run.py`, the sweep `ReplaySource`) read the same choice from the saved files via `load_markers()`. Not recorded in the `.npz` meta (the run log is the record). 21-10-26 evidence for using frame on node 2: node 1 dwell vs node 2 slave chip, core width (interquartile range) 0.68 ns on frame against 1.30 ns on dwell and 2.96 ns on line, 80 % of markers within ±1 ns against 61 % and 53 %, and none of the dwell input's ~4 % chip-pair satellites (master − slave off by −13…−17 ns). Frame's chip-pair scatter is looser (two levels ~1.1 ns apart, interquartile range ~1.0 ns against 0.13 ns on dwell), still inside the tracker's 3 ns level tolerance (checked: `dwell_offset.py` finds the +100 ns jump of node 2's master chip in the 21-10-26 frame run).
 
 ### Per-pixel TDC offset calibration (sender)
 
