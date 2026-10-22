@@ -19,6 +19,7 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, 'tools'))
 import chip_map
 from dwell_offset import DwellOffsetTracker
+from marker_source import load_markers
 from crosstalk_offsets import _hist, locate_peak
 
 MIN_SIGMA = 5.0
@@ -38,8 +39,8 @@ def process(node, run, mask, ref, tmax, bw, applied=True):
     tau = -tmax + (np.arange(nb) + .5) * bw
     act = active_of(mask)
     tr = DwellOffsetTracker()
-    tr.feed(np.fromfile(os.path.join(d, 'master_dwell.bin'), dtype=np.int64),
-            np.fromfile(os.path.join(d, 'slave_dwell.bin'), dtype=np.int64))
+    _m, _s, _kind = load_markers(d)   # dwell, or line/frame if that is where the reference was wired
+    tr.feed(_m, _s)
     tr.flush()
     s = tr.summary()
     print(f'node {node}: dwell level(s) {[round(x["level_ns"], 3) for x in s["levels"]]} ns, jumps {len(s["jumps"])}', flush=True)

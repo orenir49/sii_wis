@@ -48,6 +48,9 @@ from dataclasses import dataclass
 
 import numpy as np
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from marker_source import load_markers   # dwell / line / frame: whichever input carries the reference on this node
+
 # A slave marker within this of a master marker is the same dwell event. Markers are
 # ~80 ms apart, so even 1 ms is unambiguous -- and wide enough to still match after a
 # jump far larger than 100 ns instead of silently reporting "no matches".
@@ -257,8 +260,9 @@ class DwellOffsetTracker:
 # ---------------------------------------------------------------------------------
 
 def check_dir(node_dir: str, chunk: int = CHUNK_CLI) -> tuple:
-    m = np.fromfile(os.path.join(node_dir, 'master_dwell.bin'), dtype=np.int64)
-    s = np.fromfile(os.path.join(node_dir, 'slave_dwell.bin'), dtype=np.int64)
+    """Run the tracker over a saved node directory. The marker input is whichever of dwell / line / frame the
+    node's reference was wired to (marker_source.load_markers); returns (tracker, n_master, n_slave, span_s, kind)."""
+    m, s, kind = load_markers(node_dir)
     tr = DwellOffsetTracker()
     # Fixed-size slices, the slave stream starting half a chunk behind, so the two arrive
     # out of step the way the two live queues do.
@@ -268,11 +272,11 @@ def check_dir(node_dir: str, chunk: int = CHUNK_CLI) -> tuple:
         mi += chunk
         si += lag if si == 0 else chunk
     tr.flush()
-    return tr, len(m), len(s), (int(m[-1]) - int(m[0])) / 1e12 if len(m) > 1 else 0.0
+    return tr, len(m), len(s), (int(m[-1]) - int(m[0])) / 1e12 if len(m) > 1 else 0.0, kind
 
 
-def report(name: str, tr: DwellOffsetTracker, n_m: int, n_s: int, span_s: float) -> None:
-    print(f'{name}: master {n_m} / slave {n_s} markers over {span_s:.1f} s  |  matched {tr.n_matched}, '
+def report(name: str, tr: DwellOffsetTracker, n_m: int, n_s: int, span_s: float, kind: str = 'dwell') -> None:
+    print(f'{name} ({kind} markers): master {n_m} / slave {n_s} markers over {span_s:.1f} s  |  matched {tr.n_matched}, '
           f'unmatched {tr.n_unmatched}, isolated off-level {tr.n_off_level}')
     if not tr.history:
         print('   no level established (fewer than %d matched markers)' % INIT_N)
@@ -360,7 +364,7 @@ def _selftest() -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--dir', action='append', help='node data directory holding master_dwell.bin / slave_dwell.bin '
+    ap.add_argument('--dir', action='append', help='node data directory holding master_/slave_{dwell,line,frame}.bin '
                     '(repeatable; default spad_data\\node1 and spad_data\\node2)')
     ap.add_argument('--json', help='also write the per-directory summaries here')
     ap.add_argument('--selftest', action='store_true')
@@ -371,8 +375,8 @@ def main() -> int:
     dirs = args.dir or [os.path.join(root, 'spad_data', 'node1'), os.path.join(root, 'spad_data', 'node2')]
     out = {}
     for d in dirs:
-        tr, n_m, n_s, span = check_dir(d)
-        report(os.path.relpath(d, root) if os.path.isabs(d) else d, tr, n_m, n_s, span)
+        tr, n_m, n_s, span, kind = check_dir(d)
+        report(os.path.relpath(d, root) if os.path.isabs(d) else d, tr, n_m, n_s, span, kind)
         out[d] = tr.summary()
     if args.json:
         with open(args.json, 'w') as f:

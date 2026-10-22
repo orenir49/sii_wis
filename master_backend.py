@@ -38,6 +38,9 @@ SPECIAL_KEY_TO_FILENAME = {
     325: 'slave_frame.bin',
 }
 SLAVE_DWELL_KEY = 323   # what master.py's sparse dwell calibration actually fits on
+# The reference signal can be wired to the dwell, line or frame input of a node; marker_source picks the one that
+# carries data and hands it to the hook queues under the dwell keys (320/323), so every consumer reads 320/323 as before.
+from marker_source import MarkerSelector, KEY_KIND, KIND_KEYS
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -117,7 +120,9 @@ def run_session_loop(conn: socket.socket, log_fn=print,
                   n_bytes//8 for every pixel chunk (key_id < 320) so the
                   caller can poll it for a count-rate display.
     on_first_dwell_chunk: optional callable, invoked once per session when the
-                  first SLAVE_DWELL_KEY (323) chunk arrives -- not merely the
+                  first slave-chip marker chunk of the node's active marker input
+                  (SLAVE_DWELL_KEY, 323, or its line/frame equivalent -- see
+                  marker_source.py) arrives -- not merely the
                   first chunk of any key. The one consumer (master.py's sparse
                   dwell calibration) fits its offset from slave_dwell
                   specifically, so anything else arriving first (a master-chip
@@ -202,6 +207,8 @@ def run_session_loop(conn: socket.socket, log_fn=print,
                            f'written now, so those files are not this session — '
                            f'do not analyse them against this run.')
 
+            selector     = MarkerSelector()   # which of dwell / line / frame carries the reference on this node
+            marker_kinds_seen: set = set()   # kinds that delivered data BEFORE the one just selected (for the switch warning)
             chunks       = 0
             unknown      = 0
             written      = 0      # bytes committed to disk this session
@@ -215,7 +222,21 @@ def run_session_loop(conn: socket.socket, log_fn=print,
                     if key_id == KEY_END:
                         break
                     payload = readall(stream, n_bytes)
-                    if (not dwell_seen and key_id == SLAVE_DWELL_KEY
+                    hook_key = key_id
+                    if key_id in KEY_KIND:
+                        hook_key, new_kind = selector.observe(key_id, n_bytes)
+                        if new_kind is not None:
+                            k_m, k_s = KIND_KEYS[new_kind]
+                            log_fn(f'[session {session}] marker source: {new_kind} (keys {k_m}/{k_s}'
+                                   + ('' if new_kind == 'dwell' else '; handed to the hooks as the dwell keys 320/323')
+                                   + ')')
+                            if marker_kinds_seen:
+                                log_fn(f'[session {session}] WARNING: marker input switched to {new_kind} '
+                                       f'after {sorted(marker_kinds_seen)} data had already arrived -- more than '
+                                       f'one of dwell/line/frame is carrying a signal on this node')
+                        if n_bytes:
+                            marker_kinds_seen.add(KEY_KIND[key_id])
+                    if (not dwell_seen and hook_key == SLAVE_DWELL_KEY
                             and on_first_dwell_chunk is not None):
                         dwell_seen = True
                         on_first_dwell_chunk()
@@ -240,7 +261,7 @@ def run_session_loop(conn: socket.socket, log_fn=print,
                         skipped += n_bytes
                     else:
                         unknown += 1
-                    for q in subs.get(key_id, ()):
+                    for q in subs.get(hook_key, ()):
                         q.put(payload)
 
                     chunks += 1

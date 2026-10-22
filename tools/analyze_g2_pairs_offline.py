@@ -33,6 +33,7 @@ from numba import njit, prange
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import marker_source
 import offset_tools
 
 
@@ -126,8 +127,10 @@ def estimate_slave_offset(base_dir: str, n_events: int = 2000) -> float:
     (densest-cluster average, same method+signal as the live correlator's
     sparse-cal flow) -- bounded to the first n_events to stay within
     estimate_offset's O(n1*n2) full-matrix search limit."""
-    slave1 = np.memmap(fr'{base_dir}\node1\slave_dwell.bin', dtype=np.int64, mode='r')
-    slave2 = np.memmap(fr'{base_dir}\node2\slave_dwell.bin', dtype=np.int64, mode='r')
+    # whichever of dwell / line / frame each node's reference was wired to (marker_source.py)
+    _, slave1, k1 = marker_source.load_markers(fr'{base_dir}\node1')
+    _, slave2, k2 = marker_source.load_markers(fr'{base_dir}\node2')
+    print(f'marker input: node1 {k1}, node2 {k2}')
     offset, details = offset_tools.estimate_offset(
         slave1[:n_events], slave2[:n_events], cluster_tol=10_000, return_details=True)
     print(f'slave offset: {offset:+,.0f} ps  '
