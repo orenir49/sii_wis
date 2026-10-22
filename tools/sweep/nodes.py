@@ -26,6 +26,7 @@ sys.path.insert(0, os.path.join(ROOT, 'tools'))
 
 import ssh_launcher as sl
 from master_backend import start_server, run_session_loop
+from marker_source import load_markers
 from master import merge_hooks
 from correlate_engine import ChannelGraph
 from correlate_kernel import bin_edges, PairPool, prewarm
@@ -72,6 +73,14 @@ class NodeLink:
         self.last_status = None
         self.recv_host = None
         self.error = None   # set by _on_status on an 'error' report, cleared by start_acquisition
+        # Record mode (tools/sweep/record.py): keep the raw stamps instead of correlating live. write_raw makes the receiver write
+        # px_*.bin and the marker files; session_log keeps what the session loop says (marker source, warnings); last_stats is the
+        # node's own end-of-session account (records, overflow, lag...); sessions_done counts finished data sessions.
+        self.write_raw = False
+        self.output_dir = None        # None: ./spad_data/node{id}
+        self.session_log: list = []
+        self.last_stats = None
+        self.sessions_done = 0
 
     def connect(self, retries: int = 10, retry_delay_s: float = 2.0):
         """First-time setup: local data server + its accept loop (these
@@ -144,6 +153,7 @@ class NodeLink:
         s = msg.get('status')
         self.last_status = msg
         if s == 'done':
+            self.last_stats = msg.get('stats') or None
             self.session_active.clear()
         elif s == 'error':
             print(f'[node{self.node_id}] ERROR: {msg.get("msg")}')
@@ -174,21 +184,23 @@ class NodeLink:
                 {320: self.master_dwell_q, 323: self.dwell_q},
             )
             try:
-                run_session_loop(conn, log_fn=lambda m: None,
-                                  pixel_hooks=hooks, write_hooked=False)
+                run_session_loop(conn, log_fn=(self.session_log.append if self.write_raw else (lambda m: None)),
+                                  pixel_hooks=hooks, write_hooked=self.write_raw)
             except Exception as exc:
                 print(f'[node{self.node_id}] session loop crashed: {exc!r}')
+                self.session_log.append(f'session loop crashed: {exc!r}')
             finally:
                 try:
                     conn.close()
                 except OSError:
                     pass
                 self.data_conn = None
+                self.sessions_done += 1
 
     def start_acquisition(self, duration_s: float):
         self.error = None
         self.session_active.set()
-        output_dir = f'./spad_data/node{self.node_id}'
+        output_dir = self.output_dir or f'./spad_data/node{self.node_id}'
         self._send({'cmd': 'start', 'recv_host': self.recv_host,
                     'recv_port': self.data_port, 'output_dir': output_dir,
                     'duration': duration_s, 'test': False})
@@ -284,6 +296,46 @@ def shutdown_lspad_both(log=print):
             log(f'[node{nid}] lSPAD shut down')
         finally:
             client.close()
+
+
+def shutdown_lspad_each(log=print) -> dict:
+    """Close lSPAD on each node INDEPENDENTLY: a node that cannot be reached (SSH down, powered off) is reported and skipped, never allowed
+    to stop the other one from being closed. Returns {node: True (closed) | False (not reached / still running)}."""
+    out = {}
+    for nid, info in NODES.items():
+        client = None
+        try:
+            client = sl.ssh_connect(info['host'], info['user'])
+            sl.run_ps(client, "Get-Process -Name 'lSPAD*' -ErrorAction SilentlyContinue | Stop-Process -Force")
+            time.sleep(2.0)
+            left, _ = sl.run_ps(client, "Get-Process -Name 'lSPAD*' -ErrorAction SilentlyContinue | Measure-Object | Select-Object -ExpandProperty Count")
+            if left.strip() not in ('', '0'):
+                sl.run_ps(client, "taskkill /F /IM lSPAD.exe /T")
+                time.sleep(2.0)
+                left, _ = sl.run_ps(client, "Get-Process -Name 'lSPAD*' -ErrorAction SilentlyContinue | Measure-Object | Select-Object -ExpandProperty Count")
+            out[nid] = left.strip() in ('', '0')
+            log(f'[node{nid}] lSPAD closed' if out[nid] else f'[node{nid}] lSPAD is STILL RUNNING after Stop-Process and taskkill')
+        except Exception as exc:
+            out[nid] = False
+            log(f'[node{nid}] could not close lSPAD: {type(exc).__name__}: {exc}')
+        finally:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+    return out
+
+
+def unreachable_nodes() -> list:
+    """Nodes that do not answer over SSH (10 s timeout each)."""
+    dead = []
+    for nid, info in NODES.items():
+        try:
+            sl.ssh_connect(info['host'], info['user']).close()
+        except Exception:
+            dead.append(nid)
+    return dead
 
 
 def full_reset_and_launch(masks, log=print):
@@ -492,10 +544,8 @@ class ReplaySource:
         d1, d2 = os.path.join(base_dir, 'node1'), os.path.join(base_dir, 'node2')
         self.t1 = np.memmap(os.path.join(d1, f'px_{pixel}.bin'), dtype=np.int64, mode='r')
         self.t2 = np.memmap(os.path.join(d2, f'px_{pixel}.bin'), dtype=np.int64, mode='r')
-        self.dw = {1: (np.fromfile(os.path.join(d1, 'master_dwell.bin'), dtype=np.int64),
-                       np.fromfile(os.path.join(d1, 'slave_dwell.bin'), dtype=np.int64)),
-                   2: (np.fromfile(os.path.join(d2, 'master_dwell.bin'), dtype=np.int64),
-                       np.fromfile(os.path.join(d2, 'slave_dwell.bin'), dtype=np.int64))}
+        # each node's marker input: dwell, or line/frame where the reference was wired (marker_source.py)
+        self.dw = {1: load_markers(d1)[:2], 2: load_markers(d2)[:2]}
         self.pixel, self.lo_s, self.hi_s, self.offset = pixel, lo_s, hi_s, int(offset_ps)
         self.step_s, self.max_buf = step_s, max_buffer_bytes
         self._fed_s, self._stop, self._thread = 0.0, threading.Event(), None
