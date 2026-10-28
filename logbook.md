@@ -552,3 +552,16 @@ Reverting to 2:1 fiber splitter, new spectral alignment.
 - No bunching confirmed on both pixel 194 and pixel 124 (upper limit of ~0.1-0.2% signal).
 - It's impractical to use the 10 micron source to get a tighter limit.
 - Next- back to SM fiber, increase baseline even more, try to get a weaker amplitude.
+
+## 28-10-26
+
+- B=60mm, SM fiber, telescopes close to the edge of the beam: no ND gives 50.8 / 43.2 Mcps over mask_20 (`spad_data/intensity/28-10-26/` has no file for this scan; the 08:22 scan was overwritten), and lSPAD refused to start on both nodes (USB bandwidth) at that rate, then accepted the same rate after a restart. One 60 s mask_20 round by hand (`spad_data/record/mask20_60mm`, residual offsets offline): coadd 0.54 \pm 0.11%, 4.7 sigma.
+- With OD 0.4 / 0.3 (node 1 / 2): 41.7 / 43.3 Mcps over mask_40, Campaign `B=60mm`: 10 rounds x 120 s, 
+  - Coadd 0.631 \pm 0.040% (13.2 sigma at 6.90 ns).
+- `figs/28-10-26/v2_vs_baseline.png`: the four mask_40 coadds are 0.746, 0.667, 0.697, 0.631% at 28.5, 38.5, 48.5, 60.5 mm, a ~15% decline, looks almost flat.
+  - Any reasonable source visibility function predicts a steep decline on this baseline range.
+  - I suspect it is due to the collimating lens.
+- Tried direct coupling: no lens, 0.5" OAPs straight onto the fiber. Count rate plummets due to defocus: 1.1 / 1.4 Mcps global, roughly 100x below the lens setup. Not useful for bunching measurements (intensity data stored).
+- Collimating lens removed and reinstalled. 
+  - Telescopes realigned successfully, count rates back to normal (`spad_data/intensity/28-10-26/node{1,2}_lens_reinstalled_noND.txt`).
+  - Bunching survived the disturbance: `spad_data/lens_reinstall.npz`, 4 pixels without ND, ~120 seconds, high coadded SNR.
