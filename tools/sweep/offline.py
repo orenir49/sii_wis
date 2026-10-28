@@ -147,35 +147,35 @@ def _neg_steps(mm, step: int = 50_000_000) -> list:
 
 
 def glitch_drops(mm, max_run: int = 5000) -> np.ndarray:
-    """Indices of events stamped one coarse-counter epoch (6.5536 ms) late or early: a RUN of one or more consecutive events displaced by one epoch,
-    seen as a big step down at the sort-order break and a matching step of the opposite sign at the other end of the run (21-10-26: a lone event in
-    some files, a run of ~10 in others; the first version assumed a lone event and failed g3 round 2). A late run is preceded by its up-step, an early
-    run followed by its up-step; the displaced events are dropped (a handful of ~1e9)."""
+    """Indices of stray events that break the sort order the kernel needs: at every step down (mm[i] > mm[i+1]) the SHORTEST run of events
+    whose removal restores the order is dropped -- either a late run ending at i (events j+1..i with mm[j] <= mm[i+1]) or an early run
+    starting at i+1 (events i+1..k with mm[k+1] >= mm[i]). This covers the coarse-counter epoch glitches (a lone event or a run of ~10
+    stamped 6.5536 ms late or early; 21-10-26) and a lone event stamped 133 us late (22-10-26, mask44 round 2, node 2 px 170), which the
+    first version, keyed on the epoch, refused. A break that no run of <= max_run events explains is a real corruption and raises."""
     drop = []
     skip_to = -1
-    prev = -1                     # the last index a handled glitch ended at: an up-step before it belongs to that glitch, not to this one
-    big = 6_000_000_000
+    prev = -1                     # the last index a handled glitch ended at
     for i in _neg_steps(mm):
         if i <= skip_to:
             continue
-        if abs((int(mm[i + 1]) - int(mm[i])) + EPOCH_PS) >= 5_000_000:
-            raise ValueError(f'sort order broken at {i} by {int(mm[i + 1]) - int(mm[i])} ps: not a single-epoch glitch')
+        nxt = int(mm[i + 1])
         lo = max(0, i - max_run, prev + 1)
-        back = np.diff(np.asarray(mm[lo:i + 1])) if i > lo else np.empty(0, np.int64)
-        up_back = np.nonzero(back > big)[0]
-        if len(up_back):                                           # late run: events (j+1 .. i), j the last up-step before i
-            j = lo + int(up_back[-1])
-            drop.extend(range(j + 1, i + 1))
+        back = np.asarray(mm[lo:i + 1]).astype(np.int64)
+        ok = np.nonzero(back <= nxt)[0]                            # candidates j for a late run j+1..i
+        late = (i - (lo + int(ok[-1]))) if len(ok) else None       # its length
+        cur = int(mm[i])
+        fwd = np.asarray(mm[i + 1:i + 2 + max_run]).astype(np.int64)
+        ok2 = np.nonzero(fwd[1:] >= cur)[0]                        # candidates k for an early run i+1..k (k = i+1+index)
+        early = (int(ok2[0]) + 1) if len(ok2) else None
+        if late is None and early is None:
+            raise ValueError(f'sort order broken at {i} by {nxt - cur} ps and no run of <= {max_run} events explains it')
+        if early is None or (late is not None and late <= early):
+            drop.extend(range(i - late + 1, i + 1))
             prev = i
-            continue
-        fwd = np.diff(np.asarray(mm[i + 1:i + 2 + max_run]))
-        up_fwd = np.nonzero(fwd > big)[0]
-        if len(up_fwd):                                            # early run: events (i+1 .. i+1+k), k the first up-step after
-            k = i + 1 + int(up_fwd[0])
+        else:
+            k = i + early
             drop.extend(range(i + 1, k + 1))
             skip_to = prev = k
-            continue
-        raise ValueError(f'sort order broken at {i} without a matching step back within {max_run} events')
     return np.array(sorted(set(drop)), dtype=np.int64)
 
 
@@ -205,10 +205,12 @@ def segment_edges(offset_ps: int, st1: dict, st2: dict) -> list:
 
 
 def correlate_pixel(p: int, node1_dir: str, node2_dir: str, offset_ps: int, st1: dict, st2: dict, edges: list, *, tmax_ps: float,
-                    bws, n_shift: int, pool, block: int = BLOCK, log=print) -> dict:
+                    bws, n_shift: int, pool, block: int = BLOCK, log=print, px_offset_ps: tuple = (0, 0)) -> dict:
     """{(variant, seg, bw): histogram} for pixel p (identity pair). Variants: 'raw' (no chip correction) and, for a master-chip
-    pixel, 'cor' (both nodes' chip states removed from the stamps)."""
+    pixel, 'cor' (both nodes' chip states removed from the stamps). `px_offset_ps` = (node-1, node-2) per-pixel TDC offset ADDED to this
+    pixel's stamps on each node (the pixel_offsets_ps.txt convention, what node_backend would have added live)."""
     master = chip_map.chip_of_loc(p) == 'master'
+    po1, po2 = (np.int64(int(px_offset_ps[0])), np.int64(int(px_offset_ps[1])))
     mm1 = np.memmap(_px_path(node1_dir, p), dtype=np.int64, mode='r')
     mm2 = np.memmap(_px_path(node2_dir, p), dtype=np.int64, mode='r')
     d1, d2 = glitch_drops(mm1), glitch_drops(mm2)
@@ -233,6 +235,10 @@ def correlate_pixel(p: int, node1_dir: str, node2_dir: str, offset_ps: int, st1:
             if hi <= lo:
                 continue
             w2 = take(mm2, lo, hi, d2)
+            if po1:
+                t1 = t1 + po1                                   # a constant per pixel: order and the jump positions are unchanged
+            if po2:
+                w2 = w2 + po2
             for bw in bws:
                 h = pool.run([(0, t1, w2 - np.int64(offset_ps))], bw, tmax_ps, nb[bw], n_shift)[0]
                 out[('raw', seg, bw)] = out.get(('raw', seg, bw), 0) + h
@@ -358,9 +364,18 @@ def analyze_round(res: dict, pixels, bws=BWS, peak_window_ps: dict | None = None
 # ---------------------------------------------------------------------------
 
 def process_round(round_dir: str, pixels, *, tmax_ps: float = TMAX_PS, bws=BWS, n_shift: int = N_SHIFT, workers: int | None = None,
-                  block: int = BLOCK, peak_window_ps: tuple | None = None, log=print) -> dict:
-    """round_dir/node1, round_dir/node2 -> round_dir/result.npz + analysis.json. Returns the analysis (plus meta)."""
+                  block: int = BLOCK, peak_window_ps: tuple | None = None, log=print, pixel_offsets: dict | None = None,
+                  offsets_source: str = 'none') -> dict:
+    """round_dir/node1, round_dir/node2 -> round_dir/result.npz + analysis.json. Returns the analysis (plus meta).
+    `pixel_offsets` = {1: vec, 2: vec} (320 ints each, the pixel_offsets_ps.txt convention) added to each pixel's stamps per node before
+    correlating -- for a round recorded with zero offsets on the nodes (crosstalk_round.round_offsets measures them from the round itself)."""
     t0 = time.time()
+    po = {n: np.asarray(pixel_offsets[n], dtype=np.int64) for n in (1, 2)} if pixel_offsets else None
+    if po is not None:
+        for n in (1, 2):
+            if po[n].shape != (320,):
+                raise ValueError(f'pixel_offsets[{n}]: expected 320 entries, got {po[n].shape}')
+        log(f'pixel offsets ({offsets_source}): ' + '; '.join(f'node {n} ' + ' '.join(f'{p}:{int(po[n][p]):+d}' for p in pixels) for n in (1, 2)))
     n1, n2 = (os.path.join(round_dir, f'node{n}') for n in (1, 2))
     m1, s1, k1 = marker_source.load_markers(n1)
     m2, s2, k2 = marker_source.load_markers(n2)
@@ -384,7 +399,8 @@ def process_round(round_dir: str, pixels, *, tmax_ps: float = TMAX_PS, bws=BWS, 
     try:
         for p in pixels:
             tp = time.time()
-            h, inf = correlate_pixel(p, n1, n2, offset, st1, st2, edges, tmax_ps=tmax_ps, bws=bws, n_shift=n_shift, pool=pool, block=block, log=log)
+            h, inf = correlate_pixel(p, n1, n2, offset, st1, st2, edges, tmax_ps=tmax_ps, bws=bws, n_shift=n_shift, pool=pool, block=block, log=log,
+                                     px_offset_ps=(int(po[1][p]), int(po[2][p])) if po is not None else (0, 0))
             for (var, seg, bw), arr in h.items():
                 res[KEY.format(p=p, var=var, seg=seg, bw=bw_key(bw))] = arr
             info[p] = inf
@@ -396,7 +412,9 @@ def process_round(round_dir: str, pixels, *, tmax_ps: float = TMAX_PS, bws=BWS, 
     meta = dict(pixels=list(pixels), offset=cal, node1=dict(kind=k1, state={k: v for k, v in st1.items() if k != 'summary'}, summary=st1['summary']),
                 node2=dict(kind=k2, state={k: v for k, v in st2.items() if k != 'summary'}, summary=st2['summary']),
                 seg_edges_node1_clock_ps=edges, tmax_ps=tmax_ps, n_shift=n_shift, bws=[bw_key(b) for b in bws], info={str(k): v for k, v in info.items()},
-                tau_label='left edge of the kernel bin (physical centre = label + bw/2)', analysis_s=round(time.time() - t0, 1))
+                tau_label='left edge of the kernel bin (physical centre = label + bw/2)', analysis_s=round(time.time() - t0, 1),
+                pixel_offsets=dict(source=offsets_source, **{f'node{n}': {str(p): int(po[n][p]) for p in pixels} for n in (1, 2)}) if po is not None
+                else dict(source='none'))
     np.savez(os.path.join(round_dir, 'result.npz'), pixels=np.array(pixels), meta=json.dumps(meta), **res)
     with open(os.path.join(round_dir, 'analysis.json'), 'w') as f:
         json.dump(dict(meta=meta, analysis=analysis), f, indent=1, default=float)
@@ -503,6 +521,15 @@ def main(argv=None) -> int:
     r.add_argument('--n-shift', type=int, default=N_SHIFT)
     r.add_argument('--bins-ps', default=','.join(str(bw_key(b)) for b in BWS))
     r.add_argument('--peak-window-ns', type=float, nargs=2, default=None, metavar=('LO', 'HI'), help='search the coadd peak only inside this tau window (default +-150 ns)')
+    r.add_argument('--crosstalk-offsets', action='store_true',
+                   help='the round was recorded with ZERO offsets on the nodes: measure each node\'s per-pixel TDC offsets from its own cross-talk '
+                        'peaks first (crosstalk_round.py; offsets_node{1,2}.txt in the round folder) and apply them when correlating')
+    r.add_argument('--residual-offsets', action='store_true',
+                   help='like --crosstalk-offsets, but the round was recorded WITH the calibration file applied on the nodes: the cross-talk '
+                        'peaks are the residuals of that file (master/slave links shifted by whole 100 ns ticks only, no static level added) and '
+                        'are applied on top of it when correlating')
+    r.add_argument('--offsets-ref', type=int, default=160, help='reference pixel of the cross-talk chain (default 160, else the nearest active)')
+    r.add_argument('--crosstalk-seconds', type=float, default=None, help='cross-talk offsets from the first N s of the round only (default: all)')
     c = sub.add_parser('combine', help='combine every analysed round of a campaign folder')
     c.add_argument('--campaign', required=True)
     c.add_argument('--peak-window-ns', type=float, nargs=2, default=None, metavar=('LO', 'HI'))
@@ -513,9 +540,16 @@ def main(argv=None) -> int:
         import test_offline_round
         return test_offline_round.main()
     if args.cmd == 'round':
-        process_round(args.dir, _parse_pixels(args.pixels), tmax_ps=args.tmax_ns * 1e3, n_shift=args.n_shift, workers=args.workers,
+        pixels = _parse_pixels(args.pixels)
+        po, src = None, 'none'
+        if args.crosstalk_offsets or args.residual_offsets:
+            import crosstalk_round
+            po = crosstalk_round.round_offsets(args.dir, pixels, ref=args.offsets_ref, max_seconds=args.crosstalk_seconds, calibrated=args.residual_offsets)
+            src = 'crosstalk residuals, this round (calibrated data)' if args.residual_offsets else 'crosstalk, this round'
+        process_round(args.dir, pixels, tmax_ps=args.tmax_ns * 1e3, n_shift=args.n_shift, workers=args.workers,
                       bws=tuple(float(x) for x in args.bins_ps.split(',')),
-                      peak_window_ps=tuple(x * 1e3 for x in args.peak_window_ns) if args.peak_window_ns else None)
+                      peak_window_ps=tuple(x * 1e3 for x in args.peak_window_ns) if args.peak_window_ns else None,
+                      pixel_offsets=po, offsets_source=src)
         return 0
     if args.cmd == 'combine':
         import record_plots

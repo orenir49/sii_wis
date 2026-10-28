@@ -497,7 +497,7 @@ Reverting to 2:1 fiber splitter, new spectral alignment.
 - Made `.claude/masks/mask_20.txt` (20 pixels, 150-169, the 20 `mask_sparse` pixels closest to 160) and pushed it to both nodes (not applied yet).
 - For 0.5% bunching excess, 100 ps bins, identity pairs 150-169: ~40 min to SNR 5 per pixel (34-50 min), ~2 min for the coadded peak (assumes the 20 peaks align within a bin).
 - Took 10 rounds of 2 min integrations on mask_20; for all, peak isn't detectable per pixel but only in coadded frames.
-- The bunching amplitude is clearly not consistent between the 10 measurements.
+- The bunching amplitude is seemingly not consistent between the 10 measurements (actually, 22-10's analysis and Monte Carlo suggest everything is OK).
 - To diagnose this inconsistency, dropped the ND filters and used mask_5 (~30 Mcps per node).
 - With 2-3 minute measurements of mask_5, peaks are detectable in both the individual and coadded frames.
 - Tested frame clock on node2 (trying to eliminate master - slave satellites). This moves the bunching peak from ~13 ns to ~7 ns.
@@ -516,3 +516,39 @@ Reverting to 2:1 fiber splitter, new spectral alignment.
 - Based on these statistics, a Monte Carlo test of the mask20 result (21-10-26: 10 rounds of 2 min, 20 pixels, coadd amplitudes that looked inconsistent). `tools/sweep/coadd_sim.py`, figures and json in `figs/22-10-26/mask20_sim/`. Each simulated round uses a real round's own per-pixel baselines (its count rate x duration), per-pixel amplitude and width bootstrapped from the 40 mask4 free fits, centroid offsets of 17 ps rms, Poisson counts, and the same tallest-bin + fixed-sigma fit as the real rounds.
   - Real: mean 0.70 %, sd over the 10 rounds 0.120 %. Simulated: mean 0.68 %, sd 0.094 % -- Poisson alone gives 0.093 %; the per-pixel amplitude scatter and the 17 ps offsets add nothing. Every real round lies inside the simulated ±2 sigma band (`mask20_sim_vs_real.png`, pulls -2.0 to +1.9); the excess scatter is chi2/dof 1.8 for 9 dof, p = 0.08, i.e. a 1.2 sigma fluctuation. The 10 rounds are consistent with Poisson noise at mask20's count rate.
   - Misalignment is ruled out as a cause on separate grounds: centroid offsets lower the mean height (0.63 % at 50 ps rms, 0.54 % at 100 ps) without widening the scatter, and the real mean equals the aligned prediction, so the mask20 pixels were aligned to better than ~30 ps rms. If a real excess exists it is specific to that session (ND attenuation, dwell input on node 2) and needs more rounds to show.
+- Live offsets: instead of calibrating per-pixel offsets once, I've tried computing offsets from cross-talk peaks present in the same data we use for g2. I.e, live offset calibration (though done on data stored to disk).
+- Same raw data correlated three ways: coadd 0.67 % (free σ 134 ps) with the centroid offsets, 0.86 % (95 ps) with the 19-10-26 calibration file, 0.91 % (86 ps) with the two-hump midpoint offsets. `crosstalk_round.py` now uses the midpoint; the calibration files carry the low-rate centroid bias (~13-16 ps per link, a ±150 ps ramp over 20 pixels).
+- With OD 1.0 filters `.claude/masks/mask_44.txt` gives 30.0 / 34.8 Mcps per node. Planned next: mask_44, 5 x 180 s, raw, per-round midpoint offsets, raw deleted after analysis (~107 GB per round). This campaign is meant to check again the repeatability of the coadded g2 peak (same as 10 rounds of mask 20).
+- 5 rounds are consistent within their error bar. 40 pixels is a good regime to work in moving forward, expected to reach SNR 10 in ~5 hours (8 Mcps over the mask, ~OD 1.5 per node).
+- As a final check of the consistency of blind coadding, I would like to repeat 10 rounds of mask_20, OD 0.5 per node, 2-3 min integration per node.
+
+## 25-10-26
+
+- 10 rounds x 180 sec integration, mask_20.txt, OD 0.5 / 0.6 per node for ~40 Mcps global.
+- Longer integrations compared to 21-10's campaign produced much cleaner results, clearly consistent with a single bunching amplitude inside the error bars.
+- At this point, I feel confident we can use spectral multiplexing to build the visibility curve.
+- At the first baseline, of ~30mm:
+  - 5 rounds x 150 sec integration, mask_40.txt, OD 0.8 for both, yielding ~40 Mcps per node.
+  - The total integration time was chosen to exceed SNR 10 for the coadded peak.
+  - This couldn't be done in a single round for practical reasons (either crash RAM at 40 Mcps, or go to 8 Mcps and wait for 5 hours).
+  - The bunching amplitude comes out to 0.746 \pm 0.05%, about 1 error bar away from the mask_20 result (0.68%). 
+  - However, it is consistent with the prediction obtained by coadding the amplitudes of the g0-g9 campaign, showing the importance of zero baseline calibration (currently g2 depends on WHICH pixels are coadded).
+- Next: 
+  - More accurate measurement of the baseline + uncertainty estimate.
+  - Educated choice of next baseline based on expected change in visibility.
+  - Preferably, go to larger baselines first (35,40,45 mm) since it's easier than zero baseline.
+  - Expected at B=0,30,40,50 respectively: |V|^2 = 1.0, 0.49, 0.28, 0.14
+  - With same count rate and integration time, expected SNR is >4 for all data points, and all are separated by more than 3 sigma.
+  - This should be good enough for a ~5% measurement of the source angular diameter.
+
+## 26-10-26
+
+- B=30mm: caliper measurement 28.5 \pm 2 mm
+- B=40mm: caliper measurement 38.5 \pm 2 mm
+- B=50mm: caliper measurement 48.5 \pm 2 mm
+- B=60mm: caliper measurement 60.5 \pm 2 mm
+- The three campaigns have surprisingly similar bunching amplitudes, seemingly inconsistent with how we understand the gemoetry of the setup.
+- As a sanity check, I will run a quick bunching test with a 10 micron source @B=50mm, expecting essentially no signal.
+- No bunching confirmed on both pixel 194 and pixel 124 (upper limit of ~0.1-0.2% signal).
+- It's impractical to use the 10 micron source to get a tighter limit.
+- Next- back to SM fiber, increase baseline even more, try to get a weaker amplitude.

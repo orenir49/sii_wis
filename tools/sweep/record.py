@@ -18,6 +18,11 @@ Mirror folder    <mirror>/<name>/ :  status.txt/json every 15 s, records.jsonl, 
                  (two campaign figures + two per-round grids, see record_plots.py) directly in it.
 A failed mirror write never stops the run; it is shown in the status (`mirror_error`) and retried.
 
+Raw-offset campaigns (--zero-offsets --crosstalk-offsets): before the first round each node's pixel_offsets_ps.txt is saved to
+<campaign>/offsets_backup/ and replaced by all zeros, so the rounds record RAW stamps; after each round lands, its own same-node
+cross-talk peaks give that round's per-pixel TDC offsets (tools/sweep/crosstalk_round.py -> rounds/rNN/offsets_node{1,2}.txt), which the
+offline correlation then applies to the stamps. The nodes are NOT restored at the end (`--restore-offsets` pushes the backup back).
+
 Disk: one round of 4 pixels x 180 s is ~70 GB of raw stamps. By default (--keep-raw none) a round's raw stamps are DELETED as soon as its histograms are
 analysed and saved (result.npz / analysis.json / g2_histograms are the record); --keep-raw auto keeps them while the drive has room (oldest first deleted
 below two rounds + 50 GB), all never deletes.
@@ -57,7 +62,8 @@ class NodeUnreachable(RuntimeError):
 class Config:
     def __init__(self, name, pixels, rounds=10, duration_s=180.0, root=None, mirror=None, keep_raw='none', workers=None,
                  inline_analysis=False, data_dir=None, hist_dir=None, peak_window_ns=None, round_figs=True, tmax_ps=off.TMAX_PS, n_shift=off.N_SHIFT, bws=off.BWS, drain_timeout_s=3600.0,
-                 stall_s=300.0):
+                 stall_s=300.0, zero_offsets=False, crosstalk_offsets=False, offsets_ref=160, rate_mcps=None, crosstalk_seconds=None,
+                 figures=plots.DEFAULT_FIGURES, residual_offsets=False):
         self.name = name
         self.pixels = sorted(int(p) for p in pixels)
         self.rounds = int(rounds)
@@ -77,16 +83,52 @@ class Config:
         self.stall_s = stall_s
         self.round_figs = round_figs        # the two per-round grids (one panel per round) beside the two campaign figures in figs/
         self.peak_window_ps = tuple(x * 1e3 for x in peak_window_ns) if peak_window_ns else None
+        self.zero_offsets = zero_offsets            # back up + zero the nodes' pixel_offsets_ps.txt before the first acquisition (raw stamps)
+        self.crosstalk_offsets = crosstalk_offsets  # per round: measure the TDC offsets from the round's own cross-talk peaks, apply them offline
+        self.residual_offsets = residual_offsets    # same, for rounds recorded WITH the calibration file on the nodes: the peaks are its residuals (no level term)
+        if zero_offsets and residual_offsets:
+            raise ValueError('--residual-offsets measures the residuals of the file applied on the nodes; it cannot be combined with --zero-offsets')
+        self.offsets_ref = int(offsets_ref)
+        self.rate_mcps = tuple(float(x) for x in rate_mcps) if rate_mcps else None     # (node 1, node 2) total count rate of the mask, for the disk estimate
+        self.crosstalk_seconds = crosstalk_seconds                                      # cross-talk offsets from the first N s of each round (None: all)
+        self.figures = tuple(figures)                                                   # which of record_plots.ALL_FIGURES to make
 
     def round_dir(self, i):
         return os.path.join(self.root, 'rounds', f'r{i:02d}')
+
+    @property
+    def campaign_bw(self) -> float:
+        """Bin width of the campaign figures: 20 ps when the rounds are analysed at 20 ps, else the widest (100 ps with --bins-ps 100)."""
+        keys = {off.bw_key(b) for b in self.bws}
+        return 20.0 if 20 in keys else float(max(keys))
 
     def path(self, *p):
         return os.path.join(self.root, *p)
 
     @property
     def per_round_bytes(self):
+        """Raw stamps of one round, both nodes: 8 B per event at the mask's count rate (--rate-mcps, or the latest intensity scan over the
+        campaign's pixels) with 15 % margin; without either, the 21-10-26 figure of 17.5 GB per pixel per 180 s (6 Mcps per pixel)."""
+        rates = self.rate_mcps or intensity_rates_mcps(self.pixels)
+        if rates:
+            return 8.0 * sum(rates) * 1e6 * self.duration_s * 1.15
         return GB_PER_PIXEL_180S * GB * len(self.pixels) * self.duration_s / 180.0
+
+
+def intensity_rates_mcps(pixels, max_age_h: float = 24.0) -> tuple | None:
+    """(node 1, node 2) Mcps summed over `pixels` from spad_data/intensity/node{1,2}.txt, if both exist and are younger than max_age_h."""
+    out = []
+    for n in (1, 2):
+        p = os.path.join(ROOT, 'spad_data', 'intensity', f'node{n}.txt')
+        if not os.path.exists(p) or time.time() - os.path.getmtime(p) > max_age_h * 3600:
+            return None
+        try:
+            from tools.sweep.intensity import load_rates
+            r = load_rates(p)
+            out.append(sum(r.get(int(q), 0.0) for q in pixels) / 1e6)
+        except Exception:
+            return None
+    return tuple(out)
 
 
 # ---------------------------------------------------------------------------
@@ -408,6 +450,9 @@ class RealHardware:
     def wait_ready(self, status_fn, log):
         self.nd.wait_for_ac(log, status_fn)
 
+    def zero_offsets(self, backup_dir, log) -> dict:
+        return self.nd.backup_and_zero_offsets(backup_dir, log)
+
     def bring_up(self, pixels, log):
         nd = self.nd
         nd.full_reset_and_launch(list(pixels), log=log)
@@ -479,9 +524,17 @@ class RealHardware:
 # ---------------------------------------------------------------------------
 
 def analyze(cfg: Config, rdir: str, log) -> None:
+    """The round's offline analysis; with cfg.crosstalk_offsets the round's own per-pixel TDC offsets are measured first (both nodes,
+    from the same-node cross-talk peaks) and applied to the stamps when correlating."""
     pix = ','.join(str(p) for p in cfg.pixels)
     if cfg.inline_analysis:
-        off.process_round(rdir, cfg.pixels, tmax_ps=cfg.tmax_ps, bws=cfg.bws, n_shift=cfg.n_shift, workers=cfg.workers, peak_window_ps=cfg.peak_window_ps, log=log)
+        po, src = None, 'none'
+        if cfg.crosstalk_offsets or cfg.residual_offsets:
+            import crosstalk_round
+            po = crosstalk_round.round_offsets(rdir, cfg.pixels, ref=cfg.offsets_ref, log=log, max_seconds=cfg.crosstalk_seconds, calibrated=cfg.residual_offsets)
+            src = 'crosstalk residuals, this round (calibrated data)' if cfg.residual_offsets else 'crosstalk, this round'
+        off.process_round(rdir, cfg.pixels, tmax_ps=cfg.tmax_ps, bws=cfg.bws, n_shift=cfg.n_shift, workers=cfg.workers, peak_window_ps=cfg.peak_window_ps, log=log,
+                          pixel_offsets=po, offsets_source=src)
         return
     cmd = [sys.executable, '-u', os.path.join(ROOT, 'tools', 'sweep', 'offline.py'), 'round', '--dir', rdir, '--pixels', pix,
            '--tmax-ns', str(cfg.tmax_ps / 1e3), '--n-shift', str(cfg.n_shift), '--bins-ps', ','.join(str(off.bw_key(b)) for b in cfg.bws)]
@@ -489,6 +542,10 @@ def analyze(cfg: Config, rdir: str, log) -> None:
         cmd += ['--workers', str(cfg.workers)]
     if cfg.peak_window_ps:
         cmd += ['--peak-window-ns', str(cfg.peak_window_ps[0] / 1e3), str(cfg.peak_window_ps[1] / 1e3)]
+    if cfg.crosstalk_offsets or cfg.residual_offsets:
+        cmd += ['--residual-offsets' if cfg.residual_offsets else '--crosstalk-offsets', '--offsets-ref', str(cfg.offsets_ref)]
+        if cfg.crosstalk_seconds:
+            cmd += ['--crosstalk-seconds', str(cfg.crosstalk_seconds)]
     with open(os.path.join(rdir, 'analysis.log'), 'w') as lf:
         proc = subprocess.run(cmd, stdout=lf, stderr=subprocess.STDOUT, cwd=ROOT,
                               creationflags=getattr(subprocess, 'BELOW_NORMAL_PRIORITY_CLASS', 0))
@@ -515,6 +572,15 @@ def round_record(cfg: Config, i: int, info: dict, rdir: str) -> dict:
                fwhm_ps_100=2.3548 * r100['fit_free']['sigma'], stats=info.get('stats'))
     if r20:
         rec.update(sigma_20=r20['peak']['sigma'], A_pct_20=100 * r20['fit_fixed']['A'], A_err_pct_20=100 * r20['fit_fixed']['A_err'], fwhm_ps_20=2.3548 * r20['fit_free']['sigma'])
+    po = meta.get('pixel_offsets') or {}
+    if po.get('source', 'none') != 'none':
+        xt = {}
+        for n in (1, 2):
+            p = os.path.join(rdir, f'crosstalk_node{n}.json')
+            j = json.load(open(p)) if os.path.exists(p) else {}
+            xt[n] = dict(ref=j.get('ref'), static_level_ps=j.get('static_level_ps'), untied=j.get('untied', []),
+                         weakest_sigma=min((r['sigma'] for r in j.get('rows', [])), default=None), file_ps=po.get(f'node{n}'))
+        rec['pixel_offsets'] = dict(source=po['source'], **{str(n): xt[n] for n in (1, 2)})
     return rec
 
 
@@ -556,7 +622,8 @@ def publish(cfg: Config, mirror: Mirror, log) -> dict | None:
     figures (per-round centroid alignment, coadd height / sigma against round) and, with cfg.round_figs, the two per-round grids (stacked
     per-pixel peaks and coadd peak zoom, one panel per round, 100 ps). Stale figures of earlier layouts and the figs/ folder of the layout
     before 22-10-26 are pruned from the mirror."""
-    summary = plots.combine_campaign(cfg.path('.'), log=log, prior_window_ps=cfg.peak_window_ps, round_grids=cfg.round_figs)
+    summary = plots.combine_campaign(cfg.path('.'), log=log, prior_window_ps=cfg.peak_window_ps, round_grids=cfg.round_figs, figures=cfg.figures,
+                                     bw=cfg.campaign_bw)
     save_histograms(cfg)
     cfig = cfg.path('combined', 'figs')
     combined = [os.path.join(cfig, f) for f in sorted(os.listdir(cfig)) if f.endswith('.png')] if os.path.isdir(cfig) else []
@@ -567,6 +634,18 @@ def publish(cfg: Config, mirror: Mirror, log) -> dict | None:
     for f in (cfg.path('records.jsonl'), cfg.path('combined', 'summary.txt'), cfg.path('combined', 'combined.json'), cfg.path('run.log')):
         mirror.push(f, retries=3)
     return summary
+
+
+def publish_round(cfg: Config, mirror: Mirror, i: int, rdir: str, log) -> list:
+    """The single-round figures ('poc', 'peak' of cfg.figures; record_plots.round_single_figures) into rounds/rNN/figs/ and <mirror>/<name>/rNN/.
+    Nothing when neither is requested."""
+    wanted = tuple(f for f in cfg.figures if f in plots.ROUND_FIGURES)
+    if not wanted:
+        return []
+    files = plots.round_single_figures(rdir, os.path.join(rdir, 'figs'), f'{cfg.name} round {i}', cfg.peak_window_ps, bw=cfg.campaign_bw, figures=wanted)
+    for f in files:
+        mirror.push(f, sub=f'r{i:02d}', retries=3)
+    return files
 
 
 # ---------------------------------------------------------------------------
@@ -584,6 +663,7 @@ def run_campaign(cfg: Config, hw, log=print, heartbeat_s: float = HEARTBEAT_S) -
     status.update(completed=len(done))
     if done:
         log(f'resuming: rounds {sorted(done)} already have a result')
+    offsets_zeroed = False
     try:
         for i in range(1, cfg.rounds + 1):
             rdir = cfg.round_dir(i)
@@ -600,6 +680,11 @@ def run_campaign(cfg: Config, hw, log=print, heartbeat_s: float = HEARTBEAT_S) -
                         for n in (1, 2):                          # nothing of an earlier attempt may be left in the receiver's directories
                             shutil.rmtree(os.path.join(cfg.data_dir, f'node{n}'), ignore_errors=True)
                             os.makedirs(os.path.join(cfg.data_dir, f'node{n}'), exist_ok=True)
+                        if cfg.zero_offsets and not offsets_zeroed:    # once per campaign run, before the first acquisition: raw stamps from here on
+                            status.update(detail='saving the nodes\' offset files and zeroing them')
+                            res = hw.zero_offsets(cfg.path('offsets_backup'), log)
+                            log(f'pixel offsets on the nodes: {res} (backup in {cfg.path("offsets_backup")})')
+                            offsets_zeroed = True
                         hw.bring_up(cfg.pixels, log)
                         status.update(phase='acquiring', detail=f'{cfg.duration_s:.0f} s acquisition, raw stamps to disk')
                         info = hw.acquire(cfg.duration_s, log, watch_dirs=[os.path.join(cfg.data_dir, 'node1'), os.path.join(cfg.data_dir, 'node2')],
@@ -643,7 +728,9 @@ def run_campaign(cfg: Config, hw, log=print, heartbeat_s: float = HEARTBEAT_S) -
                         j = json.load(f)
                     info = dict(stats=j.get('stats'), wall_s=j.get('wall_s'), attempts=j.get('attempts', 1))
             if i not in done:
-                status.update(phase='analyzing', detail='offline analysis (marker offset, chip states, 100 + 20 ps)')
+                status.update(phase='analyzing', detail=('cross-talk offsets per node, then ' if cfg.crosstalk_offsets else
+                                                         'cross-talk residuals of the calibration per node, then ' if cfg.residual_offsets else '')
+                              + 'offline analysis (marker offset, chip states, 100 + 20 ps)')
                 try:
                     analyze(cfg, rdir, log)
                 except Exception as exc:
@@ -657,6 +744,7 @@ def run_campaign(cfg: Config, hw, log=print, heartbeat_s: float = HEARTBEAT_S) -
                 done.add(i)
                 status.update(phase='publishing', detail='figures + combined result', completed=len(done), last_error=None)
                 try:
+                    publish_round(cfg, mirror, i, rdir, log)
                     summary = publish(cfg, mirror, log)
                 except Exception as exc:                              # figures are a convenience: never lose a round over them
                     log(f'round {i}: publishing FAILED: {exc}')
@@ -665,6 +753,9 @@ def run_campaign(cfg: Config, hw, log=print, heartbeat_s: float = HEARTBEAT_S) -
                 status.update(round_wall_s=status.state['round_wall_s'] + [wall])
                 enforce_disk_budget(cfg, keep_from=i + 1, log=log)
         status.update(phase='complete', detail='', failed_rounds=list(failed), round=None)
+        if offsets_zeroed:
+            log(f'NOTE: the nodes still have all-zero pixel offsets. Restore with: python tools\\sweep\\record.py --name {cfg.name} --pixels ... --restore-offsets '
+                f'(pushes {cfg.path("offsets_backup")}), or push calibration\\pixel_offsets_ps_node{{1,2}}.txt with tools\\push_offsets.py')
     except BaseException as exc:
         status.update(phase='error', last_error=f'{type(exc).__name__}: {exc}'[:400])
         raise
@@ -690,6 +781,8 @@ def republish(cfg: Config, log=print) -> int:
     mirror = Mirror(cfg.mirror, cfg.name)
     status = Status(cfg, mirror)
     status.state.update(completed=len(done), phase='complete', round=None, detail='')
+    for i in done:
+        publish_round(cfg, mirror, i, cfg.round_dir(i), log)
     publish(cfg, mirror, log)
     status.write(retries=3)
     log(f'republished {len(done)} round(s) of {cfg.name}')
@@ -748,6 +841,22 @@ def main(argv=None) -> int:
                     help='search the peak only in this tau window (ns); default +-150 ns. The tallest bin of a weak round is otherwise noise. 21-10-26 peaks: 6.8-13.5 ns')
     ap.add_argument('--no-round-figs', action='store_true', help='only the two campaign figures, no per-round grids')
     ap.add_argument('--publish-only', action='store_true', help='no acquisition: rebuild the combined result and figures of an existing campaign and push them (and the status)')
+    ap.add_argument('--zero-offsets', action='store_true',
+                    help='before the first acquisition save each node\'s pixel_offsets_ps.txt to <campaign>/offsets_backup/ and replace it by all zeros (raw stamps)')
+    ap.add_argument('--crosstalk-offsets', action='store_true',
+                    help='per round: measure each node\'s per-pixel TDC offsets from the round\'s own same-node cross-talk peaks and apply them in the offline correlation '
+                         '(for rounds recorded with zero offsets on the nodes)')
+    ap.add_argument('--residual-offsets', action='store_true',
+                    help='the nodes keep their calibration files (no --zero-offsets): per round, measure the RESIDUALS of that calibration from the '
+                         'same-node cross-talk peaks of the round (master/slave links shifted by whole 100 ns ticks only, no static level added) and apply them on top, offline')
+    ap.add_argument('--offsets-ref', type=int, default=160, help='reference pixel of the cross-talk chain (default 160, else the active pixel nearest it)')
+    ap.add_argument('--restore-offsets', action='store_true', help='no acquisition: push <campaign>/offsets_backup/node{1,2}_pixel_offsets_ps.txt back to the nodes and exit')
+    ap.add_argument('--crosstalk-seconds', type=float, default=60.0, help='cross-talk offsets from the first N s of each round (0: the whole round); 60 s gives peaks of hundreds of sigma')
+    ap.add_argument('--bins-ps', default='100,20', help='histogram bin widths to analyse (comma list, ps); 100 alone halves the correlation time')
+    ap.add_argument('--figures', default=','.join(plots.DEFAULT_FIGURES),
+                    help=f'comma list of {",".join(plots.ALL_FIGURES)}: alignment / trend are per campaign, stacked / zoom / hist per round (default {",".join(plots.DEFAULT_FIGURES)})')
+    ap.add_argument('--rate-mcps', type=float, nargs=2, default=None, metavar=('N1', 'N2'),
+                    help='total count rate of the mask per node, for the disk estimate (default: the latest spad_data/intensity scan over the pixels, else 6 Mcps per pixel)')
     ap.add_argument('--dry-run', action='store_true', help='1 round x 60 s into <name>_dryrun')
     args = ap.parse_args(argv)
     pixels = active_pixels(args.mask) if args.mask else [int(x) for x in args.pixels.split(',')]
@@ -758,9 +867,21 @@ def main(argv=None) -> int:
     import matplotlib
     matplotlib.use('Agg', force=True)
     cfg = Config(name, pixels, rounds, dur, mirror=args.mirror, keep_raw=args.keep_raw, workers=args.workers, inline_analysis=args.inline_analysis,
-                 peak_window_ns=args.peak_window_ns, round_figs=not args.no_round_figs)
+                 peak_window_ns=args.peak_window_ns, round_figs=not args.no_round_figs, zero_offsets=args.zero_offsets,
+                 crosstalk_offsets=args.crosstalk_offsets, residual_offsets=args.residual_offsets, offsets_ref=args.offsets_ref, rate_mcps=args.rate_mcps,
+                 crosstalk_seconds=args.crosstalk_seconds or None, bws=tuple(float(x) for x in args.bins_ps.split(',') if x.strip()),
+                 figures=tuple(x.strip() for x in args.figures.split(',') if x.strip()))
+    bad = [f for f in cfg.figures if f not in plots.ALL_FIGURES]
+    if bad:
+        print(f'unknown figure(s) {bad}; choose from {plots.ALL_FIGURES}')
+        return 2
     if args.publish_only:
         return republish(cfg)
+    if args.restore_offsets:
+        from tools.sweep import nodes as nd
+        res = nd.restore_offsets(cfg.path('offsets_backup'))
+        print(f'offsets restored: {res}')
+        return 0 if all(v == 'restored' for v in res.values()) else 1
     hw = RealHardware(cfg)
     plots.force_agg()                    # RealHardware imported the node layer, which selects TkAgg
     problems = preflight(cfg, hw)
@@ -778,6 +899,9 @@ def main(argv=None) -> int:
         print(line, flush=True)
         logf.write(line + '\n')
     log(f'{name}: {rounds} round(s) x {dur:.0f} s, pixels {pixels}, raw -> {cfg.root}' + (f', mirror {cfg.mirror}' if cfg.mirror else ''))
+    rates = cfg.rate_mcps or intensity_rates_mcps(pixels)
+    log(f'raw per round ~{cfg.per_round_bytes / GB:.0f} GB' + (f' (mask rate {rates[0]:.1f} / {rates[1]:.1f} Mcps, {"--rate-mcps" if cfg.rate_mcps else "latest intensity scan"})'
+                                                               if rates else ' (no rate known: 6 Mcps per pixel assumed)'))
     hw.log = log
     try:
         out = run_campaign(cfg, hw, log)

@@ -135,13 +135,15 @@ def stacked_figure(pixels, hists: dict, bw: float, out_png: str, title: str, mu_
     plt.close(fig)
 
 
-def zoom_figure(hists: dict, bw: float, out_dir: str, suffix: str) -> str:
-    """The 19-10-26 peak-zoom figure of the coadd: tallest bin, mean +-1 sigma, fixed-sigma Gaussian."""
+def zoom_figure(hists: dict, bw: float, out_dir: str, suffix: str, peak_window_ps: tuple | None = None) -> str:
+    """The 19-10-26 peak-zoom figure of the coadd: tallest bin (inside peak_window_ps when given -- the same window the analysis
+    searches, so the figure marks the analysed peak and not a taller noise bin elsewhere), mean +-1 sigma, fixed-sigma Gaussian."""
     force_agg()
     os.makedirs(out_dir, exist_ok=True)
     tau = off.tau_axis(bw)
     H = sum(h.astype(np.int64) for h in hists.values())
-    return pgr.plot_histogram_zoom(tau.astype(float), H, 'coadd', f'{len(hists)}pairs', suffix, float(bw), out_dir, 2.0, fit_gaussian=True)
+    return pgr.plot_histogram_zoom(tau.astype(float), H, 'coadd', f'{len(hists)}pairs', suffix, float(bw), out_dir, 2.0, fit_gaussian=True,
+                                   search_window_ps=peak_window_ps)
 
 
 def _grid(n: int, ncols: int = 5) -> tuple:
@@ -192,6 +194,35 @@ def stacked_panel(ax, pixels, hists: dict, bw: float, mu_c: float, label: str, h
     return dict(fits=fits, p2v_ps=p2v)
 
 
+STACK_MAX_PIXELS = 10            # more pixels than this: the image panel (one row per pixel) instead of the stacked traces
+
+
+def image_panel(ax, pixels, hists: dict, bw: float, mu_c: float, label: str, half_ns: float = 2.3, vmax_pct: float | None = None) -> dict:
+    """One round's per-pixel peaks as an image: one row per pixel (top = first), tau along x, colour = % over the pixel's baseline, the
+    common centroid dashed. Readable at any pixel count (the stacked traces are for <= STACK_MAX_PIXELS). The label carries the centroid
+    peak-to-valley over the pixels, from the same fixed-sigma fits as the stacked panel."""
+    tau = off.tau_axis(bw)
+    far = np.abs(tau) > 50_000
+    lo, hi = mu_c / 1e3 - half_ns, mu_c / 1e3 + half_ns
+    m = (tau > lo * 1e3) & (tau < hi * 1e3)
+    img = np.array([100 * (hists[p][m] / float(hists[p][far].mean()) - 1) for p in pixels])
+    fits = [off.fit_gauss(tau, hists[p], mu_c, sigma=off.SIGMA_PS) for p in pixels]
+    mus = np.array([f['mu'] for f in fits if np.isfinite(f['mu_err'])])
+    p2v = float(mus.max() - mus.min()) if len(mus) > 1 else float('nan')
+    v = vmax_pct or float(np.clip(3 * np.nanstd(img), 0.5, 5.0))
+    ax.imshow(img, aspect='auto', cmap='RdBu_r', vmin=-v, vmax=v, extent=[tau[m][0] / 1e3, (tau[m][-1] + bw) / 1e3, len(pixels) - 0.5, -0.5], interpolation='nearest')
+    ax.axvline(mu_c / 1e3, color='green', ls='--', lw=1)
+    step = max(1, len(pixels) // 8)
+    ticks = list(range(0, len(pixels), step))
+    ax.set_yticks(ticks, [str(pixels[i]) for i in ticks], fontsize=7)
+    for lab, i in zip(ax.get_yticklabels(), ticks):
+        lab.set_color(COL[chip_map.chip_of_loc(pixels[i])])
+    ax.text(0.02, 0.98, f'{label}\ncentroid p2v {p2v:.0f} ps\ncolour ±{v:.1f} %', transform=ax.transAxes, fontsize=8, va='top', ha='left',
+            bbox=dict(boxstyle='round,pad=0.25', facecolor='white', edgecolor='none', alpha=.8))
+    ax.tick_params(labelsize=8)
+    return dict(fits=fits, p2v_ps=p2v, vmax_pct=v)
+
+
 def zoom_panel(ax, hists: dict, bw: float, label: str, peak_window_ps: tuple | None = None, half_ns: float = 2.0) -> dict:
     """One round's coadd peak zoom into `ax`, in % over the histogram mean (so rounds share a y axis): the 100 ps step histogram
     +-half_ns around the tallest bin, mean and +-1 sigma lines, the fixed-sigma Gaussian in red, the tallest bin marked, and one line
@@ -220,10 +251,48 @@ def zoom_panel(ax, hists: dict, bw: float, label: str, peak_window_ps: tuple | N
     return dict(peak=pk, fit=fit)
 
 
-def rounds_figures(rounds: dict, pixels, out_dir: str, name: str, peak_window_ps: tuple | None = None, ncols: int = 5) -> list:
-    """The campaign's per-round figures as two grids, one panel per round (<= ncols per row): rounds_stacked_20ps.png (per-pixel peaks,
-    centroid p2v in each panel) and rounds_zoom_100ps.png (coadd peak zoom, shared y in % over the mean). Bin width falls back to the
-    other one if a round lacks it. rounds = {round_no: (res, meta)}."""
+def hist_panel(ax, hists: dict, bw: float, label: str, peak_window_ps: tuple | None = None) -> dict:
+    """One round's coadd over the whole tau range, in % over the mean, the tallest bin (inside the search window) marked."""
+    tau = off.tau_axis(bw)
+    H = sum(h.astype(np.int64) for h in hists.values())
+    pk = off.find_peak(tau, H, peak_window_ps)
+    ex = 100 * (H / pk['mean'] - 1)
+    ax.plot(tau / 1e3, ex, color='steelblue', lw=.5)
+    ax.axhline(0, color='k', lw=.6)
+    ax.plot(pk['tau_ps'] / 1e3, ex[pk['index']], 'x', color='red', ms=8, mew=1.6)
+    ax.text(0.02, 0.98, f'{label}\ntallest {pk["tau_ps"] / 1e3:.1f} ns, {pk["sigma"]:.1f} σ', transform=ax.transAxes, fontsize=8, va='top', ha='left',
+            bbox=dict(boxstyle='round,pad=0.25', facecolor='white', edgecolor='none', alpha=.8))
+    ax.set_xlim(tau[0] / 1e3, (tau[-1] + bw) / 1e3)
+    ax.tick_params(labelsize=8)
+    return dict(peak=pk)
+
+def coadd_figure(hists: dict, bw: float, out_png: str, title: str, peak_window_ps: tuple | None = None, half_ns: float = 2.0) -> dict:
+    """The campaign's coadded histogram (every pixel's aligned sum over the rounds) as two panels: the whole tau range on the left
+    (hist_panel) and the peak +-half_ns on the right (zoom_panel, with the fixed-sigma Gaussian and the tau / SNR / height numbers)."""
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(13, 4.2), gridspec_kw=dict(width_ratios=(1.6, 1)))
+    k = off.bw_key(bw)
+    r1 = hist_panel(a1, hists, bw, f'coadd, {len(hists)} pixels', peak_window_ps)
+    r2 = zoom_panel(a2, hists, bw, 'coadd', peak_window_ps, half_ns=half_ns)
+    a1.set_xlabel('τ (ns)'); a2.set_xlabel('τ (ns)')
+    a1.set_ylabel('% over the mean'); a2.set_ylabel('% over the mean')
+    a1.set_title(f'full range, {k} ps bins', fontsize=9); a2.set_title(f'peak ±{half_ns:g} ns', fontsize=9)
+    fig.suptitle(title, fontsize=10)
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=130)
+    plt.close(fig)
+    return dict(peak=r1['peak'], fit=r2['fit'])
+
+
+ALL_FIGURES = ('alignment', 'trend', 'coadd', 'stacked', 'zoom', 'hist', 'poc', 'peak')      # poc / peak: one figure per round (round_single_figures), the rest campaign-wide; coadd is always made
+ROUND_FIGURES = ('poc', 'peak')
+DEFAULT_FIGURES = ('alignment', 'trend', 'coadd', 'stacked', 'zoom')
+
+
+def rounds_figures(rounds: dict, pixels, out_dir: str, name: str, peak_window_ps: tuple | None = None, ncols: int = 5, figures=DEFAULT_FIGURES) -> list:
+    """The campaign's per-round figures as grids, one panel per round (<= ncols per row): rounds_stacked_100ps.png (per-pixel peaks with the
+    centroid p2v in each panel; an image when there are more than STACK_MAX_PIXELS), rounds_zoom_100ps.png (coadd peak zoom, shared y in %
+    over the mean) and rounds_hist_100ps.png (the coadd over the whole tau range), whichever of 'stacked', 'zoom', 'hist' are in `figures`.
+    Bin width falls back to 20 ps if a round lacks 100. rounds = {round_no: (res, meta)}."""
     force_agg()
     os.makedirs(out_dir, exist_ok=True)
     items = sorted(rounds.items())
@@ -232,34 +301,61 @@ def rounds_figures(rounds: dict, pixels, out_dir: str, name: str, peak_window_ps
     files = []
     bws = set.intersection(*(set(meta['bws']) for _, (_, meta) in items))
     bw_s = bw_z = 100.0 if 100 in bws else 20.0        # 100 ps for both: 20 ps bins constrain a centroid only ~5 % better (22-10-26, 200 fits)
-    fig, axes = plt.subplots(nrows, ncols, figsize=(3.3 * ncols, (0.9 + 1.05 * len(pixels)) * nrows), squeeze=False, sharey=True)
+    if 'hist' in figures:
+        fig, axes = plt.subplots(nrows, ncols, figsize=(3.3 * ncols, 2.7 * nrows), squeeze=False, sharey=True)
+        for k, (r, (res, meta)) in enumerate(items):
+            ax = axes[k // ncols][k % ncols]
+            hist_panel(ax, off.totals(res, pixels, bw_z), bw_z, f'round {r}', peak_window_ps)
+            if k % ncols == 0:
+                ax.set_ylabel('% over mean', fontsize=8)
+        for k in range(n, nrows * ncols):
+            axes[k // ncols][k % ncols].set_axis_off()
+        fig.supxlabel('τ (ns)', fontsize=9)
+        fig.suptitle(f'{name}: coadd over the pixels per round, whole ±{off.TMAX_PS / 1e3:.0f} ns range, {off.bw_key(bw_z)} ps bins; x = tallest bin in the search window', fontsize=9)
+        fig.subplots_adjust(left=.05, right=.99, top=.9, bottom=.15, wspace=.04, hspace=.2)
+        f = os.path.join(out_dir, f'rounds_hist_{off.bw_key(bw_z)}ps.png')
+        fig.savefig(f, dpi=130)
+        plt.close(fig)
+        files.append(f)
+    if 'zoom' in figures:
+        fig, axes = plt.subplots(nrows, ncols, figsize=(3.3 * ncols, 2.7 * nrows), squeeze=False, sharey=True)
+        for k, (r, (res, meta)) in enumerate(items):
+            ax = axes[k // ncols][k % ncols]
+            zoom_panel(ax, off.totals(res, pixels, bw_z), bw_z, f'round {r}', peak_window_ps)
+            if k % ncols == 0:
+                ax.set_ylabel('% over mean', fontsize=8)
+        for k in range(n, nrows * ncols):
+            axes[k // ncols][k % ncols].set_axis_off()
+        fig.supxlabel('τ (ns)', fontsize=9)
+        fig.suptitle(f'{name}: coadd over the pixels per round, {off.bw_key(bw_z)} ps bins; dashed = ±1σ of the histogram, red = Gaussian σ fixed {off.SIGMA_PS} ps, x = tallest bin', fontsize=9)
+        fig.subplots_adjust(left=.05, right=.99, top=.9, bottom=.15, wspace=.04, hspace=.2)
+        f = os.path.join(out_dir, f'rounds_zoom_{off.bw_key(bw_z)}ps.png')
+        fig.savefig(f, dpi=130)
+        plt.close(fig)
+        files.append(f)
+    if 'stacked' not in figures:
+        return files
+    stacked = len(pixels) <= STACK_MAX_PIXELS
+    h_panel = (0.9 + 1.05 * len(pixels)) if stacked else max(3.0, 0.12 * len(pixels) + 1.0)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(3.3 * ncols, h_panel * nrows), squeeze=False, sharey=stacked)
     for k, (r, (res, meta)) in enumerate(items):
         ax = axes[k // ncols][k % ncols]
         hs = off.totals(res, pixels, bw_s)
         mu_c = off.analyze_hists(pixels, hs, bw_s, peak_window_ps)['fit_fixed']['mu']
-        stacked_panel(ax, pixels, hs, bw_s, mu_c, f'round {r}')
+        if stacked:
+            stacked_panel(ax, pixels, hs, bw_s, mu_c, f'round {r}')
+        else:
+            image_panel(ax, pixels, hs, bw_s, mu_c, f'round {r}')
+            if k % ncols:
+                ax.set_yticklabels([])
     for k in range(n, nrows * ncols):
         axes[k // ncols][k % ncols].set_axis_off()
     fig.supxlabel('τ (ns)', fontsize=9)
     fig.suptitle(f'{name}: per-pixel peaks per round, {off.bw_key(bw_s)} ps bins' + (' (shown as 3-bin rebins)' if bw_s <= 25 else '')
-                 + f', % over each pixel\'s baseline; black = Gaussian σ fixed {off.SIGMA_PS} ps, dashed = the round\'s common centroid', fontsize=9)
-    fig.subplots_adjust(left=.01, right=.99, top=.95, bottom=.08, wspace=.03, hspace=.12)
+                 + (f', % over each pixel\'s baseline; black = Gaussian σ fixed {off.SIGMA_PS} ps, dashed = the round\'s common centroid' if stacked
+                    else f'; one row per pixel, colour = % over the pixel\'s baseline, dashed = the round\'s common centroid'), fontsize=9)
+    fig.subplots_adjust(left=(.01 if stacked else .06), right=.99, top=.95 if stacked else .9, bottom=.08 if stacked else .12, wspace=.03, hspace=.12 if stacked else .2)
     f = os.path.join(out_dir, f'rounds_stacked_{off.bw_key(bw_s)}ps.png')
-    fig.savefig(f, dpi=130)
-    plt.close(fig)
-    files.append(f)
-    fig, axes = plt.subplots(nrows, ncols, figsize=(3.3 * ncols, 2.7 * nrows), squeeze=False, sharey=True)
-    for k, (r, (res, meta)) in enumerate(items):
-        ax = axes[k // ncols][k % ncols]
-        zoom_panel(ax, off.totals(res, pixels, bw_z), bw_z, f'round {r}', peak_window_ps)
-        if k % ncols == 0:
-            ax.set_ylabel('% over mean', fontsize=8)
-    for k in range(n, nrows * ncols):
-        axes[k // ncols][k % ncols].set_axis_off()
-    fig.supxlabel('τ (ns)', fontsize=9)
-    fig.suptitle(f'{name}: coadd over the pixels per round, {off.bw_key(bw_z)} ps bins; dashed = ±1σ of the histogram, red = Gaussian σ fixed {off.SIGMA_PS} ps, x = tallest bin', fontsize=9)
-    fig.subplots_adjust(left=.05, right=.99, top=.9, bottom=.15, wspace=.04, hspace=.2)
-    f = os.path.join(out_dir, f'rounds_zoom_{off.bw_key(bw_z)}ps.png')
     fig.savefig(f, dpi=130)
     plt.close(fig)
     files.append(f)
@@ -290,6 +386,75 @@ def round_figures(round_dir: str, out_dir: str, tag: str) -> list:
     for stale in os.listdir(out_dir):
         if stale.endswith('.png') and os.path.join(out_dir, stale) not in files:
             os.remove(os.path.join(out_dir, stale))
+    return files
+
+
+def poc_figure(pixels, hists: dict, bw: float, out_png: str, title: str, peak_window_ps: tuple | None = None, ncols: int = 5) -> dict:
+    """The 21-10-26 'poc' figure of one round: left, every pixel's own g2 over the whole tau range (counts over the pair's mean, one small
+    panel per pixel, shared y), right, the coadd over the pixels with the tallest bin (inside the search window) marked and its numbers
+    (tau, counts, excess over the mean, SNR, mean +- sd). Returns the coadd's find_peak result."""
+    force_agg()
+    tau = off.tau_axis(bw) / 1e3
+    pixels = list(pixels)
+    n = len(pixels)
+    nrows, ncols = _grid(n, ncols)
+    g = {p: hists[p] / max(float(np.mean(hists[p])), 1.0) for p in pixels}
+    lo, hi = min(float(v.min()) for v in g.values()), max(float(v.max()) for v in g.values())
+    H = sum(h.astype(np.int64) for h in hists.values())
+    pk = off.find_peak(off.tau_axis(bw), H, peak_window_ps)
+    G = H / pk['mean']
+    fig = plt.figure(figsize=(22.0, 1.0 + 1.75 * nrows + 0.5))
+    gs = fig.add_gridspec(1, 2, width_ratios=[1.0, 1.25], wspace=0.06, left=0.012, right=0.93, top=0.98, bottom=0.09)
+    left = gs[0].subgridspec(nrows, ncols, wspace=0.0, hspace=0.0)
+    for k, p in enumerate(pixels):
+        ax = fig.add_subplot(left[k // ncols, k % ncols])
+        ax.plot(tau, g[p], color='#3b6ea5', lw=0.4)
+        ax.set_ylim(lo, hi)
+        ax.set_xlim(tau[0], tau[-1])
+        ax.set_xticks([]); ax.set_yticks([])
+        ax.text(0.03, 0.96, f'px {p}', transform=ax.transAxes, fontsize=9, va='top', ha='left')
+    for k in range(n, nrows * ncols):
+        fig.add_subplot(left[k // ncols, k % ncols]).set_axis_off()
+    ax = fig.add_subplot(gs[1])
+    ax.plot(tau, G, color='#3b6ea5', lw=0.6)
+    ax.plot(pk['tau_ps'] / 1e3, G[pk['index']], 'x', color='red', ms=12, mew=2.5)
+    ax.yaxis.tick_right(); ax.yaxis.set_label_position('right')
+    ax.set_ylabel(f'g² (coadd of {n} pairs)')
+    ax.set_xlabel('τ (ns)')
+    ax.set_xlim(tau[0], tau[-1])
+    ax.grid(alpha=0.3)
+    ax.text(0.97, 0.97, f'{n} channels coadded', transform=ax.transAxes, fontsize=14, fontweight='bold', va='top', ha='right')
+    ax.annotate(f'peak τ = {pk["tau_ps"] / 1e3:.1f} ns\ncounts = {pk["height"]:.1e}\nexcess = {100 * (pk["height"] / pk["mean"] - 1):.3f}% of mean\n'
+                f'SNR = {pk["sigma"]:.2f}\nmean = {pk["mean"]:.1e} ± {pk["sd"]:.1e}',
+                xy=(pk['tau_ps'] / 1e3, G[pk['index']]), xycoords='data', xytext=(0.78, 0.86), textcoords='axes fraction', fontsize=9, va='top', ha='left',
+                bbox=dict(boxstyle='round', facecolor='white', edgecolor='red'), arrowprops=dict(arrowstyle='->', color='red'))
+    fig.text(0.012, 0.02, f'{title}.  Small panels: x: τ (ns), {tau[0]:.0f} to +{tau[-1]:.0f} ns ({off.bw_key(bw)} ps bins);  y: g² (counts / pair mean), {lo:.4f} to {hi:.4f}',
+             fontsize=9, va='bottom', ha='left')
+    os.makedirs(os.path.dirname(out_png) or '.', exist_ok=True)
+    fig.savefig(out_png, dpi=100)
+    plt.close(fig)
+    return pk
+
+
+def round_single_figures(round_dir: str, out_dir: str, tag: str, peak_window_ps: tuple | None = None, bw: float = 100.0, figures=ROUND_FIGURES) -> list:
+    """The figures of ONE round for a campaign (the 21-10-26 mask20 set), at fixed names in out_dir: poc_{bw}ps.png ('poc', poc_figure) and
+    peak_zoom_{bw}ps.png ('peak', the 19-10-26 coadd zoom with the fixed-sigma Gaussian). Made once per round by record.py (into
+    rounds/rNN/figs/, mirrored to <mirror>/<name>/rNN/) when 'poc' / 'peak' are among the campaign's figures."""
+    res, meta = off.load_round(round_dir)
+    pixels = meta['pixels']
+    k = off.bw_key(bw)
+    if k not in meta['bws']:
+        bw, k = 100.0, 100
+    hs = off.totals(res, pixels, bw)
+    os.makedirs(out_dir, exist_ok=True)
+    files = []
+    if 'poc' in figures:
+        files.append(os.path.join(out_dir, f'poc_{k}ps.png'))
+        poc_figure(pixels, hs, bw, files[-1], tag, peak_window_ps)
+    if 'peak' in figures:
+        z = zoom_figure(hs, bw, out_dir, f'{tag}_{k}ps', peak_window_ps)
+        files.append(os.path.join(out_dir, f'peak_zoom_{k}ps.png'))
+        os.replace(z, files[-1])
     return files
 
 
@@ -332,7 +497,7 @@ def alignment_figure(pixels, series: list, bw: float, out_png: str, title: str) 
     n, m = len(pixels), len(series)
     chips = [chip_map.chip_of_loc(p) for p in pixels]
     cols = _round_colors(m)
-    fig, ax = plt.subplots(figsize=(max(7.0, 1.6 * n + 3.0), 5.0))
+    fig, ax = plt.subplots(figsize=(max(7.0, min(1.6, 20.0 / n) * n + 3.0), 5.0))      # 1.6 in per pixel up to ~12 pixels, then a 23 in wide axis
     dodge = np.linspace(-0.3, 0.3, m) if m > 1 else np.array([0.0])
     allv, alle = [], []
     for j, s in enumerate(series):
@@ -346,7 +511,7 @@ def alignment_figure(pixels, series: list, bw: float, out_png: str, title: str) 
     ax.axhline(0, color='green', lw=1)
     for i in range(1, n):
         ax.axvline(i - 0.5, color='gray', lw=.4, alpha=.6)
-    ax.set_xticks(np.arange(n), [f'{p}{chr(10)}{c}' for p, c in zip(pixels, chips)])
+    ax.set_xticks(np.arange(n), [f'{p}{chr(10)}{c}' if n <= 20 else f'{p}{chr(10)}{c[0]}' for p, c in zip(pixels, chips)], fontsize=10 if n <= 20 else 7)
     for lab, c in zip(ax.get_xticklabels(), chips):
         lab.set_color(COL[c])
     ax.set_xlim(-0.5, n - 0.5)
@@ -392,22 +557,34 @@ def trend_figure(series: list, bw: float, out_png: str, title: str, combined: di
     plt.close(fig)
 
 
-def campaign_figures(name: str, pixels, rounds: dict, comb: dict, figs: str, bw: float = 20.0, prior_window_ps: tuple | None = None) -> tuple:
-    """The two campaign figures at `bw` (20 ps; 100 ps when a round has no 20 ps histograms) into `figs`: returns (files, series)."""
+def campaign_figures(name: str, pixels, rounds: dict, comb: dict, figs: str, bw: float = 20.0, prior_window_ps: tuple | None = None, figures=DEFAULT_FIGURES) -> tuple:
+    """The campaign figures ('alignment', 'trend', 'coadd' of `figures`) at `bw` (20 ps; 100 ps when a round has no 20 ps histograms) into `figs`:
+    returns (files, series)."""
     if any(off.bw_key(bw) not in meta['bws'] for _, meta in rounds.values()):
         bw = 100.0
     k = off.bw_key(bw)
     series = round_series(rounds, pixels, bw, prior_window_ps)
     tag = f'{name}: {len(series)} round(s), pixels {list(pixels)}'
-    files = [os.path.join(figs, f'centroid_alignment_{k}ps.png'), os.path.join(figs, f'round_trend_{k}ps.png')]
-    alignment_figure(pixels, series, bw, files[0], tag)
-    trend_figure(series, bw, files[1], tag, comb['analysis'].get(str(k)))
+    files = []
+    if 'alignment' in figures:
+        files.append(os.path.join(figs, f'centroid_alignment_{k}ps.png'))
+        alignment_figure(pixels, series, bw, files[-1], tag)
+    if 'trend' in figures:
+        files.append(os.path.join(figs, f'round_trend_{k}ps.png'))
+        trend_figure(series, bw, files[-1], tag, comb['analysis'].get(str(k)))
+    if k in comb['hists']:                      # the campaign coadd is always made (26-10-26): it is the headline figure, whatever --figures says
+        files.append(os.path.join(figs, f'coadd_{k}ps.png'))
+        px = list(pixels)
+        span = f'{px[0]}-{px[-1]}' if px == list(range(px[0], px[-1] + 1)) else ', '.join(map(str, px))
+        coadd_figure(comb['hists'][k], bw, files[-1], f'{name}: campaign coadd over {len(series)} round(s), {len(px)} pixels ({span})', prior_window_ps)
     return files, series
 
 
-def combine_campaign(campaign_dir: str, figs_dir: str | None = None, log=print, prior_window_ps: tuple | None = None, round_grids: bool = True) -> dict | None:
+def combine_campaign(campaign_dir: str, figs_dir: str | None = None, log=print, prior_window_ps: tuple | None = None, round_grids: bool = True,
+                     figures=DEFAULT_FIGURES, bw: float = 20.0) -> dict | None:
     """Combine every analysed round under campaign_dir/rounds/rNN and write the campaign's results into campaign_dir/combined/: the
-    combined files, the two campaign figures and (round_grids) the two per-round grids, all in combined/figs/."""
+    combined files and the figures named in `figures` (ALL_FIGURES; round_grids=False drops the per-round ones), all in combined/figs/.
+    The bin widths combined are those every round has; `bw` is the campaign figures' bin width (20 ps, or 100 when a round lacks 20)."""
     rd = os.path.join(campaign_dir, 'rounds')
     rounds = {}
     for name in sorted(os.listdir(rd)) if os.path.isdir(rd) else []:
@@ -420,11 +597,13 @@ def combine_campaign(campaign_dir: str, figs_dir: str | None = None, log=print, 
     out_dir = os.path.join(campaign_dir, 'combined')
     figs = figs_dir or os.path.join(out_dir, 'figs')
     os.makedirs(figs, exist_ok=True)
-    comb = off.combine(rounds, pixels, prior_window_ps=prior_window_ps)
+    bws = sorted(set.intersection(*(set(meta['bws']) for _, meta in rounds.values())), reverse=True)
+    comb = off.combine(rounds, pixels, bws=tuple(float(b) for b in bws), prior_window_ps=prior_window_ps)
     name = os.path.basename(os.path.normpath(campaign_dir))
-    files, series = campaign_figures(name, pixels, rounds, comb, figs, prior_window_ps=prior_window_ps)
+    figures = tuple(figures)
+    files, series = campaign_figures(name, pixels, rounds, comb, figs, bw=bw, prior_window_ps=prior_window_ps, figures=figures)
     if round_grids:
-        files += rounds_figures(rounds, pixels, figs, name, prior_window_ps)
+        files += rounds_figures(rounds, pixels, figs, name, prior_window_ps, figures=figures)
     for stale in os.listdir(figs):                                                   # figures of earlier layouts (the combined zoom / stacked set)
         if stale.endswith('.png') and os.path.join(figs, stale) not in files:
             os.remove(os.path.join(figs, stale))

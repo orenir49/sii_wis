@@ -13,8 +13,10 @@ level(t) = master_dwell - slave_dwell (dwell_offset.DwellOffsetTracker, ~1 ns, ~
 master chip is on its +100 ns tick state).  The master pixel's stamps are put on the slave clock
 first: t_master - level(t_master).
 
-The peak is ~350 ps wide, flat-topped / double-humped on every pair, so its position is the
-centroid of the whole feature (locate_peak), not the tallest bin.
+The peak is ~350 ps wide and double-humped on every pair (the two directions of the cross-talk);
+its position is the MIDPOINT of the two humps (locate_midpoint, default since 22-10-26: the humps'
+weights follow the count rate, so the weighted centroid is rate-dependent), --centroid for the old
+centroid of the whole feature.
 
 Chaining the peaks gives every pixel's offset relative to pixel --ref (160).  The file written,
 calibration\pixel_offsets_ps_node{N}.txt (tracked in git, rename to
@@ -90,6 +92,48 @@ def locate_peak(tau, h, bw, half_ps=400):
         w = (h[m] - base).clip(min=0)
         c = float((tau[m] * w).sum() / w.sum()) if w.sum() > 0 else c
     return float(tau[i]), c, base, float(h[i])
+
+
+MIN_HUMP_SEP_PS = 60.0           # two humps closer than this, or one lighter than MIN_HUMP_WEIGHT of the pair, are not resolved: centroid instead
+MIN_HUMP_WEIGHT = 0.15
+
+
+def locate_midpoint(tau, h, bw):
+    """Position of a cross-talk peak as the MIDPOINT of its two humps -- the default since 22-10-26. The peak is two humps ~190 ps (node 1)
+    / ~235 ps (node 2) apart, the two directions of the cross-talk, whose relative weight follows the count rate (left hump 0.43 of the pair
+    at 0.5 Mcps per pixel, 0.48 / 0.54 at 2 Mcps), so the weighted centroid of one link moves by 9 / 30 ps between those rates and the chain
+    turns that into a ramp along the array (+-270 ps over 20 pixels); the midpoint moved by 1 +- 10 ps on the same links. Two Gaussians of
+    one width are fitted around the centroid; when they are not resolved the centroid is used. Returns dict(pos_ps, centroid_ps, midpoint_ps,
+    sep_ps, left_weight, method, baseline, peak_counts, tallest_ps)."""
+    from scipy.optimize import curve_fit
+    arg, cen, base, pk = locate_peak(tau, h, bw)
+    out = dict(pos_ps=cen, centroid_ps=cen, midpoint_ps=float('nan'), sep_ps=float('nan'), left_weight=float('nan'), method='centroid',
+               baseline=base, peak_counts=pk, tallest_ps=arg)
+    m = np.abs(tau - cen) < 600
+    x, y = tau[m], h[m] - base
+    if len(x) < 10 or y.max() <= 0:
+        return out
+    f = lambda t, a1, m1, a2, m2, s: a1 * np.exp(-(t - m1)**2 / (2 * s * s)) + a2 * np.exp(-(t - m2)**2 / (2 * s * s))
+    try:
+        p, _ = curve_fit(f, x, y, p0=[y.max(), cen - 80, y.max(), cen + 80, 70], bounds=([0, cen - 400, 0, cen - 400, 30], [np.inf, cen + 400, np.inf, cen + 400, 200]))
+    except (RuntimeError, ValueError):
+        return out
+    (a1, m1), (a2, m2) = sorted([(p[0], p[1]), (p[2], p[3])], key=lambda t: t[1])
+    sep, wl = m2 - m1, a1 / (a1 + a2) if a1 + a2 > 0 else float('nan')
+    out.update(midpoint_ps=(m1 + m2) / 2, sep_ps=sep, left_weight=wl)
+    if sep >= MIN_HUMP_SEP_PS and MIN_HUMP_WEIGHT <= wl <= 1 - MIN_HUMP_WEIGHT:
+        out.update(pos_ps=(m1 + m2) / 2, method='midpoint')
+    return out
+
+
+def locate(tau, h, bw, centroid=False):
+    """(tallest-bin tau, position, baseline, tallest count, info): the midpoint by default, the plain centroid with centroid=True."""
+    if centroid:
+        arg, cen, base, pk = locate_peak(tau, h, bw)
+        return arg, cen, base, pk, dict(method='centroid', centroid_ps=cen, midpoint_ps=float('nan'), hump_sep_ps=float('nan'), left_weight=float('nan'))
+    loc = locate_midpoint(tau, h, bw)
+    return loc['tallest_ps'], loc['pos_ps'], loc['baseline'], loc['peak_counts'], dict(method=loc['method'], centroid_ps=loc['centroid_ps'],
+                                                                                     midpoint_ps=loc['midpoint_ps'], hump_sep_ps=loc['sep_ps'], left_weight=loc['left_weight'])
 
 
 def chain(rows):
@@ -203,6 +247,7 @@ def main():
     ap.add_argument('--out', default=None)
     ap.add_argument('--refit', action='store_true', help='re-locate peaks in the stored histograms (no recompute of g2)')
     ap.add_argument('--force', action='store_true', help='recompute parts that already have stored histograms')
+    ap.add_argument('--centroid', action='store_true', help='locate each peak by its weighted centroid (the pre-22-10-26 method) instead of the two-hump midpoint')
     a = ap.parse_args()
     d = os.path.join(ROOT, 'spad_data', 'crosstalk_align', f'node{a.node}')
     out = a.out or os.path.join(d, 'analysis')
@@ -232,8 +277,8 @@ def main():
             if key in stored:
                 r = stored[key]
                 if a.refit:
-                    r['peak_bin_ps'], r['peak_ps'], r['baseline'], r['peak_counts'] = locate_peak(
-                        tau, ph[key].astype(float), a.bw)
+                    r['peak_bin_ps'], r['peak_ps'], r['baseline'], r['peak_counts'], info = locate(tau, ph[key].astype(float), a.bw, a.centroid)
+                    r.update(info)
                 r['gap'] = q - p
                 pr.append(r)
                 continue
@@ -255,12 +300,12 @@ def main():
                 ta.sort()
                 tb.sort()      # a level step can reorder a few stamps
             h = _hist(ta, tb, a.tmax, a.bw, nb)
-            arg, cen, base, pk = locate_peak(tau, h, a.bw)
+            arg, cen, base, pk, info = locate(tau, h.astype(float), a.bw, a.centroid)
             r = dict(part=k, a=p, b=q, gap=q - p, chip_a=ca, chip_b=cb, dwell_level_ns=lvl_applied,
-                     n_a=len(ta), n_b=len(tb), peak_bin_ps=arg, peak_ps=cen, baseline=base, peak_counts=pk)
+                     n_a=len(ta), n_b=len(tb), peak_bin_ps=arg, peak_ps=cen, baseline=base, peak_counts=pk, **info)
             pr.append(r)
             ph[key] = h
-            print(f'  {p}->{q} {ca[0]}{cb[0]}: peak {cen:+8.1f} ps (bin {arg:+.1f})  counts {pk:.0f} vs median {base:.0f}',
+            print(f'  {p}->{q} {ca[0]}{cb[0]}: peak {cen:+8.1f} ps ({info["method"]}; bin {arg:+.1f})  counts {pk:.0f} vs median {base:.0f}',
                   flush=True)
         rows += pr
         json.dump(pr, open(pj, 'w'), indent=1)

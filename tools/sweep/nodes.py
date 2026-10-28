@@ -25,7 +25,7 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, 'tools'))
 
 import ssh_launcher as sl
-from master_backend import start_server, run_session_loop
+from master_backend import start_server, run_session_loop, run_intensity_session
 from marker_source import load_markers
 from master import merge_hooks
 from correlate_engine import ChannelGraph
@@ -81,6 +81,7 @@ class NodeLink:
         self.session_log: list = []
         self.last_stats = None
         self.sessions_done = 0
+        self.intensity_mode = False   # the next data connection carries one classical intensity measurement (start_intensity), not stamps
 
     def connect(self, retries: int = 10, retry_delay_s: float = 2.0):
         """First-time setup: local data server + its accept loop (these
@@ -184,8 +185,11 @@ class NodeLink:
                 {320: self.master_dwell_q, 323: self.dwell_q},
             )
             try:
-                run_session_loop(conn, log_fn=(self.session_log.append if self.write_raw else (lambda m: None)),
-                                  pixel_hooks=hooks, write_hooked=self.write_raw)
+                if self.intensity_mode:
+                    run_intensity_session(conn, filename=f'node{self.node_id}.txt', log_fn=self.session_log.append)
+                else:
+                    run_session_loop(conn, log_fn=(self.session_log.append if self.write_raw else (lambda m: None)),
+                                     pixel_hooks=hooks, write_hooked=self.write_raw)
             except Exception as exc:
                 print(f'[node{self.node_id}] session loop crashed: {exc!r}')
                 self.session_log.append(f'session loop crashed: {exc!r}')
@@ -204,6 +208,14 @@ class NodeLink:
         self._send({'cmd': 'start', 'recv_host': self.recv_host,
                     'recv_port': self.data_port, 'output_dir': output_dir,
                     'duration': duration_s, 'test': False})
+
+    def start_intensity(self, duration_s: float = 1.0, output_dir: str = './spad_data/intensity'):
+        """One classical intensity measurement (lSPAD `I`, duration_s) written by the receiver as <output_dir>/node{id}.txt, the same
+        file master.py's intensity mode writes. The data connection that follows is handled by run_intensity_session."""
+        self.error = None
+        self.intensity_mode = True
+        self.session_active.set()
+        self._send({'cmd': 'intensity', 'recv_host': self.recv_host, 'recv_port': self.data_port, 'output_dir': output_dir, 'duration': duration_s})
 
     def stop_soft(self):
         self._send({'cmd': 'stop', 'mode': 'soft'})
@@ -277,6 +289,75 @@ def apply_masks(masks, log=print):
                 f'{resp.encode("ascii","replace").decode("ascii")[:80]}')
         finally:
             client.close()
+
+
+def _offsets_remote_path(client) -> str:
+    from node_backend import PIXEL_OFFSET_FILENAME
+    lspad_dir = sl.find_lspad_dir(client)
+    if not lspad_dir:
+        raise RuntimeError('lSPAD.exe not found on the node')
+    return lspad_dir + '\\' + PIXEL_OFFSET_FILENAME
+
+
+def backup_and_zero_offsets(backup_dir: str, log=print) -> dict:
+    """Put an all-zero pixel_offsets_ps.txt on both nodes so the next acquisitions record RAW stamps, after saving each node's current
+    file as <backup_dir>/node{N}_pixel_offsets_ps.txt (a second backup of a different file gets a time stamp rather than overwriting the
+    first; a node whose file is already all zeros is left alone and nothing is written over its backup). Readback-verified. Returns
+    {node: 'zeroed' | 'already zero' | 'no file, zeros written'}. The node reads the file at the start of every acquisition, so no apply step."""
+    os.makedirs(backup_dir, exist_ok=True)
+    zeros = ('0\n' * 320).encode('ascii')
+    out = {}
+    for nid, info in NODES.items():
+        client = sl.ssh_connect(info['host'], info['user'])
+        try:
+            remote = _offsets_remote_path(client)
+            try:
+                current = sl.read_remote_file(client, remote)
+            except (OSError, IOError):
+                current = None
+            if current is not None:
+                vals = [int(x) for x in current.decode('ascii', 'replace').split()]
+                if vals and not any(vals):
+                    out[nid] = 'already zero'
+                    log(f'[node{nid}] {remote} is already all zeros')
+                    continue
+                dst = os.path.join(backup_dir, f'node{nid}_pixel_offsets_ps.txt')
+                if os.path.exists(dst) and open(dst, 'rb').read() != current:
+                    dst = os.path.join(backup_dir, f'node{nid}_pixel_offsets_ps_{time.strftime("%Y%m%d_%H%M%S")}.txt')
+                with open(dst, 'wb') as f:
+                    f.write(current)
+                log(f'[node{nid}] offsets file saved to {dst} ({len(vals)} values, {sum(1 for v in vals if v)} non-zero)')
+            sl.upload_file(client, remote, zeros)
+            if sl.read_remote_file(client, remote) != zeros:
+                raise RuntimeError(f'node{nid}: zero offsets file readback mismatch')
+            out[nid] = 'zeroed' if current is not None else 'no file, zeros written'
+            log(f'[node{nid}] {remote} <- all zeros (raw stamps from the next acquisition on)')
+        finally:
+            client.close()
+    return out
+
+
+def restore_offsets(backup_dir: str, log=print) -> dict:
+    """Push <backup_dir>/node{N}_pixel_offsets_ps.txt back to each node (the counterpart of backup_and_zero_offsets). Readback-verified."""
+    out = {}
+    for nid, info in NODES.items():
+        src = os.path.join(backup_dir, f'node{nid}_pixel_offsets_ps.txt')
+        if not os.path.exists(src):
+            out[nid] = 'no backup'
+            log(f'[node{nid}] no backup at {src}: nothing restored')
+            continue
+        content = open(src, 'rb').read()
+        client = sl.ssh_connect(info['host'], info['user'])
+        try:
+            remote = _offsets_remote_path(client)
+            sl.upload_file(client, remote, content)
+            if sl.read_remote_file(client, remote) != content:
+                raise RuntimeError(f'node{nid}: restored offsets readback mismatch')
+            out[nid] = 'restored'
+            log(f'[node{nid}] {remote} <- {src}')
+        finally:
+            client.close()
+    return out
 
 
 def shutdown_lspad_both(log=print):

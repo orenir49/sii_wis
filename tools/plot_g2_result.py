@@ -102,15 +102,28 @@ def plot_histogram(centers, counts, px1, px2, suffix, bin_width_ps, outdir) -> s
     return out_path
 
 
+def peak_index(centers, counts, search_window_ps=None) -> int:
+    """Index of the tallest bin -- inside [lo, hi] (ps) when a search window is given, else over the whole histogram. A campaign's
+    per-round figures pass its --peak-window so a noise bin far from the peak (3.8 sigma at -103 ns, B=40mm round 8) is never marked."""
+    if search_window_ps is None:
+        return int(np.argmax(counts))
+    lo, hi = search_window_ps
+    m = (centers >= lo) & (centers <= hi)
+    if not m.any():
+        return int(np.argmax(counts))
+    return int(np.argmax(np.where(m, counts, -np.inf)))
+
+
 def plot_histogram_zoom(centers, counts, px1, px2, suffix, bin_width_ps, outdir,
                         half_width_ns, fit_gaussian=False,
-                        fit_sigma_ps=RESOLVE_PEAK_20PS_SIGMA_PS) -> str:
+                        fit_sigma_ps=RESOLVE_PEAK_20PS_SIGMA_PS, search_window_ps=None) -> str:
     """Same peak as plot_histogram, but the x-axis is cropped to +/-half_width_ns
     around it so individual bins are visible instead of being compressed across
-    the full tau window."""
+    the full tau window. search_window_ps=(lo, hi) restricts the tallest-bin search
+    (peak_index); the mean / sigma are still those of the whole histogram."""
     mean = counts.mean()
     std = counts.std()
-    peak_idx = int(np.argmax(counts))
+    peak_idx = peak_index(centers, counts, search_window_ps)
     peak_tau_ps = centers[peak_idx]
     peak_count = counts[peak_idx]
     excess_pct = (peak_count - mean) / mean * 100

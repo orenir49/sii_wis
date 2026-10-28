@@ -1,4 +1,5 @@
-r"""Per-pixel TDC offsets from ONE full-mask capture (e.g. a 30 s mask_sparse run), same method as crosstalk_offsets.py.
+r"""Per-pixel TDC offsets from ONE full-mask capture (e.g. a 30 s mask_sparse run), same method as crosstalk_offsets.py (two-hump midpoint
+per link since 22-10-26; --centroid for the old weighted centroid).
 
 Reads spad_data\node{N}\px_NNN.bin + master/slave_dwell.bin IN PLACE (raw data is never copied), histograms the
 same-node cross-talk spike of every pair of consecutive active pixels of the mask, locates each peak by its centroid,
@@ -20,7 +21,7 @@ sys.path.insert(0, os.path.join(ROOT, 'tools'))
 import chip_map
 from dwell_offset import DwellOffsetTracker
 from marker_source import load_markers
-from crosstalk_offsets import _hist, locate_peak
+from crosstalk_offsets import _hist, locate
 
 MIN_SIGMA = 5.0
 OUT = os.path.join(ROOT, 'spad_data', 'crosstalk_repeat')
@@ -31,7 +32,7 @@ def active_of(mask):
     return sorted(set(range(320)) - off)
 
 
-def process(node, run, mask, ref, tmax, bw, applied=True):
+def process(node, run, mask, ref, tmax, bw, applied=True, centroid=False):
     d = os.path.join(ROOT, 'spad_data', f'node{node}')
     out = os.path.join(OUT, f'run{run}')
     os.makedirs(out, exist_ok=True)
@@ -67,12 +68,12 @@ def process(node, run, mask, ref, tmax, bw, applied=True):
                 tb = np.sort(tb - sh(tb))
             lv = [round(x['level_ns'], 3) for x in s['levels']]
         h = _hist(ta, tb, tmax, bw, nb)
-        arg, cen, base, pk = locate_peak(tau, h, bw)
+        arg, cen, base, pk, info = locate(tau, h.astype(float), bw, centroid)
         rows.append(dict(a=p, b=q, chip_a=ca, chip_b=cb, dwell_level_ns=lv, n_a=len(ta), n_b=len(tb),
                          peak_bin_ps=arg, peak_ps=cen, baseline=base, peak_counts=pk,
-                         sigma=(pk - base) / max(base, 1) ** .5))
+                         sigma=(pk - base) / max(base, 1) ** .5, **info))
         hs[f'{p}_{q}'] = h
-        print(f'  {p}->{q} {ca[0]}{cb[0]}: peak {cen:+8.1f} ps  {rows[-1]["sigma"]:.1f} sigma', flush=True)
+        print(f'  {p}->{q} {ca[0]}{cb[0]}: peak {cen:+8.1f} ps ({info["method"]})  {rows[-1]["sigma"]:.1f} sigma', flush=True)
     np.savez(os.path.join(out, f'node{node}.npz'), tau_ps=tau, **hs)
     # chain; a weak link cuts the chain
     seg, cur = {act[0]: 0}, 0
@@ -131,9 +132,10 @@ if __name__ == '__main__':
     ap.add_argument('--bw', type=int, default=25)
     ap.add_argument('--raw', action='store_true', help='the nodes had NO pixel_offsets_ps.txt applied (default: they did)')
     ap.add_argument('--summary', type=int, nargs='+')
+    ap.add_argument('--centroid', action='store_true', help='weighted centroid of the peak (the pre-22-10-26 method) instead of the two-hump midpoint')
     a = ap.parse_args()
     if a.summary:
         summary(a.summary, a.ref)
     else:
         for n in a.node:
-            process(n, a.run, a.mask, a.ref, a.tmax, a.bw, applied=not a.raw)
+            process(n, a.run, a.mask, a.ref, a.tmax, a.bw, applied=not a.raw, centroid=a.centroid)

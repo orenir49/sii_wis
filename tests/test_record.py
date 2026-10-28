@@ -37,11 +37,23 @@ def quiet(*_a, **_k):
 PIXELS = (158, 159)
 
 
+SKEW = {1: {158: 0, 159: 350}, 2: {158: 200, 159: -400}}      # per-pixel TDC skews of the raw rounds (what the cross-talk step must find)
+
+
 class FakeHardware:
     def __init__(self, cfg, fail_first=0, tau_step=300):
         self.cfg, self.fail_first, self.calls, self.acquisitions, self.aborts = cfg, fail_first, 0, 0, 0
         self.tau_step = tau_step
         self.dead, self.closed = [], False
+        self.zeroed = []
+
+    def zero_offsets(self, backup_dir, log):
+        os.makedirs(backup_dir, exist_ok=True)
+        for n in (1, 2):
+            with open(os.path.join(backup_dir, f'node{n}_pixel_offsets_ps.txt'), 'w') as f:
+                f.write('7\n' * 320)
+        self.zeroed.append(backup_dir)
+        return {1: 'zeroed', 2: 'zeroed'}
 
     def bring_up(self, pixels, log):
         self.calls += 1
@@ -55,8 +67,10 @@ class FakeHardware:
                 for p in range(320):
                     open(os.path.join(self.cfg.data_dir, f'node{n}', f'px_{p:03d}.bin'), 'wb').close()
             return dict(stats={1: {'overflow': 0}, 2: {'overflow': 0}}, logs={}, errors=[], wall_s=1.0)
+        raw = self.cfg.crosstalk_offsets
         syn.make_round(self.cfg.data_dir, PIXELS, duration_s=duration_s, tau_ps=12_000 + self.tau_step * self.acquisitions, node2_jump=(duration_s / 2, 100_000),
-                       glitch=False, seed=self.acquisitions)
+                       glitch=False, seed=self.acquisitions, tdc_skew_ps=SKEW if raw else None, crosstalk_q=0.01 if raw else 0.0,
+                       marker_jitter_ps=60.0 if raw else 300.0)        # a master pixel's offset is only as good as the markers' level (see test_offline_round)
         return dict(stats={1: {'overflow': 0, 'records': 1}, 2: {'overflow': 0, 'records': 1}}, logs={1: ['marker source: dwell'], 2: ['marker source: frame']}, errors=[], wall_s=duration_s + 2)
 
     def abort(self):
@@ -69,11 +83,60 @@ class FakeHardware:
         self.closed = True
 
 
-def make_cfg(tmp, rounds=2, mirror=True, keep_raw='all', duration=6.0):
+def make_cfg(tmp, rounds=2, mirror=True, keep_raw='all', duration=6.0, **kw):
     mir = os.path.join(tmp, 'dropbox') if mirror else None
     return record.Config('test', PIXELS, rounds=rounds, duration_s=duration, root=os.path.join(tmp, 'campaign'), mirror=mir, keep_raw=keep_raw,
                          workers=4, inline_analysis=True, data_dir=os.path.join(tmp, 'receiver'),
-                         hist_dir=os.path.join(tmp, 'g2_histograms', 'test'))
+                         hist_dir=os.path.join(tmp, 'g2_histograms', 'test'), **kw)
+
+
+def test_disk_estimate_uses_the_count_rate():
+    tmp = tempfile.mkdtemp(prefix='rec_')
+    try:
+        cfg = make_cfg(tmp, duration=180.0, rate_mcps=(30.0, 35.0))
+        check('--rate-mcps: one round = 8 B x (30 + 35) Mcps x 180 s x 1.15 = 108 GB, not 17.5 GB per pixel', abs(cfg.per_round_bytes / 1e9 - 107.6) < 0.5, str(cfg.per_round_bytes / 1e9))
+        cfg2 = make_cfg(tmp, duration=180.0)
+        est = cfg2.per_round_bytes / 1e9
+        rates = record.intensity_rates_mcps(cfg2.pixels)
+        want = 8 * sum(rates) * 1e6 * 180 * 1.15 / 1e9 if rates else 17.5 * 2
+        check('without --rate-mcps the latest intensity scan over the pixels is used when there is one, else 17.5 GB per pixel', abs(est - want) < 0.5, f'{est} vs {want} ({rates})')
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_raw_campaign_with_crosstalk_offsets():
+    """--zero-offsets --crosstalk-offsets: the nodes' offset files are backed up and zeroed once before the first acquisition; each round
+    measures its own per-pixel offsets from the cross-talk peaks (offsets_node{1,2}.txt beside result.npz), the correlation applies them,
+    and the record / meta say so."""
+    tmp = tempfile.mkdtemp(prefix='rec_')
+    try:
+        cfg = make_cfg(tmp, rounds=2, mirror=False, keep_raw='none', zero_offsets=True, crosstalk_offsets=True)
+        hw = FakeHardware(cfg)
+        out = record.run_campaign(cfg, hw, log=quiet, heartbeat_s=0.2)
+        check('raw campaign: both rounds completed', out['done'] == [1, 2] and not out['failed'], str(out))
+        check('the offset files were backed up and zeroed exactly once, before the first round', hw.zeroed == [cfg.path('offsets_backup')]
+              and os.path.exists(os.path.join(cfg.path('offsets_backup'), 'node2_pixel_offsets_ps.txt')), str(hw.zeroed))
+        import numpy as _np
+        for i in (1, 2):
+            rd = cfg.round_dir(i)
+            for n in (1, 2):
+                v = _np.loadtxt(os.path.join(rd, f'offsets_node{n}.txt'), dtype=int)
+                j = json.load(open(os.path.join(rd, f'crosstalk_node{n}.json')))
+                want = -(SKEW[n][158] - SKEW[n][159])                      # ref = 159 (nearest active to 160): slave 158's entry = -(its offset vs 159)
+                check(f'round {i} node {n}: 320-line offsets file from the round\'s own cross-talk peak, 158 within 40 ps of the truth ({want:+d}), ref 159',
+                      v.shape == (320,) and j['ref'] == 159 and abs(int(v[158]) - want) < 40 and int(v[160]) == 0, f'{v[158]} ref {j["ref"]}')
+            z = _np.load(os.path.join(rd, 'result.npz'), allow_pickle=True)
+            meta = json.loads(str(z['meta']))
+            check(f'round {i}: result meta carries the applied offsets', meta['pixel_offsets']['source'].startswith('crosstalk') and meta['pixel_offsets']['node1']['158'] == int(v[158]) or
+                  meta['pixel_offsets']['node1']['158'] == int(_np.loadtxt(os.path.join(rd, 'offsets_node1.txt'), dtype=int)[158]), str(meta['pixel_offsets']))
+            check(f'round {i}: raw stamps deleted after the analysis, offsets and cross-talk files kept',
+                  not os.path.isdir(os.path.join(rd, 'node1')) and os.path.exists(os.path.join(rd, 'crosstalk_node1.npz')))
+        recs = [json.loads(x) for x in open(cfg.path('records.jsonl')).read().splitlines()]
+        check('records.jsonl says which offsets each round used (source, ref, static level, weakest link)',
+              all(r['pixel_offsets']['source'].startswith('crosstalk') and r['pixel_offsets']['1']['ref'] == 159 and r['pixel_offsets']['1']['weakest_sigma'] > 5 for r in recs), str(recs[0].get('pixel_offsets')))
+        check('the peak is found at the injected tau with the offsets applied (both rounds > 5 sigma)', all(r['sigma_100'] > 5 for r in recs), str([r['sigma_100'] for r in recs]))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def test_full_campaign_and_resume():
@@ -106,10 +169,10 @@ def test_full_campaign_and_resume():
         check('final status: complete, 2 done', st['phase'] == 'complete' and st['completed'] == 2 and not st['failed_rounds'], str(st))
         mir = os.path.join(cfg.mirror, 'test')
         check('the mirror folder has the status, records and summary', all(os.path.exists(os.path.join(mir, f)) for f in ('status.txt', 'status.json', 'records.jsonl', 'summary.txt', 'combined.json')), str(os.listdir(mir)))
-        four = ['centroid_alignment_20ps.png', 'round_trend_20ps.png', 'rounds_stacked_100ps.png', 'rounds_zoom_100ps.png']
+        five = ['centroid_alignment_20ps.png', 'coadd_20ps.png', 'round_trend_20ps.png', 'rounds_stacked_100ps.png', 'rounds_zoom_100ps.png']
         figs = sorted(f for f in os.listdir(mir) if f.endswith('.png'))
-        check('the mirror gets the two campaign figures (centroid alignment, height / sigma trend) and the two per-round grids (stacked, zoom; 100 ps) directly in the campaign folder',
-              figs == four and not any(os.path.isdir(os.path.join(mir, d)) for d in os.listdir(mir)), str(os.listdir(mir)))
+        check('the mirror gets the three campaign figures (centroid alignment, campaign coadd, height / sigma trend) and the two per-round grids (stacked, zoom; 100 ps) directly in the campaign folder',
+              figs == five and not any(os.path.isdir(os.path.join(mir, d)) for d in os.listdir(mir)), str(os.listdir(mir)))
         os.makedirs(os.path.join(mir, 'figs', 'round1'), exist_ok=True)
         open(os.path.join(mir, 'figs', 'round1', 'peak_zoom_100ps.png'), 'wb').close()
         record.Mirror(cfg.mirror, 'test').prune_dirs('', 'figs')
@@ -239,7 +302,12 @@ def test_preflight():
         c3 = make_cfg(tmp, mirror=False)
         c3.root = os.path.join(tmp, 'c3')
         c3.data_dir = os.path.join(tmp, 'r3')
-        check('the per-round disk estimate scales with pixels and duration', abs(c3.per_round_bytes - 17.5e9 * 2 * 6 / 180) < 1)
+        keep = record.intensity_rates_mcps
+        record.intensity_rates_mcps = lambda *a, **k: None                  # no scan known: the 17.5 GB per pixel per 180 s fallback
+        try:
+            check('with no rate known the per-round disk estimate scales with pixels and duration', abs(c3.per_round_bytes - 17.5e9 * 2 * 6 / 180) < 1)
+        finally:
+            record.intensity_rates_mcps = keep
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -287,6 +355,8 @@ def main() -> int:
     test_retry_after_an_empty_round()
     test_lspad_is_closed_at_the_end_and_when_a_node_is_lost()
     test_mirror_failure_does_not_stop_the_run()
+    test_disk_estimate_uses_the_count_rate()
+    test_raw_campaign_with_crosstalk_offsets()
     print(f'\n{len(PASSED)} checks passed')
     return 0
 
